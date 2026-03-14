@@ -49,6 +49,8 @@ type Store interface {
 	Close() error
 }
 
+var _ Store = (*boltStore)(nil)
+
 type boltStore struct {
 	logger logrus.FieldLogger
 
@@ -336,9 +338,8 @@ type activeResource struct {
 
 func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	var (
-		resourceType         = f.typeName
-		activeEvents         []*activeResource
-		completedTransitions []string
+		resourceType = f.typeName
+		activeEvents []*activeResource
 		// "<resource_name>#"
 		resourcePrefixKey = bytes.Join([][]byte{[]byte(resourceType), emptyPrefix}, keySeparator)
 	)
@@ -373,9 +374,10 @@ func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, erro
 			eventCursor := eventB.Cursor()
 			logger.WithField("start_event", string(ae.StartEvent)).WithField("event_prefix", string(eventPrefix)).Info("iterating events")
 			var (
-				response   []byte
-				retryCount uint64
-				fsmError   RunErr
+				completedTransitions []string
+				response             []byte
+				retryCount           uint64
+				fsmError             RunErr
 			)
 			for eventKey, eventValue := eventCursor.Seek(ae.StartEvent); eventKey != nil && bytes.HasPrefix(eventKey, eventPrefix); eventKey, eventValue = eventCursor.Next() {
 				var event fsmv1.StateEvent
