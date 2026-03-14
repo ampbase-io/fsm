@@ -40,7 +40,18 @@ var (
 	errEventArchived = errors.New("event archived")
 )
 
-type store struct {
+// Store is the interface that storage backends must implement.
+type Store interface {
+	Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error)
+	Active(ctx context.Context, f *fsm) ([]*activeResource, error)
+	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
+	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
+	Close() error
+}
+
+var _ Store = (*boltStore)(nil)
+
+type boltStore struct {
 	logger logrus.FieldLogger
 
 	tracer trace.Tracer
@@ -57,7 +68,7 @@ type store struct {
 	archiveCh chan struct{}
 }
 
-func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB *memdb.MemDB) (*store, error) {
+func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB *memdb.MemDB) (*boltStore, error) {
 	db, err := bbolt.Open(filepath.Join(path, stateDB), 0o600, &bbolt.Options{
 		Timeout: 1 * time.Second,
 	})
@@ -91,7 +102,7 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &store{
+	s := &boltStore{
 		logger:    logger,
 		tracer:    tracer,
 		cancel:    cancel,
@@ -106,7 +117,7 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 	return s, nil
 }
 
-func (s *store) Close() error {
+func (s *boltStore) Close() error {
 	s.logger.Info("shutting down store")
 
 	var err error
@@ -133,7 +144,7 @@ type archiveEvent struct {
 	historyEvent *fsmv1.HistoryEvent
 }
 
-func (s *store) archive(ctx context.Context) {
+func (s *boltStore) archive(ctx context.Context) {
 	// TODO: clear out date buckets older than X days
 	runArchive := func(ctx context.Context) {
 		ctx, rootSpan := s.tracer.Start(ctx, "store.archive")
@@ -325,11 +336,10 @@ type activeResource struct {
 	fsmError RunErr
 }
 
-func (s *store) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
+func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	var (
-		resourceType         = f.typeName
-		activeEvents         []*activeResource
-		completedTransitions []string
+		resourceType = f.typeName
+		activeEvents []*activeResource
 		// "<resource_name>#"
 		resourcePrefixKey = bytes.Join([][]byte{[]byte(resourceType), emptyPrefix}, keySeparator)
 	)
@@ -364,9 +374,10 @@ func (s *store) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
 			eventCursor := eventB.Cursor()
 			logger.WithField("start_event", string(ae.StartEvent)).WithField("event_prefix", string(eventPrefix)).Info("iterating events")
 			var (
-				response   []byte
-				retryCount uint64
-				fsmError   RunErr
+				completedTransitions []string
+				response             []byte
+				retryCount           uint64
+				fsmError             RunErr
 			)
 			for eventKey, eventValue := eventCursor.Seek(ae.StartEvent); eventKey != nil && bytes.HasPrefix(eventKey, eventPrefix); eventKey, eventValue = eventCursor.Next() {
 				var event fsmv1.StateEvent
@@ -498,7 +509,7 @@ func withParent(parent ulid.ULID) appendOptionFunc {
 	}
 }
 
-func (s *store) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error) {
+func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error) {
 	var ao appendOption
 	for _, opt := range opts {
 		if err := opt(&ao); err != nil {
@@ -712,7 +723,7 @@ func (s *store) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, qu
 	return eventVersion, nil
 }
 
-func (s *store) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error) {
+func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error) {
 	runVersionBytes, err := runVersion.MarshalText()
 	if err != nil {
 		return nil, err
@@ -768,7 +779,7 @@ func (s *store) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.Histo
 	return &historyEvent, err
 }
 
-func (s *store) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
+func (s *boltStore) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
 	parentyBytes, err := parent.MarshalText()
 	if err != nil {
 		return nil, err

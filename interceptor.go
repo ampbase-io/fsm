@@ -79,7 +79,7 @@ func skipper() TransitionInterceptorFunc {
 	})
 }
 
-func canceller(store *store, codec Codec) TransitionInterceptorFunc {
+func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			var (
@@ -124,7 +124,7 @@ func canceller(store *store, codec Codec) TransitionInterceptorFunc {
 	})
 }
 
-func retry(tracer trace.Tracer, store *store) TransitionInterceptorFunc {
+func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			logger := req.Log()

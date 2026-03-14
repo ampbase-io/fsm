@@ -80,7 +80,7 @@ type Manager struct {
 
 	db *memdb.MemDB
 
-	store *store
+	store Store
 
 	fsms map[fsmKey]*fsm
 
