@@ -102,11 +102,22 @@ type Config struct {
 	Logger logrus.FieldLogger
 
 	// DBPath is the directory to use for persisting FSM state.
+	// Set DBPath for the BoltDB backend (default, existing behavior),
+	// or ObjectStorage for the S3-compatible backend. Exactly one must be set.
 	DBPath string
 
-	// Qeues defines which queues are available for FSMs to use. The key is the queue name and the
+	// ObjectStorage configures the S3-compatible object storage backend.
+	ObjectStorage *ObjectStorageConfig
+
+	// Queues defines which queues are available for FSMs to use. The key is the queue name and the
 	// value is the maximum number of FSMs that can run concurrently.
 	Queues map[string]int
+
+	// NodeID is a unique identifier for this node. Required for the object storage backend.
+	NodeID string
+
+	// NodeAddr is the address reachable by other nodes for cancel RPC. Required for the object storage backend.
+	NodeAddr string
 }
 
 // New creates a new FSM manager to register and run FSMs.
