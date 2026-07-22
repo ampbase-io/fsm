@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oklog/ulid/v2"
 	"go.etcd.io/bbolt"
 )
 
@@ -164,8 +163,7 @@ func TestActiveExactID(t *testing.T) {
 		t.Fatalf("failed to build FSM: %v", err)
 	}
 
-	v1, err := start(ctx, "machine-1", NewRequest(&orderReq{}, &orderResp{}))
-	if err != nil {
+	if _, err := start(ctx, "machine-1", NewRequest(&orderReq{}, &orderResp{})); err != nil {
 		t.Fatalf("failed to start machine-1: %v", err)
 	}
 	v10, err := start(ctx, "machine-10", NewRequest(&orderReq{}, &orderResp{}))
@@ -184,14 +182,17 @@ func TestActiveExactID(t *testing.T) {
 		t.Fatalf("expected exactly 1 active run for machine-1, got %d: %v", len(active), active)
 	}
 
+	// Wait for one run by id and the other by version to cover both wait paths; WaitByID is
+	// called while the run may still be executing, exercising the watch loop.
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- m.WaitByID(ctx, "machine-1") }()
+
 	close(block)
-	for _, v := range []struct {
-		name    string
-		version ulid.ULID
-	}{{"machine-1", v1}, {"machine-10", v10}} {
-		if err := m.Wait(ctx, v.version); err != nil {
-			t.Fatalf("%s completed with error: %v", v.name, err)
-		}
+	if err := <-waitErr; err != nil {
+		t.Fatalf("machine-1 completed with error: %v", err)
+	}
+	if err := m.Wait(ctx, v10); err != nil {
+		t.Fatalf("machine-10 completed with error: %v", err)
 	}
 }
 
