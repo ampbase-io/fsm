@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -302,6 +303,31 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 // Children returns a list of FSMs that are associated with the given parent.
 func (m *Manager) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
 	return m.store.Children(ctx, parent)
+}
+
+// Runs returns the versions of all runs recorded for the given resource id across the FSM
+// types registered with this manager, oldest first, including completed runs. Details for a
+// version can be fetched with History, or waited on with Wait. Retention follows the backend:
+// BoltDB serves runs whose events have not yet been archived, while the object storage backend
+// indexes runs durably.
+func (m *Manager) Runs(ctx context.Context, id string) ([]ulid.ULID, error) {
+	seenTypes := map[string]struct{}{}
+	var runs []ulid.ULID
+	for fk := range m.fsms {
+		if _, ok := seenTypes[fk.name]; ok {
+			continue
+		}
+		seenTypes[fk.name] = struct{}{}
+
+		typeRuns, err := m.store.Runs(ctx, fk.name, id)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, typeRuns...)
+	}
+
+	slices.SortFunc(runs, func(a, b ulid.ULID) int { return a.Compare(b) })
+	return runs, nil
 }
 
 // ActiveChildren returns a list of FSMs that were started from the given parent and are still

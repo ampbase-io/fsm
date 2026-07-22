@@ -136,6 +136,14 @@ func (s *objectStore) historyKey(date string, runVersion ulid.ULID) string {
 	return s.key("history", date, runVersion.String())
 }
 
+func (s *objectStore) runIndexKey(resourceType, resourceID, action string, runVersion ulid.ULID) string {
+	return s.key("index", escapeSegment(resourceType), escapeSegment(resourceID), escapeSegment(action), runVersion.String())
+}
+
+func (s *objectStore) runIndexPrefix(resourceType, resourceID string) string {
+	return s.key("index", escapeSegment(resourceType), escapeSegment(resourceID)) + "/"
+}
+
 func (s *objectStore) childKey(parent, child ulid.ULID) string {
 	return s.key("children", parent.String(), child.String())
 }

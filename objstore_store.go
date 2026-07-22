@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -173,6 +174,13 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 
 	// 2. Write the START event.
 	if err := s.putIfAbsent(ctx, eventKey, eventBytes); err != nil && !errors.Is(err, errPreconditionFailed) {
+		return err
+	}
+
+	// 2b. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
+	// events (deleted at archival), index markers persist, so past runs stay enumerable.
+	indexKey := s.runIndexKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.StartVersion)
+	if err := s.putIfAbsent(ctx, indexKey, nil); err != nil && !errors.Is(err, errPreconditionFailed) {
 		return err
 	}
 
@@ -473,6 +481,32 @@ func (s *objectStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1
 // Children is implemented by the children/ prefix listing.
 func (s *objectStore) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
 	return s.listChildren(ctx, parent)
+}
+
+// Runs returns the versions of all runs ever recorded for the resource, oldest first, from the
+// keys-only index/ prefix listing. Index markers outlive locks and events, so completed and
+// archived runs remain enumerable.
+func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error) {
+	keys, err := s.listKeys(ctx, s.runIndexPrefix(resourceType, resourceID))
+	if err != nil {
+		return nil, err
+	}
+
+	runs := make([]ulid.ULID, 0, len(keys))
+	for _, key := range keys {
+		segments := strings.Split(key, "/")
+
+		var version ulid.ULID
+		if err := version.UnmarshalText([]byte(segments[len(segments)-1])); err != nil {
+			s.logger.WithError(err).WithField("key", key).Error("failed to parse run version from index key")
+			continue
+		}
+		runs = append(runs, version)
+	}
+
+	// The listing groups keys by action, so re-sort chronologically across actions.
+	slices.SortFunc(runs, func(a, b ulid.ULID) int { return a.Compare(b) })
+	return runs, nil
 }
 
 // Close shuts down the store. The object storage backend holds no local resources or background

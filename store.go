@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"time"
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
@@ -46,6 +47,10 @@ type Store interface {
 	Active(ctx context.Context, f *fsm) ([]*activeResource, error)
 	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
 	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
+	// Runs returns the versions of runs recorded for the resource, oldest first, including
+	// completed runs. Backends differ in retention: BoltDB serves runs whose events have not
+	// yet been archived, while the object storage backend indexes runs durably.
+	Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error)
 	Close() error
 }
 
@@ -785,6 +790,44 @@ func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.H
 
 	})
 	return &historyEvent, err
+}
+
+// Runs returns the versions of runs recorded for the resource by scanning the events bucket,
+// oldest first. Events for archived runs have been deleted, so only unarchived runs appear;
+// resourceType is unused because BoltDB event keys are already scoped by resource id.
+func (s *boltStore) Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error) {
+	// EVENT bucket keys: <resource_id>#<action>#<run_version>#<event_version>
+	prefix := bytes.Join([][]byte{[]byte(resourceID), emptyPrefix}, keySeparator)
+
+	seen := map[ulid.ULID]struct{}{}
+	runs := []ulid.ULID{}
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cursor := tx.Bucket(eventsBucket).Cursor()
+		for k, _ := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cursor.Next() {
+			parts := bytes.Split(k, keySeparator)
+			if len(parts) < 4 {
+				continue
+			}
+
+			var version ulid.ULID
+			if err := version.UnmarshalText(parts[len(parts)-2]); err != nil {
+				s.logger.WithError(err).WithField("key", string(k)).Error("failed to parse run version from event key")
+				continue
+			}
+			if _, ok := seen[version]; ok {
+				continue
+			}
+			seen[version] = struct{}{}
+			runs = append(runs, version)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	slices.SortFunc(runs, func(a, b ulid.ULID) int { return a.Compare(b) })
+	return runs, nil
 }
 
 func (s *boltStore) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {

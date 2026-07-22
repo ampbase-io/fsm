@@ -9,6 +9,8 @@ import (
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
+	"github.com/oklog/ulid/v2"
+
 	"go.etcd.io/bbolt"
 )
 
@@ -161,6 +163,75 @@ func testHistory(t *testing.T, f *managerFactory) {
 	}
 	if he.GetLastEvent().GetType() != fsmv1.EventType_EVENT_TYPE_FINISH {
 		t.Fatalf("expected FINISH last event, got %v", he.GetLastEvent().GetType())
+	}
+}
+
+// TestRuns verifies past runs for a resource stay enumerable after completion, across actions,
+// scoped to the requested id.
+func TestRuns(t *testing.T) { runBackends(t, testRuns) }
+
+func testRuns(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	registerAction := func(action string) Start[orderReq, orderResp] {
+		start, _, err := m.Register[orderReq, orderResp](action).
+			Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+				return nil, nil
+			}).
+			End("done").
+			Build(ctx)
+		if err != nil {
+			t.Fatalf("failed to build %s FSM: %v", action, err)
+		}
+		return start
+	}
+	createStart := registerAction("create")
+	deployStart := registerAction("deploy")
+
+	runAndWait := func(start Start[orderReq, orderResp], id string) ulid.ULID {
+		t.Helper()
+		v, err := start(ctx, id, NewRequest(&orderReq{}, &orderResp{}))
+		if err != nil {
+			t.Fatalf("failed to start %s: %v", id, err)
+		}
+		if err := m.Wait(ctx, v); err != nil {
+			t.Fatalf("%s completed with error: %v", id, err)
+		}
+		// ULIDs within the same millisecond are not ordered; space runs out so the
+		// chronological ordering assertion below is deterministic.
+		time.Sleep(2 * time.Millisecond)
+		return v
+	}
+
+	v1 := runAndWait(createStart, "res-1")
+	v2 := runAndWait(deployStart, "res-1")
+	v3 := runAndWait(createStart, "res-1")
+	runAndWait(createStart, "res-2")
+
+	runs, err := m.Runs(ctx, "res-1")
+	if err != nil {
+		t.Fatalf("Runs failed: %v", err)
+	}
+	want := []ulid.ULID{v1, v2, v3}
+	if len(runs) != len(want) {
+		t.Fatalf("expected %d completed runs for res-1, got %d: %v", len(want), len(runs), runs)
+	}
+	for i, v := range want {
+		if runs[i] != v {
+			t.Fatalf("expected chronological runs %v, got %v", want, runs)
+		}
+	}
+
+	// Every returned version resolves to details via History.
+	for _, v := range runs {
+		if _, err := m.store.History(ctx, v); err != nil {
+			t.Fatalf("History for run %s failed: %v", v, err)
+		}
+	}
+
+	if runs, err := m.Runs(ctx, "res-unknown"); err != nil || len(runs) != 0 {
+		t.Fatalf("expected no runs for unknown resource, got %v (err %v)", runs, err)
 	}
 }
 
