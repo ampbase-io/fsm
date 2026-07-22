@@ -641,29 +641,28 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 				}
 			}
 
-			if queue == "" {
-				switch deleted, err := txn.DeleteAll(fsmTable, runIndex, run.ID); {
-				case err != nil:
-					return err
-				case deleted > 0:
-					s.logger.WithField("id", run.ID).Info("deleted existing run")
-				}
-			} else {
-				switch iter, err := txn.Get(fsmTable, runIndex, run.ID); {
-				case err != nil:
-					return err
-				default:
-					for next := iter.Next(); next != nil; next = iter.Next() {
-						rs := next.(runState)
-						if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
-							continue
-						}
-						if err := txn.Delete(fsmTable, next.(runState)); err != nil {
-							return err
-						}
+			// Clear out completed runs for this resource id so stale rows don't accumulate.
+			// Runs that are still in flight are left alone: the same id may be actively running
+			// under a different action, and deleting its row would make waiters believe it
+			// finished.
+			switch iter, err := txn.Get(fsmTable, runIndex, run.ID); {
+			case err != nil:
+				return err
+			default:
+				deleted := 0
+				for next := iter.Next(); next != nil; next = iter.Next() {
+					rs := next.(runState)
+					if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
+						continue
 					}
+					if err := txn.Delete(fsmTable, rs); err != nil {
+						return err
+					}
+					deleted++
 				}
-
+				if deleted > 0 {
+					s.logger.WithField("id", run.ID).Info("deleted completed runs")
+				}
 			}
 
 			rs.State = fsmv1.RunState_RUN_STATE_PENDING
