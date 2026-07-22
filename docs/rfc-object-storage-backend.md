@@ -130,7 +130,9 @@ Headers: If-None-Match: *
 Body: Protobuf-encoded StateEvent
 ```
 
-If the write returns 412 (object already exists), the event was already written (e.g., retry after a crash). This is safe because events are idempotent by key.
+If the write returns 412 (object already exists), the event was already written (e.g., retry after a crash). This is safe because events are idempotent by key. This idempotency requires the caller to derive the event version *before* the first write attempt and reuse it across retries; minting a fresh version per attempt would create a duplicate event under a new key.
+
+**Events are an audit trail, not the recovery source.** Because every COMPLETE/ERROR event also CAS-updates the run manifest, the manifest is a materialized view of the event log — `completed_states`, `latest_response`, `retry_count`, and `error`/`error_state` are exactly the fields recovery needs. Hot paths (resume, lease takeover) read only the manifest. Reading event *bodies* is reserved for latency-tolerant paths: admin/history views and reconciliation after a detected crash. This matters because object storage has no batch GET: listing a run's events costs one round trip per event body (~10–50 ms each on Tigris), which is acceptable for debugging but must never sit on the recovery path.
 
 ### State Transition Flows
 
@@ -228,6 +230,8 @@ For any node to resume a run mid-flight, the manifest must contain sufficient st
 - The error state if the run was halted
 
 On resume, a node deserializes the resource, reconstructs the `Request` object, skips completed transitions, and continues execution from the next uncompleted transition. This is the same logic as the existing `resume()` function, generalized to work from the manifest rather than from BoltDB.
+
+**Resume reads the manifest, never the event listing.** Recovering a run is exactly one consistent GET of its manifest, independent of how many events the run has produced. The Phase 3 `Append`/`Active` implementations must not call `listRunEvents` on this path — a listing plus per-event GETs is linear in run length (see Event Storage), and the manifest already carries every field recovery needs. `listRunEvents` exists for admin/history views and for reconciliation, and reconciliation's *detection* step is keys-only: a `ListObjectsV2` listing (1,000 keys per request, no body reads) compared against the manifest's `latest_event_key`. Only when a discrepancy is found are the trailing event bodies fetched, which is rare and bounded by the gap size.
 
 Transitions SHOULD be idempotent. If a node crashes mid-transition and another node resumes, the transition will execute again. The library cannot guarantee exactly-once execution at the transition level; it provides at-least-once semantics with a fencing token (`lease_epoch`) that external systems can use to reject stale operations.
 
@@ -484,7 +488,7 @@ New trace attributes on run spans: `fsm.owner_node`, `fsm.lease_epoch`, `fsm.sto
 
 |Failure                                                |Detection                                                      |Recovery                                                                                    |
 |-------------------------------------------------------|---------------------------------------------------------------|--------------------------------------------------------------------------------------------|
-|**Crash between event write and manifest update**      |Startup scan: events exist beyond manifest's `latest_event_key`|Reconcile manifest from event log                                                           |
+|**Crash between event write and manifest update**      |Startup scan: keys-only event listing shows keys beyond manifest's `latest_event_key`|Fetch only the trailing event bodies and reconcile the manifest from them                   |
 |**Crash between manifest completion and lock deletion**|Archive scan: manifest says "complete" but lock exists         |Delete the orphaned lock                                                                    |
 |**Crash between START steps (partial create)**         |Startup scan: lock exists but no manifest                      |Delete the orphaned lock                                                                    |
 |**Node dies while owning a run**                       |Lease expiry (30s)                                             |Another node claims the expired lease and resumes                                           |

@@ -278,9 +278,15 @@ func (s *objectStore) appendEvent(ctx context.Context, resourceID, action string
 const listEventFetchers = 8
 
 // listRunEvents lists all events for a run in chronological order (ULID lexicographic order).
-// Any failure to read or decode an event fails the whole listing: callers use the result to
-// decide which transitions to re-execute on resume, so a silently dropped event would cause a
-// completed transition to run again.
+//
+// Cost: one GET per event body (object storage has no batch GET), fetched listEventFetchers at
+// a time — linear in run length. This is intended for audit/history views and crash
+// reconciliation only; resume must read the run manifest instead, which materializes the same
+// state in a single GET (see the "Resumability" section of the object storage RFC).
+//
+// Any failure to read or decode an event fails the whole listing: a silently dropped event
+// would misrepresent the run's history to reconciliation, which could re-execute a completed
+// transition.
 func (s *objectStore) listRunEvents(ctx context.Context, resourceID, action string, runVersion ulid.ULID) ([]*fsmv1.StateEvent, error) {
 	keys, err := s.listKeys(ctx, s.eventPrefix(resourceID, action, runVersion))
 	if err != nil {
