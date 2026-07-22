@@ -93,9 +93,19 @@ func TestCancel(t *testing.T) {
 		t.Fatalf("expected cancellation cause in error, got %v", waitErr)
 	}
 
-	// Canceling an unknown version reports ErrFsmNotFound.
-	if err := m.Cancel(ctx, version, "again"); !errors.Is(err, ErrFsmNotFound) {
-		t.Fatalf("expected ErrFsmNotFound for finished FSM, got %v", err)
+	// Canceling a finished FSM reports ErrFsmNotFound. The running-map entry is removed by the
+	// run goroutine's deferred cleanup, which can lag Wait's return slightly, so poll briefly.
+	deadline := time.After(5 * time.Second)
+	for {
+		err := m.Cancel(ctx, version, "again")
+		if errors.Is(err, ErrFsmNotFound) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected ErrFsmNotFound for finished FSM, got %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
