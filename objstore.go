@@ -140,26 +140,36 @@ func (s *objectStore) childPrefix(parent ulid.ULID) string {
 
 var errPreconditionFailed = errors.New("precondition failed: object already exists")
 
+// httpStatusError is satisfied by smithy-go response errors, which carry the HTTP status
+// code of the failed request. AWS SDK v2 does not expose typed errors for conditional-write
+// failures, so classification goes by status code.
+type httpStatusError interface {
+	error
+	HTTPStatusCode() int
+}
+
+// hasHTTPStatus reports whether err's chain contains an HTTP response error with the given
+// status code.
+func hasHTTPStatus(err error, status int) bool {
+	httpErr, ok := errors.AsType[httpStatusError](err)
+	return ok && httpErr.HTTPStatusCode() == status
+}
+
 // isPreconditionFailed checks if an S3 error is a 412 Precondition Failed response.
-// AWS SDK v2 does not expose a typed error for 412; instead, extract the HTTP status
-// code from the underlying response via the smithy-go HTTPStatusCode() interface.
 func isPreconditionFailed(err error) bool {
-	var httpErr interface{ HTTPStatusCode() int }
-	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusPreconditionFailed
+	return hasHTTPStatus(err, http.StatusPreconditionFailed)
 }
 
 // isConditionalConflict checks if an S3 error is a 409 Conflict response. S3 returns 409
 // (ConditionalRequestConflict) when concurrent conditional writes race on the same key; the
 // request should be retried, after which the winner's object exists and the retry observes 412.
 func isConditionalConflict(err error) bool {
-	var httpErr interface{ HTTPStatusCode() int }
-	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusConflict
+	return hasHTTPStatus(err, http.StatusConflict)
 }
 
 // isNotFound checks if an S3 error is a 404 Not Found response.
 func isNotFound(err error) bool {
-	var httpErr interface{ HTTPStatusCode() int }
-	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound
+	return hasHTTPStatus(err, http.StatusNotFound)
 }
 
 // maxConditionalRetries bounds retries of conditional writes that fail with 409 Conflict.
