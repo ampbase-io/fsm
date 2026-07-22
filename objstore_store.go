@@ -15,14 +15,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Manifest status values. Transitions: pending → running → complete → archived.
-const (
-	manifestStatusPending  = "pending"
-	manifestStatusRunning  = "running"
-	manifestStatusComplete = "complete"
-	manifestStatusArchived = "archived"
-)
-
 // maxManifestCASRetries bounds re-read-and-retry loops on manifest If-Match failures. In
 // practice contention on a single run's manifest is near-zero because one goroutine drives a
 // run sequentially; the bound exists for Phase 4, where lease takeovers introduce competitors.
@@ -187,7 +179,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	// 3. Create the manifest. A 412 means a crashed earlier attempt of this same run already
 	// created it; the existing manifest is authoritative.
 	manifest := &fsmv1.RunManifest{
-		Status:         manifestStatusPending,
+		Status:         fsmv1.RunState_RUN_STATE_PENDING,
 		ResourceType:   event.GetResourceType(),
 		ResourceId:     event.GetId(),
 		Action:         event.GetAction(),
@@ -259,8 +251,8 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
-		if m.Status == manifestStatusPending {
-			m.Status = manifestStatusRunning
+		if m.Status == fsmv1.RunState_RUN_STATE_PENDING {
+			m.Status = fsmv1.RunState_RUN_STATE_RUNNING
 		}
 
 		switch event.GetType() {
@@ -286,7 +278,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	}
 
 	manifest, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
-		m.Status = manifestStatusComplete
+		m.Status = fsmv1.RunState_RUN_STATE_COMPLETE
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
@@ -407,7 +399,7 @@ func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, er
 			return nil, err
 		}
 
-		if manifest.GetStatus() == manifestStatusComplete || manifest.GetStatus() == manifestStatusArchived {
+		if manifest.GetStatus() == fsmv1.RunState_RUN_STATE_COMPLETE || manifest.GetStatus() == fsmv1.RunState_RUN_STATE_ARCHIVED {
 			// Crash window between manifest completion and lock deletion: finish the cleanup.
 			logger.Info("completed run still holds its lock, removing")
 			if err := s.deleteObject(ctx, lockKey); err != nil {

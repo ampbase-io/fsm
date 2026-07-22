@@ -18,6 +18,10 @@ type orderReq struct{ Name string }
 
 type orderResp struct{ Status string }
 
+type gadgetReq struct{ Name string }
+
+type gadgetResp struct{ Status string }
+
 // newTestManager creates a BoltDB-backed Manager for tests that are specific to that backend;
 // backend-agnostic behavior tests use runBackends instead.
 func newTestManager(t *testing.T) *Manager {
@@ -204,16 +208,36 @@ func testRuns(t *testing.T, f *managerFactory) {
 		return v
 	}
 
+	// A second resource TYPE sharing the same id: exercises the cross-type dedup in Manager.Runs
+	// (the Bolt backend keys events by id alone, so without dedup its runs repeat per type).
+	gadgetStart, _, err := m.Register[gadgetReq, gadgetResp]("assemble").
+		Start("created", func(ctx context.Context, req *Request[gadgetReq, gadgetResp]) (*Response[gadgetResp], error) {
+			return nil, nil
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build gadget FSM: %v", err)
+	}
+
 	v1 := runAndWait(createStart, "res-1")
 	v2 := runAndWait(deployStart, "res-1")
 	v3 := runAndWait(createStart, "res-1")
 	runAndWait(createStart, "res-2")
 
+	v4, err := gadgetStart(ctx, "res-1", NewRequest(&gadgetReq{}, &gadgetResp{}))
+	if err != nil {
+		t.Fatalf("failed to start gadget: %v", err)
+	}
+	if err := m.Wait(ctx, v4); err != nil {
+		t.Fatalf("gadget completed with error: %v", err)
+	}
+
 	runs, err := m.Runs(ctx, "res-1")
 	if err != nil {
 		t.Fatalf("Runs failed: %v", err)
 	}
-	want := []ulid.ULID{v1, v2, v3}
+	want := []ulid.ULID{v1, v2, v3, v4}
 	if len(runs) != len(want) {
 		t.Fatalf("expected %d completed runs for res-1, got %d: %v", len(want), len(runs), runs)
 	}

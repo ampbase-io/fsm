@@ -39,4 +39,7 @@ enum RunState {
   RUN_STATE_PENDING = 1;
   RUN_STATE_RUNNING = 2;
   RUN_STATE_COMPLETE = 3;
+  // RUN_STATE_ARCHIVED is a completed run whose events have been swept to
+  // history. Only the object storage backend sets it (via the run manifest).
+  RUN_STATE_ARCHIVED = 4;
 }

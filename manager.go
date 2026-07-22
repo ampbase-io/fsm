@@ -151,22 +151,9 @@ func New(cfg Config) (*Manager, error) {
 		trace.WithSchemaURL(semconv.SchemaURL),
 	)
 
-	var store Store
-	if cfg.ObjectStorage != nil {
-		var err error
-		store, err = newObjectStore(context.Background(), cfg.Logger.WithField("sys", "fsm-store"), cfg.ObjectStorage, memDB)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
-			return nil, fmt.Errorf("failed to setup DB path: %w", err)
-		}
-
-		store, err = newStore(cfg.Logger.WithField("sys", "fsm-store"), tracer, cfg.DBPath, memDB)
-		if err != nil {
-			return nil, err
-		}
+	store, err := newBackend(cfg, memDB, tracer, cfg.Logger.WithField("sys", "fsm-store"))
+	if err != nil {
+		return nil, err
 	}
 
 	done := make(chan struct{})
@@ -201,39 +188,52 @@ func New(cfg Config) (*Manager, error) {
 		man.logger.Info("no admin socket path configured, admin service disabled")
 		return man, nil
 	}
-
-	mux := http.NewServeMux()
-	mux.Handle(fsmv1connect.NewFSMServiceHandler(&adminServer{
-		m: man,
-	}))
-
-	server := &http.Server{
-		Handler: h2c.NewHandler(mux, &http2.Server{}),
+	if err := man.serveAdmin(socket); err != nil {
+		return nil, err
 	}
+
+	return man, nil
+}
+
+// newBackend constructs the storage backend selected by the config. Exactly one of DBPath or
+// ObjectStorage is set; the caller validates that.
+func newBackend(cfg Config, memDB *memdb.MemDB, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
+	if cfg.ObjectStorage != nil {
+		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, memDB)
+	}
+	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to setup DB path: %w", err)
+	}
+	return newStore(logger, tracer, cfg.DBPath, memDB)
+}
+
+// serveAdmin starts the admin RPC service on the given unix socket and tears it down when the
+// manager shuts down.
+func (m *Manager) serveAdmin(socket string) error {
+	mux := http.NewServeMux()
+	mux.Handle(fsmv1connect.NewFSMServiceHandler(&adminServer{m: m}))
+	server := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
 
 	os.Remove(socket)
-	unixListener, err := net.Listen("unix", socket)
+	listener, err := net.Listen("unix", socket)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen on unix socket %s, %w", socket, err)
+		return fmt.Errorf("failed to listen on unix socket %s, %w", socket, err)
 	}
 
-	go server.Serve(unixListener)
-
+	go server.Serve(listener)
 	go func() {
 		defer os.Remove(socket)
-		<-man.done
-		if err := unixListener.Close(); err != nil {
-			man.logger.WithError(err).Error("failed to close unix listener")
+		<-m.done
+		if err := listener.Close(); err != nil {
+			m.logger.WithError(err).Error("failed to close unix listener")
 		}
-
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			man.logger.WithError(err).Error("failed to shutdown http server")
+			m.logger.WithError(err).Error("failed to shutdown http server")
 		}
 	}()
-
-	return man, nil
+	return nil
 }
 
 // Shutdown sends a stop signal to all FSMs and blocks until they have all stopped.
@@ -311,7 +311,11 @@ func (m *Manager) Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, 
 // BoltDB serves runs whose events have not yet been archived, while the object storage backend
 // indexes runs durably.
 func (m *Manager) Runs(ctx context.Context, id string) ([]ulid.ULID, error) {
+	// Query each registered type once (a type's runs are the same regardless of which action
+	// registered it). Dedup the merged result on run version: the Bolt backend keys events by
+	// id alone and returns every run regardless of type, so multiple types would repeat runs.
 	seenTypes := map[string]struct{}{}
+	seen := map[ulid.ULID]struct{}{}
 	var runs []ulid.ULID
 	for fk := range m.fsms {
 		if _, ok := seenTypes[fk.name]; ok {
@@ -323,7 +327,13 @@ func (m *Manager) Runs(ctx context.Context, id string) ([]ulid.ULID, error) {
 		if err != nil {
 			return nil, err
 		}
-		runs = append(runs, typeRuns...)
+		for _, v := range typeRuns {
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			runs = append(runs, v)
+		}
 	}
 
 	slices.SortFunc(runs, func(a, b ulid.ULID) int { return a.Compare(b) })
@@ -380,33 +390,53 @@ func (m *Manager) checkRun(ctx context.Context, logger logrus.FieldLogger, versi
 	defer txn.Abort()
 
 	ch, item, err := txn.FirstWatch(fsmTable, idIndex, version.String())
-	switch {
-	case err != nil:
+	if err != nil {
 		logger.WithError(err).Error("failed to wait for FSM")
 		return nil, true, err
-	case item == nil:
-		// Lookup from the store in case the FSM has already completed.
-		he, err := m.store.History(ctx, version)
-		switch {
-		case errors.Is(err, ErrFsmNotFound):
-			return nil, true, nil
-		case err != nil:
-			return nil, true, err
-		case he.GetLastEvent().GetError() != "":
-			return nil, true, &haltError{err: errors.New(he.GetLastEvent().GetError())}
-		default:
-			return nil, true, nil
-		}
+	}
+	if item == nil {
+		// Not in the local index; the store is authoritative for a run that already finished.
+		return nil, true, m.historyOutcome(ctx, version)
 	}
 
-	state, ok := item.(runState)
-	switch {
-	case !ok:
+	rs, ok := item.(runState)
+	if !ok {
 		return nil, true, fmt.Errorf("unexpected type %T", item)
-	case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
-		return nil, true, state.Error.Err
+	}
+	if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+		return nil, true, rs.Error.Err
+	}
+	return ch, false, nil
+}
+
+// historyOutcome reports a completed run's terminal result from the store, mapping a missing
+// record to a nil error (the run is gone) and a recorded error to a haltError.
+func (m *Manager) historyOutcome(ctx context.Context, version ulid.ULID) error {
+	he, err := m.store.History(ctx, version)
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		return nil
+	case err != nil:
+		return err
+	case he.GetLastEvent().GetError() != "":
+		return &haltError{err: errors.New(he.GetLastEvent().GetError())}
 	default:
-		return ch, false, nil
+		return nil
+	}
+}
+
+// watch blocks until ch fires (a state change on the watched run) or ctx ends.
+func (m *Manager) watch(ctx context.Context, logger logrus.FieldLogger, ch <-chan struct{}) error {
+	ws := memdb.NewWatchSet()
+	ws.Add(ch)
+	switch err := ws.WatchCtx(ctx); {
+	case errors.Is(err, context.Canceled):
+		return err
+	case err != nil:
+		logger.WithError(err).Error("failed to wait for FSM")
+		return err
+	default:
+		return nil
 	}
 }
 
@@ -422,14 +452,7 @@ func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
 			return err
 		}
 		logger.Info("FSM still running")
-
-		ws := memdb.NewWatchSet()
-		ws.Add(ch)
-		switch err := ws.WatchCtx(ctx); {
-		case errors.Is(err, context.Canceled):
-			return err
-		case err != nil:
-			logger.WithError(err).Error("failed to wait for FSM")
+		if err := m.watch(ctx, logger, ch); err != nil {
 			return err
 		}
 	}
@@ -442,21 +465,13 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 	logger.Info("waiting for FSM to finish")
 	defer logger.Info("done waiting for FSM to finish")
 	for {
-		// Resolve the id to the run's start version. A zero version falls through to checkRun,
-		// which reports the run as not found.
-		var version ulid.ULID
-		txn := m.db.Txn(false)
-		item, err := txn.First(fsmTable, runIndex, id)
-		txn.Abort()
-		switch {
-		case err != nil:
-		case item == nil:
-		default:
-			rs := item.(runState)
-			if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
-				return rs.Error.Err
-			}
-			version = rs.StartVersion
+		// Resolve the id to its run version. On a miss version stays zero and checkRun reports
+		// it via the store (completed) or as not found.
+		version, done, err := m.resolveByID(id)
+		if done {
+			return err
+		}
+		if version.Compare(ulid.ULID{}) != 0 {
 			logger = logger.WithField("start_version", version.String())
 		}
 
@@ -465,15 +480,27 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 			return err
 		}
 		logger.Info("FSM still running")
-
-		ws := memdb.NewWatchSet()
-		ws.Add(ch)
-		switch err := ws.WatchCtx(ctx); {
-		case errors.Is(err, context.Canceled):
-			return err
-		case err != nil:
-			logger.WithError(err).Error("failed to wait for FSM")
+		if err := m.watch(ctx, logger, ch); err != nil {
 			return err
 		}
 	}
+}
+
+// resolveByID looks up the active run version for an id in the local index. done is true when
+// the run is already complete (its result is returned in err). A miss returns a zero version
+// and done=false so the caller falls through to the store.
+func (m *Manager) resolveByID(id string) (version ulid.ULID, done bool, err error) {
+	txn := m.db.Txn(false)
+	defer txn.Abort()
+
+	item, ferr := txn.First(fsmTable, runIndex, id)
+	if ferr != nil || item == nil {
+		return ulid.ULID{}, false, nil
+	}
+
+	rs := item.(runState)
+	if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+		return rs.StartVersion, true, rs.Error.Err
+	}
+	return rs.StartVersion, false, nil
 }

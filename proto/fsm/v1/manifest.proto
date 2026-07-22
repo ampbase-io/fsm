@@ -2,13 +2,15 @@ syntax = "proto3";
 
 package fsm.v1;
 
+import "fsm/v1/fsm.proto";
+
 // RunManifest is the per-run coordination object for the object storage backend. It is the
 // linearization point for all run state: every state transition is sequenced through a
 // conditional write (If-Match CAS) to this object, and it materializes everything recovery
 // needs so resume never reads the event log.
 message RunManifest {
-  // status is one of "pending", "running", "complete", "archived".
-  string status = 1;
+  // status is the run's lifecycle state.
+  RunState status = 1;
 
   string resource_type = 2;
 
