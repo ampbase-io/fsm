@@ -323,8 +323,8 @@ func TestAbortSkipsRemainingTransitions(t *testing.T) {
 	}
 
 	waitErr := m.Wait(ctx, version)
-	var ae *AbortError
-	if !errors.As(waitErr, &ae) {
+	ae, ok := errors.AsType[*AbortError](waitErr)
+	if !ok {
 		t.Fatalf("expected Wait to return an AbortError, got %v", waitErr)
 	}
 	if ae.Error() != "boom" {
@@ -340,7 +340,7 @@ func TestAbortSkipsRemainingTransitions(t *testing.T) {
 		if re.State != "two" {
 			t.Fatalf("expected failure recorded in state two, got %q", re.State)
 		}
-		if !errors.As(re.Err, &ae) {
+		if _, ok := errors.AsType[*AbortError](re.Err); !ok {
 			t.Fatalf("expected finalizer to observe the AbortError, got %v", re.Err)
 		}
 	case <-time.After(10 * time.Second):

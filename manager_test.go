@@ -51,8 +51,8 @@ func TestAlreadyRunning(t *testing.T) {
 	<-entered
 
 	_, err = start(ctx, "dup-1", NewRequest(&orderReq{}, &orderResp{}))
-	var are *AlreadyRunningError
-	if !errors.As(err, &are) {
+	are, ok := errors.AsType[*AlreadyRunningError](err)
+	if !ok {
 		t.Fatalf("expected AlreadyRunningError, got %v", err)
 	}
 	if are.Version != version {

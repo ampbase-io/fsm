@@ -650,25 +650,27 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			case err = <-errc:
 			}
 
+			if err == nil {
+				continue
+			}
+
 			var (
-				ae *AbortError
-				ue *UnrecoverableError
-				he *HandoffError
+				_, isAbort          = errors.AsType[*AbortError](err)
+				ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
+				_, isHandoff        = errors.AsType[*HandoffError](err)
 			)
 			switch {
-			case err == nil:
-				continue
-			case errors.As(err, &ae):
+			case isAbort:
 				localActionCounterVec.WithLabelValues("abort", "").Inc()
 				localActionDurationVec.WithLabelValues("abort", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", "abort"))
-			case errors.As(err, &ue):
+			case isUnrecoverable:
 				kind := ue.Kind.String()
 				localActionCounterVec.WithLabelValues("unrecoverable", kind).Inc()
 				localActionDurationVec.WithLabelValues("unrecoverable", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", kind))
 				logger.WithError(err).Error("reached unrecoverable error, canceling FSM")
-			case errors.As(err, &he):
+			case isHandoff:
 				localActionCounterVec.WithLabelValues("fsm_handoff_error", "").Inc()
 				localActionDurationVec.WithLabelValues("fsm_handoff_error", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", "handoff"))

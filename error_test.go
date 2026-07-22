@@ -21,8 +21,7 @@ func TestErrorHelpers(t *testing.T) {
 	}
 
 	wrapped := Abort(io.EOF)
-	var ae *AbortError
-	if !errors.As(wrapped, &ae) {
+	if _, ok := errors.AsType[*AbortError](wrapped); !ok {
 		t.Fatalf("expected AbortError, got %T", wrapped)
 	}
 	if !errors.Is(wrapped, io.EOF) {
@@ -30,8 +29,7 @@ func TestErrorHelpers(t *testing.T) {
 	}
 
 	halted := halt(io.EOF)
-	var he *haltError
-	if !errors.As(halted, &he) {
+	if _, ok := errors.AsType[*haltError](halted); !ok {
 		t.Fatalf("expected haltError, got %T", halted)
 	}
 	if !errors.Is(halted, io.EOF) {
@@ -40,8 +38,8 @@ func TestErrorHelpers(t *testing.T) {
 
 	version := ulid.Make()
 	handoff := Handoff(version)
-	var hoe *HandoffError
-	if !errors.As(handoff, &hoe) {
+	hoe, ok := errors.AsType[*HandoffError](handoff)
+	if !ok {
 		t.Fatalf("expected HandoffError, got %T", handoff)
 	}
 	if hoe.NewFSM != version {
