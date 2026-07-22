@@ -309,14 +309,40 @@ func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
 		}
 
 		for _, resource := range resources {
+			// Restore the run options from the persisted event before building the Run so the
+			// queue and parent reflect this resource, not whatever a previous iteration left on f.
+			var startOpt startOptions
+			if delayUntil := resource.active.GetOptions().GetDelayUntil(); delayUntil > 0 {
+				startOpt.until = time.Unix(delayUntil, 0)
+			}
+
+			if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
+				if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
+					m.logger.WithError(err).Error("failed to unmarshal run_after")
+				}
+			}
+
+			startOpt.queue = resource.active.GetOptions().GetQueue()
+			f.queue = startOpt.queue
+
+			if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
+				if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
+					m.logger.WithError(err).Error("failed to unmarshal parent")
+				}
+
+				if startOpt.parent.Compare(ulid.ULID{}) != 0 {
+					f.parent = startOpt.parent
+				}
+			}
+
 			r := Run{
 				ID:           resource.active.GetResourceId(),
 				StartVersion: resource.version,
 				Action:       f.action,
 				ResourceName: f.alias,
 				TypeName:     f.typeName,
-				Queue:        f.queue,
-				Parent:       f.parent,
+				Queue:        startOpt.queue,
+				Parent:       startOpt.parent,
 				fsmErr:       resource.fsmError,
 			}
 
@@ -347,7 +373,7 @@ func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
 					}]
 					if !ok {
 						m.logger.Warn("transition did not exist")
-						transition = newTransition(name, noOp[R, W], TransitionConfig[R, W]{
+						transition = newTransition(name, noOp, TransitionConfig[R, W]{
 							interceptors: []TransitionInterceptorFunc{
 								skipper(),
 								canceller(m.store, f.wCodec),
@@ -358,29 +384,6 @@ func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
 				}
 			}
 
-			var startOpt startOptions
-			if delayUntil := resource.active.GetOptions().GetDelayUntil(); delayUntil > 0 {
-				startOpt.until = time.Unix(delayUntil, 0)
-			}
-
-			if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
-				if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
-					m.logger.WithError(err).Error("failed to unmarshal run_after")
-				}
-			}
-
-			f.queue = resource.active.GetOptions().GetQueue()
-
-			if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
-				if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
-					m.logger.WithError(err).Error("failed to unmarshal parent")
-				}
-
-				if startOpt.parent.Compare(ulid.ULID{}) != 0 {
-					f.parent = startOpt.parent
-				}
-			}
-
 			ctx := withRetry(ctx, resource.retryCount)
 			ctx = withRestart(ctx, true)
 
@@ -388,7 +391,7 @@ func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
 
 			runner := runnerFromOpts(&startOpt, m)
 
-			request := NewRequest[R, W](&req, &w)
+			request := NewRequest(&req, &w)
 			request.run = r
 
 			run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions})
@@ -647,25 +650,27 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			case err = <-errc:
 			}
 
+			if err == nil {
+				continue
+			}
+
 			var (
-				ae *AbortError
-				ue *UnrecoverableError
-				he *HandoffError
+				_, isAbort          = errors.AsType[*AbortError](err)
+				ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
+				_, isHandoff        = errors.AsType[*HandoffError](err)
 			)
 			switch {
-			case err == nil:
-				continue
-			case errors.As(err, &ae):
+			case isAbort:
 				localActionCounterVec.WithLabelValues("abort", "").Inc()
 				localActionDurationVec.WithLabelValues("abort", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", "abort"))
-			case errors.As(err, &ue):
+			case isUnrecoverable:
 				kind := ue.Kind.String()
 				localActionCounterVec.WithLabelValues("unrecoverable", kind).Inc()
 				localActionDurationVec.WithLabelValues("unrecoverable", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", kind))
 				logger.WithError(err).Error("reached unrecoverable error, canceling FSM")
-			case errors.As(err, &he):
+			case isHandoff:
 				localActionCounterVec.WithLabelValues("fsm_handoff_error", "").Inc()
 				localActionDurationVec.WithLabelValues("fsm_handoff_error", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", "handoff"))
@@ -675,7 +680,9 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				State: transitionName,
 			})
 		}
-		if err == nil {
+		// err only reflects the last transition executed; skipped transitions after a failure
+		// return nil, so the recorded run error is the source of truth for overall success.
+		if err == nil && request.Run().fsmErr.Err == nil {
 			localActionCounterVec.WithLabelValues("ok", "").Inc()
 			localActionDurationVec.WithLabelValues("ok", "").Observe(time.Since(actionStartTime).Seconds())
 		}

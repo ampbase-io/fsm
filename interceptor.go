@@ -92,12 +92,11 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 					Action:       run.Action,
 					State:        run.CurrentState,
 				}
-				haltErr *haltError
 			)
 
 			resp, err := next(ctx, req)
-			switch {
-			case errors.As(err, &haltErr):
+			switch haltErr, isHalt := errors.AsType[*haltError](err); {
+			case isHalt:
 				logger.WithError(haltErr.err).Info("transition returned cancelable error, completing run")
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
 				event.Error = haltErr.Error()
@@ -159,9 +158,6 @@ func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 				retryCount = RetryFromContext(ctx)
 				lastErr    = errors.New("initial error")
 				resp       AnyResponse
-				ae         *AbortError
-				ue         *UnrecoverableError
-				he         *HandoffError
 			)
 			err := backoff.RetryNotify(
 				func() (err error) {
@@ -176,26 +172,33 @@ func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 						}
 					}()
 					resp, err = next(withRetry(transitionCtx, retryCount), req)
-					switch {
-					case err == nil:
+					if err == nil {
 						localTransitionCounterVec.WithLabelValues("ok").Inc()
 						localTransitionDurationVec.WithLabelValues("ok").Observe(time.Since(transitionStartTime).Seconds())
 						return nil
-					case errors.As(err, &ae):
+					}
+
+					var (
+						_, isAbort          = errors.AsType[*AbortError](err)
+						ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
+						_, isHandoff        = errors.AsType[*HandoffError](err)
+					)
+					switch {
+					case isAbort:
 						localTransitionCounterVec.WithLabelValues("abort").Inc()
 						localTransitionDurationVec.WithLabelValues("abort").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Error("transition aborted")
 						return backoff.Permanent(halt(err))
-					case errors.As(err, &ue):
+					case isUnrecoverable:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", ue.Kind.String()))
 						localTransitionCounterVec.WithLabelValues("unrecoverable").Inc()
 						localTransitionDurationVec.WithLabelValues("unrecoverable").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Error("reached unrecoverable error, canceling FSM")
 						return backoff.Permanent(halt(err))
-					case errors.As(err, &he):
+					case isHandoff:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", "fsmHandoffError"))
-						localTransitionCounterVec.WithLabelValues("fsm_handeoff_error").Inc()
-						localTransitionDurationVec.WithLabelValues("fsm_handeoff_error").Observe(time.Since(transitionStartTime).Seconds())
+						localTransitionCounterVec.WithLabelValues("fsm_handoff_error").Inc()
+						localTransitionDurationVec.WithLabelValues("fsm_handoff_error").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Error("reached fsm handoff error, canceling FSM")
 						return backoff.Permanent(halt(err))
 					case errors.Is(err, context.Canceled):

@@ -39,8 +39,9 @@ type nameable interface {
 	Name() string
 }
 
-// Register creates a new FSM and returns a builder to configure it.
-func Register[R, W any](m *Manager, action string) *fsmStart[R, W] {
+// Register creates a new FSM for the R/W request and response types and returns a builder to
+// configure it, e.g. m.Register[CreateReq, CreateResp]("create").
+func (m *Manager) Register[R, W any](action string) *fsmStart[R, W] {
 	var (
 		r     R
 		w     W
@@ -53,19 +54,17 @@ func Register[R, W any](m *Manager, action string) *fsmStart[R, W] {
 	}
 
 	fs := &fsmStart[R, W]{
-		transitionStep: transitionStep[R, W]{
-			m: m,
-			f: &fsm{
-				action:                action,
-				typeName:              name,
-				alias:                 alias,
-				transitions:           immutable.NewList[string](),
-				registeredTransitions: map[transitionKey]*transition{},
-			},
-			cfg: &TransitionConfig[R, W]{
-				initializers: []Initializer[R, W]{},
-				interceptors: []TransitionInterceptorFunc{},
-			},
+		m: m,
+		f: &fsm{
+			action:                action,
+			typeName:              name,
+			alias:                 alias,
+			transitions:           immutable.NewList[string](),
+			registeredTransitions: map[transitionKey]*transition{},
+		},
+		cfg: &TransitionConfig[R, W]{
+			initializers: []Initializer[R, W]{},
+			interceptors: []TransitionInterceptorFunc{},
 		},
 	}
 
@@ -178,7 +177,7 @@ func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOp
 	s.f.startState = name
 
 	opts := make([]Option[R, W], 0, len(startOpts)+1)
-	opts = append(opts, WithInitializers[R, W](setStarted[R, W](s.m.db)))
+	opts = append(opts, WithInitializers(setStarted[R, W](s.m.db)))
 	for _, o := range startOpts {
 		opts = append(opts, o)
 	}

@@ -143,7 +143,7 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("db path is required")
 	}
 
-	if err := os.MkdirAll(cfg.DBPath, 0600); err != nil {
+	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)
 	}
 
@@ -264,7 +264,7 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 
 	active := map[ActiveKey]fsmv1.RunState{}
 
-	it, err := txn.Get(fsmTable, runPrefixIndex, id)
+	it, err := txn.Get(fsmTable, runIndex, id)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +302,9 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 		if rs.StartVersion.Compare(ulid.ULID{}) == 0 {
 			continue
 		}
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			continue
+		}
 		children = append(children, rs.Run)
 	}
 
@@ -322,112 +325,89 @@ func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) e
 	return nil
 }
 
+// checkRun inspects the current state of the run with the given version. When the run is still in
+// progress it returns a watch channel that fires on the next state change and done is false;
+// otherwise done is true and err holds the run's result. The read transaction is scoped to this
+// call — the watch channel stays valid after the transaction is aborted, as it is only closed by
+// a future write.
+func (m *Manager) checkRun(ctx context.Context, logger logrus.FieldLogger, version ulid.ULID) (<-chan struct{}, bool, error) {
+	txn := m.db.Txn(false)
+	defer txn.Abort()
+
+	ch, item, err := txn.FirstWatch(fsmTable, idIndex, version.String())
+	switch {
+	case err != nil:
+		logger.WithError(err).Error("failed to wait for FSM")
+		return nil, true, err
+	case item == nil:
+		// Lookup from the store in case the FSM has already completed.
+		he, err := m.store.History(ctx, version)
+		switch {
+		case errors.Is(err, ErrFsmNotFound):
+			return nil, true, nil
+		case err != nil:
+			return nil, true, err
+		case he.GetLastEvent().GetError() != "":
+			return nil, true, &haltError{err: errors.New(he.GetLastEvent().GetError())}
+		default:
+			return nil, true, nil
+		}
+	}
+
+	state, ok := item.(runState)
+	switch {
+	case !ok:
+		return nil, true, fmt.Errorf("unexpected type %T", item)
+	case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
+		return nil, true, state.Error.Err
+	default:
+		return ch, false, nil
+	}
+}
+
 // Wait blocks until the run with the given version completes.
 func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
-	var (
-		v      = version.String()
-		logger = m.logger.WithField("start_version", v)
-	)
+	logger := m.logger.WithField("start_version", version.String())
 
 	logger.Info("waiting for FSM to finish")
 	defer logger.Info("done waiting for FSM to finish")
 	for {
-		txn := m.db.Txn(false)
-		ws := memdb.NewWatchSet()
-		defer txn.Abort()
-
-		ch, item, err := txn.FirstWatch(fsmTable, idIndex, v)
-		switch {
-		case err != nil:
-			logger.WithError(err).Error("failed to wait for FSM")
+		ch, done, err := m.checkRun(ctx, logger, version)
+		if done {
 			return err
-		case item == nil:
-			// Lookup from the store in case the FSM has already completed.
-			he, err := m.store.History(ctx, version)
-			switch {
-			case errors.Is(err, ErrFsmNotFound):
-				return nil
-			case err != nil:
-				return err
-			case he.GetLastEvent().GetError() != "":
-				return &haltError{err: errors.New(he.GetLastEvent().GetError())}
-			default:
-				return nil
-			}
 		}
+		logger.Info("FSM still running")
 
-		state, ok := item.(runState)
-		switch {
-		case !ok:
-			return fmt.Errorf("unexpected type %T", item)
-		case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
-			return state.Error.Err
-		default:
-			ws.Add(ch)
-		}
-
-		err = ws.WatchCtx(ctx)
-		switch {
+		ws := memdb.NewWatchSet()
+		ws.Add(ch)
+		switch err := ws.WatchCtx(ctx); {
 		case errors.Is(err, context.Canceled):
 			return err
 		case err != nil:
 			logger.WithError(err).Error("failed to wait for FSM")
 			return err
 		}
-
-		roTxn := m.db.Txn(false)
-		defer roTxn.Abort()
-
-		item, err = roTxn.First(fsmTable, idIndex, v)
-		switch {
-		case err != nil:
-			return err
-		case item == nil:
-			// Lookup from the store in case the FSM has already completed.
-			he, err := m.store.History(ctx, version)
-			switch {
-			case errors.Is(err, ErrFsmNotFound):
-				return nil
-			case err != nil:
-				return err
-			case he.GetLastEvent().GetError() != "":
-				return &haltError{err: errors.New(he.GetLastEvent().GetError())}
-			default:
-				return nil
-			}
-		default:
-			state, ok := item.(runState)
-			switch {
-			case !ok:
-				return fmt.Errorf("unexpected type %T", item)
-			case state.State == fsmv1.RunState_RUN_STATE_PENDING, state.State == fsmv1.RunState_RUN_STATE_RUNNING:
-				logger.Info("FSM still running")
-			case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
-				return state.Error.Err
-			}
-		}
 	}
 }
 
 // WaitByID blocks until the run with the given ID completes.
 func (m *Manager) WaitByID(ctx context.Context, id string) error {
-	var (
-		logger = m.logger.WithField("fsm_run_id", id)
-	)
+	logger := m.logger.WithField("fsm_run_id", id)
 
 	logger.Info("waiting for FSM to finish")
 	defer logger.Info("done waiting for FSM to finish")
 	for {
-		txn := m.db.Txn(false)
-		defer txn.Abort()
-
+		// Resolve the id to the run's start version. A zero version falls through to checkRun,
+		// which reports the run as not found.
 		var version ulid.ULID
-		itemByID, err := txn.First(fsmTable, runIndex, id)
+		txn := m.db.Txn(false)
+		item, err := txn.First(fsmTable, runIndex, id)
+		txn.Abort()
 		switch {
 		case err != nil:
-		case itemByID == nil:
+		case item == nil:
 		default:
-			rs := itemByID.(runState)
+			rs := item.(runState)
 			if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
 				return rs.Error.Err
 			}
@@ -435,76 +415,20 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 			logger = logger.WithField("start_version", version.String())
 		}
 
-		ch, item, err := txn.FirstWatch(fsmTable, idIndex, version.String())
-		switch {
-		case err != nil:
-			logger.WithError(err).Error("failed to wait for FSM")
+		ch, done, err := m.checkRun(ctx, logger, version)
+		if done {
 			return err
-		case item == nil:
-			// Lookup from the store in case the FSM has already completed.
-			he, err := m.store.History(ctx, version)
-			switch {
-			case errors.Is(err, ErrFsmNotFound):
-				return nil
-			case err != nil:
-				return err
-			case he.GetLastEvent().GetError() != "":
-				return &haltError{err: errors.New(he.GetLastEvent().GetError())}
-			default:
-				return nil
-			}
 		}
+		logger.Info("FSM still running")
 
 		ws := memdb.NewWatchSet()
-		state, ok := item.(runState)
-		switch {
-		case !ok:
-			return fmt.Errorf("unexpected type %T", item)
-		case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
-			return state.Error.Err
-		default:
-			ws.Add(ch)
-		}
-
-		err = ws.WatchCtx(ctx)
-		switch {
+		ws.Add(ch)
+		switch err := ws.WatchCtx(ctx); {
 		case errors.Is(err, context.Canceled):
 			return err
 		case err != nil:
 			logger.WithError(err).Error("failed to wait for FSM")
 			return err
-		}
-
-		roTxn := m.db.Txn(false)
-		defer roTxn.Abort()
-
-		item, err = roTxn.First(fsmTable, idIndex, version.String())
-		switch {
-		case err != nil:
-			return err
-		case item == nil:
-			// Lookup from the store in case the FSM has already completed.
-			he, err := m.store.History(ctx, version)
-			switch {
-			case errors.Is(err, ErrFsmNotFound):
-				return nil
-			case err != nil:
-				return err
-			case he.GetLastEvent().GetError() != "":
-				return &haltError{err: errors.New(he.GetLastEvent().GetError())}
-			default:
-				return nil
-			}
-		default:
-			state, ok := item.(runState)
-			switch {
-			case !ok:
-				return fmt.Errorf("unexpected type %T", item)
-			case state.State == fsmv1.RunState_RUN_STATE_PENDING, state.State == fsmv1.RunState_RUN_STATE_RUNNING:
-				logger.Info("FSM still running")
-			case state.State == fsmv1.RunState_RUN_STATE_COMPLETE:
-				return state.Error.Err
-			}
 		}
 	}
 }

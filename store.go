@@ -120,19 +120,19 @@ func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB
 func (s *boltStore) Close() error {
 	s.logger.Info("shutting down store")
 
-	var err error
 	s.cancel()
 
 	s.logger.Info("waiting for archive loop to finish")
 	<-s.archiveCh
 	s.logger.Info("archive loop finished")
 
-	if err := s.db.Close(); err != nil {
-		err = fmt.Errorf("failed to close state db, %w", err)
+	var err error
+	if dbErr := s.db.Close(); dbErr != nil {
+		err = fmt.Errorf("failed to close state db, %w", dbErr)
 	}
 
-	if err := s.history.Close(); err != nil {
-		err = errors.Join(err, fmt.Errorf("failed to close history db, %w", err))
+	if historyErr := s.history.Close(); historyErr != nil {
+		err = errors.Join(err, fmt.Errorf("failed to close history db, %w", historyErr))
 	}
 
 	return err
@@ -236,7 +236,8 @@ func (s *boltStore) archive(ctx context.Context) {
 						processSpan.RecordError(err)
 						continue
 					}
-					historyB.Put(historyEvent.GetActiveEvent().GetStartEvent(), historyBytes)
+					// Keyed by run version to match the archive bucket and History lookups.
+					historyB.Put(event.archiveKey, historyBytes)
 				}
 				return nil
 			})
@@ -422,6 +423,14 @@ func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, erro
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
 	for _, ae := range activeEvents {
+		// The queue and parent are restored from the persisted event options rather than from f,
+		// whose fields only reflect the most recent Start call.
+		var parent ulid.ULID
+		if parentBytes := ae.active.GetOptions().GetParent(); parentBytes != nil {
+			if err := parent.UnmarshalText(parentBytes); err != nil {
+				s.logger.WithError(err).Error("failed to unmarshal parent")
+			}
+		}
 		rs := runState{
 			Run: Run{
 				ID:           ae.active.GetResourceId(),
@@ -429,8 +438,8 @@ func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, erro
 				Action:       f.action,
 				ResourceName: f.alias,
 				TypeName:     f.typeName,
-				Queue:        f.queue,
-				Parent:       f.parent,
+				Queue:        ae.active.GetOptions().GetQueue(),
+				Parent:       parent,
 				fsmErr:       ae.fsmError,
 			},
 			State: fsmv1.RunState_RUN_STATE_PENDING,
@@ -632,29 +641,28 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 				}
 			}
 
-			if queue == "" {
-				switch deleted, err := txn.DeleteAll(fsmTable, runIndex, run.ID); {
-				case err != nil:
-					return err
-				case deleted > 0:
-					s.logger.WithField("id", run.ID).Info("deleted existing run")
-				}
-			} else {
-				switch iter, err := txn.Get(fsmTable, runIndex, run.ID); {
-				case err != nil:
-					return err
-				default:
-					for next := iter.Next(); next != nil; next = iter.Next() {
-						rs := next.(runState)
-						if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
-							continue
-						}
-						if err := txn.Delete(fsmTable, next.(runState)); err != nil {
-							return err
-						}
+			// Clear out completed runs for this resource id so stale rows don't accumulate.
+			// Runs that are still in flight are left alone: the same id may be actively running
+			// under a different action, and deleting its row would make waiters believe it
+			// finished.
+			switch iter, err := txn.Get(fsmTable, runIndex, run.ID); {
+			case err != nil:
+				return err
+			default:
+				deleted := 0
+				for next := iter.Next(); next != nil; next = iter.Next() {
+					rs := next.(runState)
+					if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
+						continue
 					}
+					if err := txn.Delete(fsmTable, rs); err != nil {
+						return err
+					}
+					deleted++
 				}
-
+				if deleted > 0 {
+					s.logger.WithField("id", run.ID).Info("deleted completed runs")
+				}
 			}
 
 			rs.State = fsmv1.RunState_RUN_STATE_PENDING

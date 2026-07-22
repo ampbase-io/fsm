@@ -1,6 +1,6 @@
 module github.com/superfly/fsm
 
-go 1.26
+go 1.27rc1
 
 require (
 	connectrpc.com/connect v1.18.1
