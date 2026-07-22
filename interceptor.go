@@ -194,8 +194,8 @@ func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 						return backoff.Permanent(halt(err))
 					case errors.As(err, &he):
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", "fsmHandoffError"))
-						localTransitionCounterVec.WithLabelValues("fsm_handeoff_error").Inc()
-						localTransitionDurationVec.WithLabelValues("fsm_handeoff_error").Observe(time.Since(transitionStartTime).Seconds())
+						localTransitionCounterVec.WithLabelValues("fsm_handoff_error").Inc()
+						localTransitionDurationVec.WithLabelValues("fsm_handoff_error").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Error("reached fsm handoff error, canceling FSM")
 						return backoff.Permanent(halt(err))
 					case errors.Is(err, context.Canceled):

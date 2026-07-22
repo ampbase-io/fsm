@@ -143,7 +143,7 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("db path is required")
 	}
 
-	if err := os.MkdirAll(cfg.DBPath, 0600); err != nil {
+	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)
 	}
 
@@ -264,7 +264,7 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 
 	active := map[ActiveKey]fsmv1.RunState{}
 
-	it, err := txn.Get(fsmTable, runPrefixIndex, id)
+	it, err := txn.Get(fsmTable, runIndex, id)
 	if err != nil {
 		return nil, err
 	}
@@ -300,6 +300,9 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 	for next := it.Next(); next != nil; next = it.Next() {
 		rs := next.(runState)
 		if rs.StartVersion.Compare(ulid.ULID{}) == 0 {
+			continue
+		}
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
 			continue
 		}
 		children = append(children, rs.Run)

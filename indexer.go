@@ -20,7 +20,12 @@ func (ulidIndexer) FromArgs(args ...interface{}) ([]byte, error) {
 		return nil, fmt.Errorf("wrong type for arg %T, expected string", args[0])
 	}
 
-	return ulid.MustParse(s).Bytes(), nil
+	id, err := ulid.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse ULID %q: %w", s, err)
+	}
+
+	return id.Bytes(), nil
 }
 
 func (u ulidIndexer) FromObject(raw interface{}) (bool, []byte, error) {
