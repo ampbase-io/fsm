@@ -3,10 +3,11 @@ package fsm
 import (
 	"context"
 	"errors"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
 	"go.etcd.io/bbolt"
 )
@@ -15,33 +16,18 @@ type orderReq struct{ Name string }
 
 type orderResp struct{ Status string }
 
-// newTestManager creates a Manager backed by a short-lived temp dir. The dir is created directly
-// under /tmp to keep the admin unix socket path under the sun_path length limit.
+// newTestManager creates a BoltDB-backed Manager for tests that are specific to that backend;
+// backend-agnostic behavior tests use runBackends instead.
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
-	return newTestManagerWithQueues(t, nil)
-}
-
-func newTestManagerWithQueues(t *testing.T, queues map[string]int) *Manager {
-	t.Helper()
-
-	dir, err := os.MkdirTemp("/tmp", "fsm-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-
-	m, err := New(Config{DBPath: dir, Queues: queues})
-	if err != nil {
-		t.Fatalf("failed to create manager: %v", err)
-	}
-	t.Cleanup(func() { m.Shutdown(5 * time.Second) })
-
+	m, _ := newBoltFactory(t).newManager(nil)
 	return m
 }
 
-func TestEndToEnd(t *testing.T) {
-	m := newTestManager(t)
+func TestEndToEnd(t *testing.T) { runBackends(t, testEndToEnd) }
+
+func testEndToEnd(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var transitions atomic.Int32
@@ -143,9 +129,46 @@ func TestHistoryAfterArchive(t *testing.T) {
 	}
 }
 
+// TestHistory verifies a completed run is immediately retrievable via History on both backends
+// (BoltDB serves it from the archive bucket, object storage from the FINISH-time history object).
+func TestHistory(t *testing.T) { runBackends(t, testHistory) }
+
+func testHistory(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	start, _, err := m.Register[orderReq, orderResp]("history").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			return NewResponse(&orderResp{Status: "ok"}), nil
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "order-3", NewRequest(&orderReq{Name: "widget"}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	if err := m.Wait(ctx, version); err != nil {
+		t.Fatalf("FSM completed with error: %v", err)
+	}
+
+	he, err := m.store.History(ctx, version)
+	if err != nil {
+		t.Fatalf("History failed: %v", err)
+	}
+	if he.GetLastEvent().GetType() != fsmv1.EventType_EVENT_TYPE_FINISH {
+		t.Fatalf("expected FINISH last event, got %v", he.GetLastEvent().GetType())
+	}
+}
+
 // TestActiveExactID verifies Active only returns runs for the exact id, not ids sharing a prefix.
-func TestActiveExactID(t *testing.T) {
-	m := newTestManager(t)
+func TestActiveExactID(t *testing.T) { runBackends(t, testActiveExactID) }
+
+func testActiveExactID(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -202,14 +225,10 @@ func TestActiveExactID(t *testing.T) {
 }
 
 // TestResumeAfterShutdown verifies an interrupted run is picked back up by Resume after the
-// manager restarts on the same data directory.
-func TestResumeAfterShutdown(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "fsm-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+// manager restarts on the same storage.
+func TestResumeAfterShutdown(t *testing.T) { runBackends(t, testResumeAfterShutdown) }
 
+func testResumeAfterShutdown(t *testing.T, f *managerFactory) {
 	ctx := context.Background()
 
 	var allowComplete, sawRestart atomic.Bool
@@ -235,10 +254,7 @@ func TestResumeAfterShutdown(t *testing.T) {
 			Build(ctx)
 	}
 
-	m1, err := New(Config{DBPath: dir})
-	if err != nil {
-		t.Fatalf("failed to create first manager: %v", err)
-	}
+	m1, stop1 := f.newManager(nil)
 
 	start, _, err := register(m1)
 	if err != nil {
@@ -254,15 +270,11 @@ func TestResumeAfterShutdown(t *testing.T) {
 	if sawRestart.Load() {
 		t.Fatal("fresh run should not be marked as a restart")
 	}
-	m1.Shutdown(5 * time.Second)
+	stop1()
 
 	allowComplete.Store(true)
 
-	m2, err := New(Config{DBPath: dir})
-	if err != nil {
-		t.Fatalf("failed to create second manager: %v", err)
-	}
-	t.Cleanup(func() { m2.Shutdown(5 * time.Second) })
+	m2, _ := f.newManager(nil)
 
 	_, resume, err := register(m2)
 	if err != nil {
@@ -292,7 +304,11 @@ func TestResumeAfterShutdown(t *testing.T) {
 // TestAbortSkipsRemainingTransitions verifies an aborting transition halts the run: later
 // transitions are skipped, the finalizer observes the failure, and Wait surfaces the error.
 func TestAbortSkipsRemainingTransitions(t *testing.T) {
-	m := newTestManager(t)
+	runBackends(t, testAbortSkipsRemainingTransitions)
+}
+
+func testAbortSkipsRemainingTransitions(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var thirdRan atomic.Bool
@@ -350,8 +366,10 @@ func TestAbortSkipsRemainingTransitions(t *testing.T) {
 
 // TestRetryUntilSuccess verifies a failing transition is retried with the attempt count exposed
 // via RetryFromContext, and the run completes once the transition succeeds.
-func TestRetryUntilSuccess(t *testing.T) {
-	m := newTestManager(t)
+func TestRetryUntilSuccess(t *testing.T) { runBackends(t, testRetryUntilSuccess) }
+
+func testRetryUntilSuccess(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -392,7 +410,11 @@ func TestRetryUntilSuccess(t *testing.T) {
 // TestInitializersInterceptorsFinalizers verifies the option hooks: initializers seed the
 // transition context, interceptors wrap execution, and finalizers run on success with no error.
 func TestInitializersInterceptorsFinalizers(t *testing.T) {
-	m := newTestManager(t)
+	runBackends(t, testInitializersInterceptorsFinalizers)
+}
+
+func testInitializersInterceptorsFinalizers(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	type ctxKey struct{}

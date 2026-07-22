@@ -102,25 +102,28 @@ type Config struct {
 	Logger logrus.FieldLogger
 
 	// DBPath is the directory to use for persisting FSM state with the BoltDB backend.
+	// Exactly one of DBPath or ObjectStorage must be set.
 	DBPath string
 
-	// ObjectStorage configures the S3-compatible object storage backend.
-	//
-	// NOT YET IMPLEMENTED: the manager does not select a backend from this field yet; New
-	// returns an error when it is set. It will become mutually exclusive with DBPath once the
-	// object storage backend lands (Phase 3 of the object storage RFC).
+	// ObjectStorage configures the S3-compatible object storage backend. Exactly one of DBPath
+	// or ObjectStorage must be set.
 	ObjectStorage *ObjectStorageConfig
+
+	// AdminSocketPath is the unix socket path for the admin service. Defaults to
+	// "<DBPath>/fsm.sock" for the BoltDB backend; with the object storage backend the admin
+	// service is only started when this is set.
+	AdminSocketPath string
 
 	// Queues defines which queues are available for FSMs to use. The key is the queue name and the
 	// value is the maximum number of FSMs that can run concurrently.
 	Queues map[string]int
 
-	// NodeID is a unique identifier for this node. Required for the object storage backend
-	// once implemented; ignored for BoltDB.
+	// NodeID is a unique identifier for this node. Used by the object storage backend's cluster
+	// coordination (Phase 4 of the object storage RFC); ignored for BoltDB.
 	NodeID string
 
-	// NodeAddr is the address reachable by other nodes for cancel RPC. Required for the object
-	// storage backend once implemented; ignored for BoltDB.
+	// NodeAddr is the address reachable by other nodes for cancel RPC. Used by the object
+	// storage backend's cluster coordination (Phase 4); ignored for BoltDB.
 	NodeAddr string
 }
 
@@ -135,16 +138,11 @@ func New(cfg Config) (*Manager, error) {
 		cfg.Logger = logrus.New()
 	}
 
-	if cfg.ObjectStorage != nil {
-		return nil, errors.New("object storage backend is not yet supported; set DBPath to use the BoltDB backend")
+	if cfg.DBPath == "" && cfg.ObjectStorage == nil {
+		return nil, errors.New("a storage backend is required: set DBPath (BoltDB) or ObjectStorage")
 	}
-
-	if cfg.DBPath == "" {
-		return nil, errors.New("db path is required")
-	}
-
-	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
-		return nil, fmt.Errorf("failed to setup DB path: %w", err)
+	if cfg.DBPath != "" && cfg.ObjectStorage != nil {
+		return nil, errors.New("DBPath and ObjectStorage are mutually exclusive; set exactly one")
 	}
 
 	tracer := otel.GetTracerProvider().Tracer(tracerName,
@@ -152,9 +150,22 @@ func New(cfg Config) (*Manager, error) {
 		trace.WithSchemaURL(semconv.SchemaURL),
 	)
 
-	store, err := newStore(cfg.Logger.WithField("sys", "fsm-store"), tracer, cfg.DBPath, memDB)
-	if err != nil {
-		return nil, err
+	var store Store
+	if cfg.ObjectStorage != nil {
+		var err error
+		store, err = newObjectStore(context.Background(), cfg.Logger.WithField("sys", "fsm-store"), cfg.ObjectStorage, memDB)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
+			return nil, fmt.Errorf("failed to setup DB path: %w", err)
+		}
+
+		store, err = newStore(cfg.Logger.WithField("sys", "fsm-store"), tracer, cfg.DBPath, memDB)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	done := make(chan struct{})
@@ -181,6 +192,15 @@ func New(cfg Config) (*Manager, error) {
 		go q.run(done, cfg.Logger.WithField("queue", name))
 	}
 
+	socket := cfg.AdminSocketPath
+	if socket == "" && cfg.DBPath != "" {
+		socket = filepath.Join(cfg.DBPath, "fsm.sock")
+	}
+	if socket == "" {
+		man.logger.Info("no admin socket path configured, admin service disabled")
+		return man, nil
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle(fsmv1connect.NewFSMServiceHandler(&adminServer{
 		m: man,
@@ -190,7 +210,6 @@ func New(cfg Config) (*Manager, error) {
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
 	}
 
-	socket := filepath.Join(cfg.DBPath, "fsm.sock")
 	os.Remove(socket)
 	unixListener, err := net.Listen("unix", socket)
 	if err != nil {

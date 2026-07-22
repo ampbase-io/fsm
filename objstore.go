@@ -18,6 +18,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -62,9 +63,10 @@ type objectStore struct {
 	logger logrus.FieldLogger
 	client *s3.Client
 	cfg    *ObjectStorageConfig
+	memDB  *memdb.MemDB
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, memDB *memdb.MemDB) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -87,6 +89,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		logger: logger,
 		client: client,
 		cfg:    cfg,
+		memDB:  memDB,
 	}, nil
 }
 
@@ -105,6 +108,11 @@ func consistentRead(o *s3.Options) {
 // path-cleaned, so segments like ".." remain literal segment names with no traversal semantics.
 func escapeSegment(s string) string {
 	return url.PathEscape(s)
+}
+
+// unescapeSegment reverses escapeSegment when parsing values back out of listed keys.
+func unescapeSegment(s string) (string, error) {
+	return url.PathUnescape(s)
 }
 
 // key joins the configured prefix and the given segments verbatim. Caller-supplied segments
@@ -203,6 +211,49 @@ func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) 
 			return fmt.Errorf("put object %s: %w", key, err)
 		}
 	}
+}
+
+var errEtagMismatch = errors.New("precondition failed: etag mismatch")
+
+// putIfMatch writes an object only if its current ETag matches (If-Match), providing
+// compare-and-swap semantics. Returns errEtagMismatch when the object changed since the read
+// that produced etag. Retries on 409 Conflict like putIfAbsent.
+func (s *objectStore) putIfMatch(ctx context.Context, key string, body []byte, etag string) error {
+	for attempt := 0; ; attempt++ {
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:  &s.cfg.Bucket,
+			Key:     &key,
+			Body:    bytes.NewReader(body),
+			IfMatch: aws.String(etag),
+		})
+		switch {
+		case err == nil:
+			return nil
+		case isPreconditionFailed(err):
+			return errEtagMismatch
+		case isConditionalConflict(err) && attempt < maxConditionalRetries:
+			delay := time.Duration(50<<attempt) * time.Millisecond
+			s.logger.WithField("key", key).WithField("attempt", attempt).Debug("conditional write conflict, retrying")
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		default:
+			return fmt.Errorf("put object %s: %w", key, err)
+		}
+	}
+}
+
+// deleteObject removes an object. Deleting a missing key is not an error.
+func (s *objectStore) deleteObject(ctx context.Context, key string) error {
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.cfg.Bucket,
+		Key:    &key,
+	}); err != nil {
+		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
 }
 
 // getObject reads an object and returns its body and ETag.

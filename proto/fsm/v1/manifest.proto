@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package fsm.v1;
+
+// RunManifest is the per-run coordination object for the object storage backend. It is the
+// linearization point for all run state: every state transition is sequenced through a
+// conditional write (If-Match CAS) to this object, and it materializes everything recovery
+// needs so resume never reads the event log.
+message RunManifest {
+  // status is one of "pending", "running", "complete", "archived".
+  string status = 1;
+
+  string resource_type = 2;
+
+  string resource_id = 3;
+
+  string action = 4;
+
+  bytes run_version = 5;
+
+  bytes start_event_key = 6;
+
+  // end_event_key is set when the FINISH event is recorded.
+  bytes end_event_key = 7;
+
+  bytes latest_event_key = 8;
+
+  int32 event_count = 9;
+
+  repeated string transitions = 10;
+
+  repeated string completed_states = 11;
+
+  // resource is the serialized request (the R in Request[R, W]).
+  bytes resource = 12;
+
+  // latest_response is the serialized response from the most recent COMPLETE event.
+  bytes latest_response = 13;
+
+  string queue = 14;
+
+  bytes parent = 15;
+
+  map<string, string> trace_context = 16;
+
+  int64 delay_until = 17;
+
+  bytes run_after = 18;
+
+  uint64 retry_count = 19;
+
+  string error = 20;
+
+  string error_state = 21;
+
+  // Cluster coordination (used from Phase 4 onward).
+  string owner_node = 22;
+
+  int64 lease_expiry = 23;
+
+  int64 lease_epoch = 24;
+
+  int64 created_at = 25;
+
+  int64 updated_at = 26;
+}
