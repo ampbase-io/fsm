@@ -101,22 +101,26 @@ type fsmKey struct {
 type Config struct {
 	Logger logrus.FieldLogger
 
-	// DBPath is the directory to use for persisting FSM state.
-	// Set DBPath for the BoltDB backend (default, existing behavior),
-	// or ObjectStorage for the S3-compatible backend. Exactly one must be set.
+	// DBPath is the directory to use for persisting FSM state with the BoltDB backend.
 	DBPath string
 
 	// ObjectStorage configures the S3-compatible object storage backend.
+	//
+	// NOT YET IMPLEMENTED: the manager does not select a backend from this field yet; New
+	// returns an error when it is set. It will become mutually exclusive with DBPath once the
+	// object storage backend lands (Phase 3 of the object storage RFC).
 	ObjectStorage *ObjectStorageConfig
 
 	// Queues defines which queues are available for FSMs to use. The key is the queue name and the
 	// value is the maximum number of FSMs that can run concurrently.
 	Queues map[string]int
 
-	// NodeID is a unique identifier for this node. Required for the object storage backend.
+	// NodeID is a unique identifier for this node. Required for the object storage backend
+	// once implemented; ignored for BoltDB.
 	NodeID string
 
-	// NodeAddr is the address reachable by other nodes for cancel RPC. Required for the object storage backend.
+	// NodeAddr is the address reachable by other nodes for cancel RPC. Required for the object
+	// storage backend once implemented; ignored for BoltDB.
 	NodeAddr string
 }
 
@@ -129,6 +133,10 @@ func New(cfg Config) (*Manager, error) {
 
 	if cfg.Logger == nil {
 		cfg.Logger = logrus.New()
+	}
+
+	if cfg.ObjectStorage != nil {
+		return nil, errors.New("object storage backend is not yet supported; set DBPath to use the BoltDB backend")
 	}
 
 	if cfg.DBPath == "" {

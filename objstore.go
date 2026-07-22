@@ -6,17 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
+	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
-	"net/http"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -24,7 +25,7 @@ import (
 
 // ObjectStorageConfig configures the S3-compatible object storage backend.
 type ObjectStorageConfig struct {
-	Bucket   string // S3 bucket name
+	Bucket   string // S3 bucket name (required)
 	Endpoint string // e.g., "https://fly.storage.tigris.dev"
 	Region   string // e.g., "auto" for Tigris
 	Prefix   string // Key namespace prefix, default "fsm/"
@@ -64,6 +65,10 @@ type objectStore struct {
 }
 
 func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
+	if cfg.Bucket == "" {
+		return nil, errors.New("object storage bucket is required")
+	}
+
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.Region),
 	)
@@ -85,26 +90,50 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	}, nil
 }
 
+// consistentRead routes the request to the leader on Tigris so reads observe all prior
+// writes, which the read-then-conditional-write flows depend on. Other S3 implementations
+// ignore the header (S3 itself is strongly consistent).
+func consistentRead(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, smithyhttp.SetHeaderValue("X-Tigris-Consistent", "true"))
+}
+
 // --- Key helpers ---
 
+// escapeSegment makes a caller-supplied value safe to embed as a single object key segment.
+// Escaping "/" (and friends) prevents a resource id or action from introducing extra key
+// hierarchy and breaking the prefix-listing contract. Keys are joined verbatim rather than
+// path-cleaned, so segments like ".." remain literal segment names with no traversal semantics.
+func escapeSegment(s string) string {
+	return url.PathEscape(s)
+}
+
+// key joins the configured prefix and the given segments verbatim. Caller-supplied segments
+// must already be escaped with escapeSegment.
+func (s *objectStore) key(segments ...string) string {
+	parts := make([]string, 0, len(segments)+1)
+	parts = append(parts, strings.TrimSuffix(s.cfg.prefix(), "/"))
+	parts = append(parts, segments...)
+	return strings.Join(parts, "/")
+}
+
 func (s *objectStore) eventKey(resourceID, action string, runVersion, eventVersion ulid.ULID) string {
-	return path.Join(s.cfg.prefix(), "events", resourceID, action, runVersion.String(), eventVersion.String())
+	return s.key("events", escapeSegment(resourceID), escapeSegment(action), runVersion.String(), eventVersion.String())
 }
 
 func (s *objectStore) eventPrefix(resourceID, action string, runVersion ulid.ULID) string {
-	return path.Join(s.cfg.prefix(), "events", resourceID, action, runVersion.String()) + "/"
+	return s.key("events", escapeSegment(resourceID), escapeSegment(action), runVersion.String()) + "/"
 }
 
 func (s *objectStore) historyKey(date string, runVersion ulid.ULID) string {
-	return path.Join(s.cfg.prefix(), "history", date, runVersion.String())
+	return s.key("history", date, runVersion.String())
 }
 
 func (s *objectStore) childKey(parent, child ulid.ULID) string {
-	return path.Join(s.cfg.prefix(), "children", parent.String(), child.String())
+	return s.key("children", parent.String(), child.String())
 }
 
 func (s *objectStore) childPrefix(parent ulid.ULID) string {
-	return path.Join(s.cfg.prefix(), "children", parent.String()) + "/"
+	return s.key("children", parent.String()) + "/"
 }
 
 // --- Conditional write helpers ---
@@ -119,28 +148,51 @@ func isPreconditionFailed(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusPreconditionFailed
 }
 
+// isConditionalConflict checks if an S3 error is a 409 Conflict response. S3 returns 409
+// (ConditionalRequestConflict) when concurrent conditional writes race on the same key; the
+// request should be retried, after which the winner's object exists and the retry observes 412.
+func isConditionalConflict(err error) bool {
+	var httpErr interface{ HTTPStatusCode() int }
+	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusConflict
+}
+
 // isNotFound checks if an S3 error is a 404 Not Found response.
 func isNotFound(err error) bool {
 	var httpErr interface{ HTTPStatusCode() int }
 	return errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound
 }
 
+// maxConditionalRetries bounds retries of conditional writes that fail with 409 Conflict.
+const maxConditionalRetries = 5
+
 // putIfAbsent writes an object only if it does not already exist (If-None-Match: *).
-// Returns errPreconditionFailed if the object already exists.
+// Returns errPreconditionFailed if the object already exists. Retries on 409 Conflict,
+// which S3 returns when concurrent conditional writes race on the same key.
 func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) error {
-	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      &s.cfg.Bucket,
-		Key:         &key,
-		Body:        bytes.NewReader(body),
-		IfNoneMatch: aws.String("*"),
-	})
-	if err != nil {
-		if isPreconditionFailed(err) {
+	for attempt := 0; ; attempt++ {
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      &s.cfg.Bucket,
+			Key:         &key,
+			Body:        bytes.NewReader(body),
+			IfNoneMatch: aws.String("*"),
+		})
+		switch {
+		case err == nil:
+			return nil
+		case isPreconditionFailed(err):
 			return errPreconditionFailed
+		case isConditionalConflict(err) && attempt < maxConditionalRetries:
+			delay := time.Duration(50<<attempt) * time.Millisecond
+			s.logger.WithField("key", key).WithField("attempt", attempt).Debug("conditional write conflict, retrying")
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		default:
+			return fmt.Errorf("put object %s: %w", key, err)
 		}
-		return fmt.Errorf("put object %s: %w", key, err)
 	}
-	return nil
 }
 
 // getObject reads an object and returns its body and ETag.
@@ -148,7 +200,7 @@ func (s *objectStore) getObject(ctx context.Context, key string) ([]byte, string
 	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.cfg.Bucket,
 		Key:    &key,
-	})
+	}, consistentRead)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, "", ErrFsmNotFound
@@ -166,10 +218,35 @@ func (s *objectStore) getObject(ctx context.Context, key string) ([]byte, string
 	return body, etag, nil
 }
 
+// listKeys returns all object keys under the given prefix in lexicographic order.
+func (s *objectStore) listKeys(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: &s.cfg.Bucket,
+		Prefix: &prefix,
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx, consistentRead)
+		if err != nil {
+			return nil, fmt.Errorf("list objects with prefix %s: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+	}
+	return keys, nil
+}
+
 // --- Event operations ---
 
-// appendEvent writes a single event object. The event is immutable — if it already
-// exists (duplicate write after crash), the 412 is silently ignored.
+// appendEvent writes a single event object with create-if-absent semantics.
+//
+// Idempotency contract: retrying after a crash is only safe when the SAME eventVersion is
+// reused for the retry — the write then observes 412 and is treated as already-applied. A
+// caller that mints a fresh event version per attempt (as boltStore.Append does today) would
+// append a duplicate event under a new key instead. Phase 3's Append must derive the event
+// version before the first write attempt and reuse it across retries.
 func (s *objectStore) appendEvent(ctx context.Context, resourceID, action string, runVersion, eventVersion ulid.ULID, event *fsmv1.StateEvent) error {
 	body, err := proto.Marshal(event)
 	if err != nil {
@@ -187,37 +264,54 @@ func (s *objectStore) appendEvent(ctx context.Context, resourceID, action string
 	return nil
 }
 
+// listEventFetchers bounds the concurrent object reads performed by listRunEvents.
+const listEventFetchers = 8
+
 // listRunEvents lists all events for a run in chronological order (ULID lexicographic order).
+// Any failure to read or decode an event fails the whole listing: callers use the result to
+// decide which transitions to re-execute on resume, so a silently dropped event would cause a
+// completed transition to run again.
 func (s *objectStore) listRunEvents(ctx context.Context, resourceID, action string, runVersion ulid.ULID) ([]*fsmv1.StateEvent, error) {
-	prefix := s.eventPrefix(resourceID, action, runVersion)
-
-	var events []*fsmv1.StateEvent
-	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: &s.cfg.Bucket,
-		Prefix: &prefix,
-	})
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list events with prefix %s: %w", prefix, err)
-		}
-
-		for _, obj := range page.Contents {
-			body, _, err := s.getObject(ctx, aws.ToString(obj.Key))
-			if err != nil {
-				return nil, err
-			}
-
-			var event fsmv1.StateEvent
-			if err := proto.Unmarshal(body, &event); err != nil {
-				s.logger.WithError(err).WithField("key", aws.ToString(obj.Key)).Error("failed to unmarshal event")
-				continue
-			}
-			events = append(events, &event)
-		}
+	keys, err := s.listKeys(ctx, s.eventPrefix(resourceID, action, runVersion))
+	if err != nil {
+		return nil, err
 	}
 
+	var (
+		events   = make([]*fsmv1.StateEvent, len(keys))
+		sem      = make(chan struct{}, listEventFetchers)
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		fetchErr error
+	)
+	for i, key := range keys {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			body, _, err := s.getObject(ctx, key)
+			if err == nil {
+				var event fsmv1.StateEvent
+				if uerr := proto.Unmarshal(body, &event); uerr != nil {
+					err = fmt.Errorf("unmarshal event %s: %w", key, uerr)
+				} else {
+					events[i] = &event
+					return
+				}
+			}
+
+			mu.Lock()
+			fetchErr = errors.Join(fetchErr, err)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
 	return events, nil
 }
 
@@ -278,33 +372,23 @@ func (s *objectStore) writeChild(ctx context.Context, parent, child ulid.ULID) e
 
 // listChildren returns all child run versions for a parent.
 func (s *objectStore) listChildren(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error) {
-	prefix := s.childPrefix(parent)
+	keys, err := s.listKeys(ctx, s.childPrefix(parent))
+	if err != nil {
+		return nil, err
+	}
 
-	var children []ulid.ULID
-	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: &s.cfg.Bucket,
-		Prefix: &prefix,
-	})
+	children := make([]ulid.ULID, 0, len(keys))
+	for _, key := range keys {
+		// Extract child ULID from the last path segment
+		parts := strings.Split(key, "/")
+		childStr := parts[len(parts)-1]
 
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list children with prefix %s: %w", prefix, err)
+		var child ulid.ULID
+		if err := child.UnmarshalText([]byte(childStr)); err != nil {
+			s.logger.WithError(err).WithField("key", key).Error("failed to parse child ULID from key")
+			continue
 		}
-
-		for _, obj := range page.Contents {
-			key := aws.ToString(obj.Key)
-			// Extract child ULID from the last path segment
-			parts := strings.Split(key, "/")
-			childStr := parts[len(parts)-1]
-
-			var child ulid.ULID
-			if err := child.UnmarshalText([]byte(childStr)); err != nil {
-				s.logger.WithError(err).WithField("key", key).Error("failed to parse child ULID from key")
-				continue
-			}
-			children = append(children, child)
-		}
+		children = append(children, child)
 	}
 
 	return children, nil
