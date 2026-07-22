@@ -10,6 +10,7 @@ import (
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/oklog/ulid/v2"
 	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/protobuf/proto"
@@ -58,10 +59,11 @@ func (s *objectStore) getManifest(ctx context.Context, runVersion ulid.ULID) (*f
 // retrying on concurrent modification. It returns the manifest as written.
 func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest)) (*fsmv1.RunManifest, error) {
 	key := s.manifestKey(runVersion)
-	for attempt := 0; ; attempt++ {
+	var updated *fsmv1.RunManifest
+	op := func() error {
 		manifest, etag, err := s.getManifest(ctx, runVersion)
 		if err != nil {
-			return nil, err
+			return backoff.Permanent(err)
 		}
 
 		mutate(manifest)
@@ -69,18 +71,24 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 
 		body, err := proto.Marshal(manifest)
 		if err != nil {
-			return nil, fmt.Errorf("marshal manifest %s: %w", runVersion, err)
+			return backoff.Permanent(fmt.Errorf("marshal manifest %s: %w", runVersion, err))
 		}
 
 		switch err := s.putIfMatch(ctx, key, body, etag); {
 		case err == nil:
-			return manifest, nil
-		case errors.Is(err, errEtagMismatch) && attempt < maxManifestCASRetries:
-			s.logger.WithField("key", key).WithField("attempt", attempt).Debug("manifest changed concurrently, retrying")
+			updated = manifest
+			return nil
+		case errors.Is(err, errEtagMismatch):
+			s.logger.WithField("key", key).Debug("manifest changed concurrently, retrying")
+			return err
 		default:
-			return nil, err
+			return backoff.Permanent(err)
 		}
 	}
+	if err := backoff.Retry(op, retryBackoff(ctx, maxManifestCASRetries)); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // Append writes an event object and updates the run manifest according to the event type. It is
@@ -165,14 +173,14 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	}
 
 	// 2. Write the START event.
-	if err := s.putIfAbsent(ctx, eventKey, eventBytes); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
 	// 2b. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
 	// events (deleted at archival), index markers persist, so past runs stay enumerable.
 	indexKey := s.runIndexKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.StartVersion)
-	if err := s.putIfAbsent(ctx, indexKey, nil); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if err := s.putIdempotent(ctx, indexKey, nil); err != nil {
 		return err
 	}
 
@@ -203,7 +211,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	if err != nil {
 		return err
 	}
-	if err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if err := s.putIdempotent(ctx, s.manifestKey(run.StartVersion), manifestBytes); err != nil {
 		return err
 	}
 
@@ -244,7 +252,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 }
 
 func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
-	if err := s.putIfAbsent(ctx, eventKey, eventBytes); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
@@ -273,7 +281,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 }
 
 func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, eventKey string, eventBytes []byte) error {
-	if err := s.putIfAbsent(ctx, eventKey, eventBytes); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
