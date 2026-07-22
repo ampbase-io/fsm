@@ -85,6 +85,50 @@ Consumers choose by their reliability need, and neither requires a dependency th
 
 An earlier sketch proposed a purpose-built "notifier" for cross-node `Wait`. That is unnecessary: `Wait` and worker-wakeup are simply the first two consumers of the event stream. One mechanism serves notification, work-available signaling, and arbitrary downstream consumption.
 
+## Part 3: Run-state queries and the memdb boundary
+
+### The current coupling
+
+In the base design, the in-memory index (`go-memdb`) is not a backend detail — it is a `Manager`-level component that both backends write through and the `Manager` reads **directly, bypassing the `Store` interface**, in five places:
+
+| Site | Query |
+|------|-------|
+|`Manager.Active`|active runs for a resource id|
+|`Manager.ActiveChildren`|active children of a parent|
+|`Manager.Wait` (checkRun)|watch a run for completion|
+|`Manager.WaitByID`|resolve id → version, then watch|
+|`adminServer.ListActive`|all active runs on this node|
+
+This encodes an unstated assumption: *there is one authoritative in-process index of every run.* That assumption holds in the single-process model and is **false the moment runs can migrate between nodes.**
+
+### Why it breaks under multi-worker execution
+
+memdb only observes writes from its own process, which produces two failures once a run can be owned by a different node than the one being asked:
+
+1. **It cannot notify across nodes.** A `Wait` for a run this node does not own can never be satisfied by this node's `WatchSet`; the notification has to come from object storage or the event stream regardless.
+2. **A stale entry hangs `Wait`.** If a worker holds `V=running` in memdb, loses its lease (GC pause, partition), and another worker completes `V`, the first worker's `checkRun` still finds a *present, non-terminal* entry and parks on a `WatchSet` that will never fire — it does **not** re-consult object storage while an entry is present. The wait blocks until its context deadline even though `V` finished elsewhere. This is a correctness regression that does not exist with a single writer.
+
+This revises — for the multi-worker case only — the base RFC's "Replacing memdb entirely" abandoned-idea reasoning. That reasoning (keep memdb; polling is too slow for in-process waits) is correct for single-process execution and is retained there. It does not carry into multi-worker execution, where memdb cannot serve the cross-node waits that dominate and the event sink, not raw polling, removes the latency objection.
+
+### Resolution: the Store interface owns run-state queries
+
+Push the five reads above behind the `Store` interface so each backend answers appropriately:
+
+- **Bolt backend** answers from memdb, with `WatchSet` for `Wait`. memdb becomes its private implementation detail — invisible above the `Store` boundary.
+- **Object backend** answers from object storage: `Active`/`ListActive` from the `locks/` prefix, `WaitByID` and id→version resolution from `locks/` + `index/`, `ActiveChildren` from `children/` + manifests, and `Wait` from the event sink (fast path) with a manifest poll floor (correctness).
+
+memdb thus gains no "multi-worker off switch"; it simply stops being part of the object backend's answer. The decision is **backend-typed, not worker-count-typed** — the object backend answers from object storage whether it runs on one node or fifty, so there is no runtime single/multi mode to detect or misconfigure. A single-node object deployment pays a rare poll-floor cost in place of memdb-instant waits, which the event sink makes negligible (see below).
+
+### The same-node fast path: what is lost, and the deferred replacement
+
+Removing memdb from the object path gives up one thing: the **same-node-owner instant wait** — a worker completing a run cannot notify a co-located waiter without an event-sink round trip or a poll. In the split topology this case is rare: the requesting tier is separate (always cross-node), and even worker-side `run_after` / parent waits are usually on runs some *other* worker owns.
+
+If profiling later shows same-node waits matter, the replacement is **not** memdb but a scoped in-process signal — a `map[runVersion]chan struct{}` that `run()` closes when it finishes a run *this node is actively executing*. It is staleness-free by construction: created at execute-start, fired at execute-end, both within the owning goroutine's lifetime; a lease loss cancels the run, which closes the channel and drops the waiter back to object storage. This is a handful of lines, not an indexed cache with invalidation. It is deliberately deferred until measured.
+
+### Cost note
+
+The concern that dropping memdb means "a GET on every poll" only holds without a notification layer. With the event sink, a `Wait` subscribes and returns on the completion event; polling degrades to a rare insurance floor (with adaptive backoff while the sink is healthy), not a per-interval cost. Removing memdb is therefore not a cost regression once the sink exists — and the sink covers the cross-node majority that memdb never helped. A deployment that stays strictly object-storage-only (no injected sink) achieves the same with an object-native completion marker (a small `done/<version>` object polled in place of the full manifest), which — unlike memdb — works across nodes.
+
 ## Interaction with the claim loop
 
 In the distributed topology the Phase 4 claim loop becomes the **primary work-distribution mechanism**, not merely a failover path: workers obtain work by claiming pending runs from object storage. The event stream's "pending" event provides low-latency wakeup so an idle worker claims immediately rather than on its next scan tick; the periodic scan remains the correctness floor.
