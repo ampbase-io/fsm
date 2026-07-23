@@ -3,7 +3,6 @@ package fsm
 import (
 	"context"
 	"errors"
-	"maps"
 	"sync"
 	"time"
 
@@ -19,6 +18,21 @@ const leaseReleaseTimeout = 5 * time.Second
 // errClaimLost reports that a competitor claimed the run first; the loser simply moves on.
 var errClaimLost = errors.New("run claimed by another node")
 
+// leaseState is this node's relationship to a run's lease.
+type leaseState int
+
+const (
+	leaseClaiming leaseState = iota // claim CAS in flight; reserved against same-store claimers
+	leaseHeld                       // lease held at epoch; extended by the heartbeat
+)
+
+// lease is one run's entry in the leases map.
+type lease struct {
+	state leaseState
+
+	epoch int64
+}
+
 // checkFence returns ErrLeaseLost unless the manifest still records this node as owner at the
 // epoch it claimed with. The epoch is the fencing token: a stale owner whose lease was taken
 // over fails this check on every manifest CAS, no matter what its local clock believes.
@@ -32,20 +46,23 @@ func (s *objectStore) checkFence(m *fsmv1.RunManifest, epoch int64) error {
 func (s *objectStore) trackLease(version ulid.ULID, epoch int64) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	s.owned[version] = epoch
+	s.leases[version] = lease{state: leaseHeld, epoch: epoch}
 }
 
 func (s *objectStore) ownedEpoch(version ulid.ULID) (int64, bool) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	epoch, ok := s.owned[version]
-	return epoch, ok
+	l, ok := s.leases[version]
+	if !ok || l.state != leaseHeld {
+		return 0, false
+	}
+	return l.epoch, true
 }
 
 func (s *objectStore) dropLease(version ulid.ULID) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	delete(s.owned, version)
+	delete(s.leases, version)
 }
 
 // noteFence drops the lease and buffers the run for the next heartbeat pass to report, so the
@@ -53,17 +70,26 @@ func (s *objectStore) dropLease(version ulid.ULID) {
 func (s *objectStore) noteFence(version ulid.ULID) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if _, ok := s.owned[version]; !ok {
+	l, ok := s.leases[version]
+	if !ok || l.state != leaseHeld {
 		return
 	}
-	delete(s.owned, version)
+	delete(s.leases, version)
 	s.fenced = append(s.fenced, version)
 }
 
+// snapshotOwned returns the held leases and their epochs; mid-claim entries are excluded.
 func (s *objectStore) snapshotOwned() map[ulid.ULID]int64 {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	return maps.Clone(s.owned)
+	owned := make(map[ulid.ULID]int64, len(s.leases))
+	for version, l := range s.leases {
+		if l.state != leaseHeld {
+			continue
+		}
+		owned[version] = l.epoch
+	}
+	return owned
 }
 
 // owns reports whether this node currently holds the run's lease.
@@ -141,7 +167,7 @@ func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
 // eligible reports whether this node may claim the run: the manifest is claimable and the
 // store neither holds the run nor has a claim on it in flight.
 func (s *objectStore) eligible(version ulid.ULID, m *fsmv1.RunManifest, now time.Time) bool {
-	if s.trackedOrClaiming(version) {
+	if s.hasLease(version) {
 		return false
 	}
 	return s.claimable(m, now)
@@ -165,39 +191,37 @@ func (s *objectStore) claimable(m *fsmv1.RunManifest, now time.Time) bool {
 	}
 }
 
-func (s *objectStore) trackedOrClaiming(version ulid.ULID) bool {
+// hasLease reports whether this node holds or is mid-claim on the run's lease.
+func (s *objectStore) hasLease(version ulid.ULID) bool {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	_, owned := s.owned[version]
-	_, claiming := s.claiming[version]
-	return owned || claiming
+	_, ok := s.leases[version]
+	return ok
 }
 
 // reserveClaim serializes same-store claimers on a run: only one goroutine may be mid-claim,
 // and a run already held is never re-claimed. Without it, a caller-invoked Resume racing the
-// claim tick could both pass the eligibility check (the winner's lease is tracked only after
+// claim tick could both pass the eligibility check (the winner's lease is recorded only after
 // its CAS returns) and claim the run twice, dispatching it twice.
 func (s *objectStore) reserveClaim(version ulid.ULID) bool {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	if _, ok := s.owned[version]; ok {
+	if _, ok := s.leases[version]; ok {
 		return false
 	}
-	if _, ok := s.claiming[version]; ok {
-		return false
-	}
-	s.claiming[version] = struct{}{}
+	s.leases[version] = lease{state: leaseClaiming}
 	return true
 }
 
-// settleClaim clears the in-progress mark, recording the lease epoch when the claim won.
+// settleClaim resolves a reservation: a won claim is held at its epoch, a lost one is gone.
 func (s *objectStore) settleClaim(version ulid.ULID, epoch int64, won bool) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	delete(s.claiming, version)
-	if won {
-		s.owned[version] = epoch
+	if !won {
+		delete(s.leases, version)
+		return
 	}
+	s.leases[version] = lease{state: leaseHeld, epoch: epoch}
 }
 
 // claimManifest takes ownership of the run via manifest CAS. The local reservation excludes

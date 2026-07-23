@@ -818,15 +818,22 @@ func (s *objectStore) completeFinish(version ulid.ULID, runErr RunErr) {
 	defer s.finishMu.Unlock()
 
 	if len(s.finishes) >= maxFinishes {
-		for evict, finish := range s.finishes {
-			if finish.state != finishDone {
-				continue
-			}
-			delete(s.finishes, evict)
-			break
-		}
+		s.evictSettledFinish()
 	}
 	s.finishes[version] = runFinish{state: finishDone, err: runErr}
+}
+
+// evictSettledFinish drops one arbitrary settled finish to bound the map; its waiters fall
+// back to the manifest's recorded error. In-flight entries are never evicted — they gate
+// waiter release — and are bounded by concurrent finishes. Callers hold finishMu.
+func (s *objectStore) evictSettledFinish() {
+	for version, finish := range s.finishes {
+		if finish.state != finishDone {
+			continue
+		}
+		delete(s.finishes, version)
+		return
+	}
 }
 
 // settleFinish clears a finish that failed mid-cleanup. A completed finish was already

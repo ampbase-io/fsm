@@ -89,15 +89,13 @@ type objectStore struct {
 	// process: a zombie sharing a NodeID is still fenced by the lease epoch.
 	nodeID string
 
-	// owned maps each run this node holds a lease on to the lease epoch it claimed with; every
-	// run-mutating manifest CAS re-verifies both. claiming reserves runs mid-claim so
-	// concurrent same-store claimers (a caller-invoked Resume racing the claim tick) cannot
-	// both win. fenced buffers runs whose fence tripped in Append so the next heartbeat pass
-	// reports them for local cancellation.
-	leaseMu  sync.Mutex
-	owned    map[ulid.ULID]int64
-	claiming map[ulid.ULID]struct{}
-	fenced   []ulid.ULID
+	// leases tracks this node's claim on each run: mid-claim (reserved, so concurrent
+	// same-store claimers cannot both win) or held at the epoch that every run-mutating
+	// manifest CAS re-verifies. fenced buffers runs whose fence tripped in Append so the next
+	// heartbeat pass reports them for local cancellation.
+	leaseMu sync.Mutex
+	leases  map[ulid.ULID]lease
+	fenced  []ulid.ULID
 
 	// finishes records this process's knowledge of run finishes, preserving typed run errors
 	// for same-process waiters and holding their release until the finish cleanup (lock
@@ -137,8 +135,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		client:   client,
 		cfg:      cfg,
 		nodeID:   nodeID,
-		owned:    map[ulid.ULID]int64{},
-		claiming: map[ulid.ULID]struct{}{},
+		leases:   map[ulid.ULID]lease{},
 		finishes: map[ulid.ULID]runFinish{},
 	}, nil
 }
