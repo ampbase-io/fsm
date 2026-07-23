@@ -35,21 +35,14 @@ func (s *adminServer) ListRegistered(context.Context, *connect.Request[fsmv1.Lis
 	}), nil
 }
 
-func (s *adminServer) ListActive(context.Context, *connect.Request[fsmv1.ListActiveRequest]) (*connect.Response[fsmv1.ListActiveResponse], error) {
-	txn := s.m.db.Txn(false)
-	defer txn.Abort()
-
-	it, err := txn.Get(fsmTable, idIndex)
+func (s *adminServer) ListActive(ctx context.Context, _ *connect.Request[fsmv1.ListActiveRequest]) (*connect.Response[fsmv1.ListActiveResponse], error) {
+	states, err := s.m.store.ListActive(ctx)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	active := []*fsmv1.ActiveFSM{}
-	for next := it.Next(); next != nil; next = it.Next() {
-		rs := next.(runState)
-		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
-			continue
-		}
+	active := make([]*fsmv1.ActiveFSM, 0, len(states))
+	for _, rs := range states {
 		af := &fsmv1.ActiveFSM{
 			Id:           rs.ID,
 			Action:       rs.Action,

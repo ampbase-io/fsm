@@ -72,6 +72,10 @@ func newObjectFactory(t *testing.T) *managerFactory {
 				Bucket:   bucket,
 				Endpoint: server.URL,
 				Region:   "auto",
+				// The fake S3 answers instantly, so tight poll intervals keep object-backend
+				// waits from eating the default 100ms floor per Wait.
+				WaitPollInterval:    1 * time.Millisecond,
+				WaitPollMaxInterval: 10 * time.Millisecond,
 			},
 			Queues: queues,
 		})
