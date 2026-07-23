@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
@@ -139,18 +138,10 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Helper()
 
-	const bucket = "test-bucket"
-	fake := newFakeS3()
-	server := httptest.NewServer(fake.handler(bucket))
-	t.Cleanup(server.Close)
-
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-
+	bucket, url, fake := startFakeS3(t)
 	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
 		Bucket:   bucket,
-		Endpoint: server.URL,
+		Endpoint: url,
 		Region:   "auto",
 	}, "node-test")
 	if err != nil {

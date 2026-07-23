@@ -3,6 +3,8 @@ package fsm
 import (
 	"context"
 	"errors"
+	"maps"
+	"sync"
 	"time"
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
@@ -61,11 +63,37 @@ func (s *objectStore) noteFence(version ulid.ULID) {
 func (s *objectStore) snapshotOwned() map[ulid.ULID]int64 {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
-	owned := make(map[ulid.ULID]int64, len(s.owned))
-	for version, epoch := range s.owned {
-		owned[version] = epoch
+	return maps.Clone(s.owned)
+}
+
+// owns reports whether this node currently holds the run's lease.
+func (s *objectStore) owns(version ulid.ULID) bool {
+	_, ok := s.ownedEpoch(version)
+	return ok
+}
+
+func (s *objectStore) coordinationIntervals() (heartbeatEvery, claimEvery time.Duration) {
+	return s.cfg.heartbeatPeriod(), s.cfg.claimInterval()
+}
+
+// forEachOwned runs fn over a snapshot of the owned leases, scanFanout at a time. Both the
+// heartbeat and release passes go through it: serially, a node owning many runs could outrun
+// the heartbeat interval and expire the very leases it was extending.
+func (s *objectStore) forEachOwned(fn func(version ulid.ULID, epoch int64)) {
+	var (
+		sem = make(chan struct{}, scanFanout)
+		wg  sync.WaitGroup
+	)
+	for version, epoch := range s.snapshotOwned() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn(version, epoch)
+		}()
 	}
-	return owned
+	wg.Wait()
 }
 
 func (s *objectStore) drainFenced() []ulid.ULID {
@@ -82,8 +110,11 @@ func (s *objectStore) drainFenced() []ulid.ULID {
 // storage errors keep the lease and retry next tick; liveness only degrades to the lease
 // timeout.
 func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
-	lost := s.drainFenced()
-	for version, epoch := range s.snapshotOwned() {
+	var (
+		mu   sync.Mutex
+		lost = s.drainFenced()
+	)
+	s.forEachOwned(func(version ulid.ULID, epoch int64) {
 		_, err := s.casManifest(ctx, version, func(m *fsmv1.RunManifest) error {
 			if err := s.checkFence(m, epoch); err != nil {
 				return err
@@ -95,11 +126,13 @@ func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
 		case err == nil:
 		case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrFsmNotFound):
 			s.dropLease(version)
+			mu.Lock()
 			lost = append(lost, version)
+			mu.Unlock()
 		default:
 			s.logger.WithError(err).WithField("run_version", version.String()).Error("failed to extend lease")
 		}
-	}
+	})
 	return lost
 }
 
@@ -144,33 +177,47 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 	return manifest, nil
 }
 
-// claimRuns claims every eligible run of f and returns them ready for resume. This is the
-// object backend's work-acquisition path: pending, released, and expired-lease runs are all
-// obtained here, whether through the periodic claim pass or a caller-invoked Resume. Failures
-// on individual runs are logged and skipped so one bad manifest cannot block the rest.
-func (s *objectStore) claimRuns(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(f.typeName))
-	if err != nil {
-		return nil, err
+// claimRuns claims every eligible run of the given FSMs and returns them paired with the FSM
+// that will resume each. This is the object backend's work-acquisition path: pending,
+// released, and expired-lease runs are all obtained here, whether through the periodic claim
+// pass or a caller-invoked Resume. One lock scan per distinct resource type serves every
+// action registered on it; failures on individual runs are logged and skipped so one bad
+// manifest cannot block the rest.
+func (s *objectStore) claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error) {
+	byType := map[string]map[string]*fsm{}
+	for _, f := range fsms {
+		actions, ok := byType[f.typeName]
+		if !ok {
+			actions = map[string]*fsm{}
+			byType[f.typeName] = actions
+		}
+		actions[f.action] = f
 	}
 
-	var claimed []*activeResource
-	for _, e := range entries {
-		if e.action != f.action {
-			continue
+	var claimed []claimedRun
+	for typeName, actions := range byType {
+		entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
+		if err != nil {
+			return nil, err
 		}
-		if !s.eligible(e.version, e.manifest, time.Now()) {
-			continue
+		for _, e := range entries {
+			f, ok := actions[e.action]
+			if !ok {
+				continue
+			}
+			if !s.eligible(e.version, e.manifest, time.Now()) {
+				continue
+			}
+			manifest, err := s.claimManifest(ctx, e.version)
+			switch {
+			case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
+				continue
+			case err != nil:
+				s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim run")
+				continue
+			}
+			claimed = append(claimed, claimedRun{f: f, resource: manifestResource(e.version, manifest)})
 		}
-		manifest, err := s.claimManifest(ctx, e.version)
-		switch {
-		case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
-			continue
-		case err != nil:
-			s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim run")
-			continue
-		}
-		claimed = append(claimed, manifestResource(e.version, manifest))
 	}
 	return claimed, nil
 }
@@ -194,7 +241,7 @@ func (s *objectStore) releaseLease(ctx context.Context, version ulid.ULID, epoch
 }
 
 func (s *objectStore) releaseLeases(ctx context.Context) {
-	for version, epoch := range s.snapshotOwned() {
+	s.forEachOwned(func(version ulid.ULID, epoch int64) {
 		s.releaseLease(ctx, version, epoch)
-	}
+	})
 }

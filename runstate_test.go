@@ -36,9 +36,9 @@ func crossManagerTimings(cfg *ObjectStorageConfig) {
 }
 
 // takeOver starts a blocking run on a first manager, lets its lease expire, and completes the
-// run on a second manager via Resume. It returns the two managers, the run version, and the
-// releaser for the first manager's still-blocked transition.
-func takeOver(t *testing.T, f *managerFactory, action, id string) (m1, m2 *Manager, version ulid.ULID, release func()) {
+// run on a second manager via Resume. It returns the first manager, the run version, and the
+// releaser for that manager's still-blocked transition.
+func takeOver(t *testing.T, f *managerFactory, action, id string) (m1 *Manager, version ulid.ULID, release func()) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -58,7 +58,7 @@ func takeOver(t *testing.T, f *managerFactory, action, id string) (m1, m2 *Manag
 	// Once the lease expires the run is claimable; the owner's heartbeat is suppressed.
 	time.Sleep(2 * 250 * time.Millisecond)
 
-	m2, _ = f.newManager(nil)
+	m2, _ := f.newManager(nil)
 	resume := completingFSM(t, m2, action)
 	if err := resume(ctx); err != nil {
 		t.Fatalf("failed to resume on second manager: %v", err)
@@ -69,7 +69,7 @@ func takeOver(t *testing.T, f *managerFactory, action, id string) (m1, m2 *Manag
 		t.Fatalf("resumed run completed with error: %v", err)
 	}
 
-	return m1, m2, version, func() { close(block) }
+	return m1, version, func() { close(block) }
 }
 
 // TestObjectWaitCrossManager is the regression test for the stale-local-index hang: when a run
@@ -79,7 +79,7 @@ func takeOver(t *testing.T, f *managerFactory, action, id string) (m1, m2 *Manag
 func TestObjectWaitCrossManager(t *testing.T) {
 	f := newObjectFactoryWith(t, crossManagerTimings)
 
-	m1, _, version, release := takeOver(t, f, "xwait", "cross-1")
+	m1, version, release := takeOver(t, f, "xwait", "cross-1")
 	defer release()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -94,7 +94,7 @@ func TestObjectWaitCrossManager(t *testing.T) {
 func TestObjectWaitByIDCrossManager(t *testing.T) {
 	f := newObjectFactoryWith(t, crossManagerTimings)
 
-	m1, _, _, release := takeOver(t, f, "xwaitid", "cross-2")
+	m1, _, release := takeOver(t, f, "xwaitid", "cross-2")
 	defer release()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 // leaseCoordinator is implemented by backends whose runs are owned via leases. The BoltDB
@@ -15,32 +14,46 @@ type leaseCoordinator interface {
 	// extendLeases performs one heartbeat pass over every run this node owns and returns the
 	// versions whose lease has been lost.
 	extendLeases(ctx context.Context) []ulid.ULID
-	// claimRuns claims every eligible run of f and returns the claimed runs ready for resume.
-	claimRuns(ctx context.Context, f *fsm) ([]*activeResource, error)
+	// claimRuns claims every eligible run of the given FSMs, paired with the FSM that will
+	// resume each.
+	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
+	// owns reports whether this node currently holds the run's lease.
+	owns(version ulid.ULID) bool
+	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
+	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
+}
+
+// claimedRun pairs a claimed resource with the FSM that will resume it.
+type claimedRun struct {
+	f *fsm
+
+	resource *activeResource
 }
 
 // resumable returns the runs of f this node should resume. A lease-coordinated backend hands
 // out only runs this node can claim, so a restarting node cannot hijack runs whose owner is
 // live; otherwise every active run is local by definition.
 func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	lc, ok := m.store.(leaseCoordinator)
-	if !ok {
+	if m.lc == nil {
 		return m.store.Active(ctx, f)
 	}
-	return lc.claimRuns(ctx, f)
-}
 
-// cancelPendingRetries bounds how many heartbeat ticks a lost-lease cancellation is retried
-// for a run that has no cancelable context yet (a delayed or queued run registers one only
-// when it starts executing). Fencing is the correctness backstop; the cancel is a latency
-// courtesy.
-const cancelPendingRetries = 3
+	claimed, err := m.lc.claimRuns(ctx, []*fsm{f})
+	if err != nil {
+		return nil, err
+	}
+	resources := make([]*activeResource, 0, len(claimed))
+	for _, c := range claimed {
+		resources = append(resources, c.resource)
+	}
+	return resources, nil
+}
 
 // coordinate is the lease-coordinated backend's background loop: it heartbeats owned leases,
 // cancels local runs whose lease was lost, and periodically claims eligible runs for every
 // registered FSM — the claim pass is the object backend's primary work-distribution
 // mechanism, not merely failover. It exits when the manager shuts down.
-func (m *Manager) coordinate(lc leaseCoordinator, heartbeatEvery, claimEvery time.Duration) {
+func (m *Manager) coordinate(lc leaseCoordinator) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -48,12 +61,12 @@ func (m *Manager) coordinate(lc leaseCoordinator, heartbeatEvery, claimEvery tim
 		cancel()
 	}()
 
+	heartbeatEvery, claimEvery := lc.coordinationIntervals()
 	heartbeat := time.NewTicker(heartbeatEvery)
 	defer heartbeat.Stop()
 	claim := time.NewTimer(withJitter(claimEvery))
 	defer claim.Stop()
 
-	pending := map[ulid.ULID]int{}
 	for {
 		select {
 		case <-m.done:
@@ -61,14 +74,10 @@ func (m *Manager) coordinate(lc leaseCoordinator, heartbeatEvery, claimEvery tim
 		case <-heartbeat.C:
 			for _, version := range lc.extendLeases(ctx) {
 				m.logger.WithField("run_version", version.String()).Warn("run lease lost")
-				pending[version] = 0
-			}
-			for version, tries := range pending {
-				if m.cancelRunning(version, ErrLeaseLost) || tries >= cancelPendingRetries {
-					delete(pending, version)
-					continue
-				}
-				pending[version] = tries + 1
+				// A run with no cancelable context yet (delayed or queued dispatch) is covered
+				// by the ownership check at execute-start; fencing remains the correctness
+				// backstop either way. Cancellation is a latency courtesy.
+				m.cancelRunning(version, ErrLeaseLost)
 			}
 		case <-claim.C:
 			m.claimPass(ctx, lc)
@@ -77,51 +86,21 @@ func (m *Manager) coordinate(lc leaseCoordinator, heartbeatEvery, claimEvery tim
 	}
 }
 
-// claimPass claims and dispatches eligible runs for every registered FSM.
+// claimPass claims and dispatches eligible runs across every registered FSM.
 func (m *Manager) claimPass(ctx context.Context, lc leaseCoordinator) {
-	for _, f := range m.registeredFSMs() {
-		if f.resumeOne == nil {
-			continue
-		}
-		claimed, err := lc.claimRuns(ctx, f)
-		if err != nil {
-			m.logger.WithError(err).WithFields(logrus.Fields{
-				"run_type":   f.typeName,
-				"run_action": f.action,
-			}).Error("claim pass failed")
-			continue
-		}
-		for _, resource := range claimed {
-			logger := m.logger.WithField("run_version", resource.version.String())
-			logger.Info("claimed run")
-			if err := f.resumeOne(ctx, resource); err != nil {
-				logger.WithError(err).Error("failed to resume claimed run")
-			}
-		}
+	claimed, err := lc.claimRuns(ctx, m.registeredFSMs())
+	if err != nil {
+		m.logger.WithError(err).Error("claim pass failed")
+		return
 	}
-}
 
-func (m *Manager) registeredFSMs() []*fsm {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	fsms := make([]*fsm, 0, len(m.fsms))
-	for _, f := range m.fsms {
-		fsms = append(fsms, f)
+	for _, c := range claimed {
+		logger := m.logger.WithField("run_version", c.resource.version.String())
+		logger.Info("claimed run")
+		if err := c.f.resumeOne(ctx, c.resource); err != nil {
+			logger.WithError(err).Error("failed to resume claimed run")
+		}
 	}
-	return fsms
-}
-
-// cancelRunning cancels the run's local context with the given cause, reporting whether a
-// running context was found.
-func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
-	m.mu.RLock()
-	cancel, ok := m.running[version]
-	m.mu.RUnlock()
-	if !ok {
-		return false
-	}
-	cancel(cause)
-	return true
 }
 
 // withJitter spreads periodic work across nodes: d scaled uniformly into [0.75d, 1.25d).

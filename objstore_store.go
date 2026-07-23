@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
@@ -433,81 +434,116 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 
 // lockEntry pairs an active resource lock with the manifest of the run holding it.
 type lockEntry struct {
-	resourceType, resourceID, action string
+	action string
 
 	version ulid.ULID
 
 	manifest *fsmv1.RunManifest
 }
 
+// scanFanout bounds the concurrent object storage operations of a lock scan or a lease pass;
+// a serial pass over many runs could outrun the interval that scheduled it.
+const scanFanout = 8
+
 // scanLocks lists resource locks under prefix and resolves each to its owning run's manifest
-// (keys-only listing plus one lock GET and one manifest GET per active run — event bodies are
-// never read, per the RFC's resumability contract). Crash windows are handled inline: a lock
-// without a manifest is skipped, and a lock whose manifest is terminal is deleted.
+// (keys-only listing plus one lock GET and one manifest GET per active run, scanFanout at a
+// time — event bodies are never read, per the RFC's resumability contract). Crash windows are
+// handled inline: a lock without a manifest is skipped, and a lock whose manifest is terminal
+// is deleted.
 func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry, error) {
 	lockKeys, err := s.listKeys(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	var entries []lockEntry
-	for _, lockKey := range lockKeys {
-		logger := s.logger.WithField("key", lockKey)
+	var (
+		resolved = make([]*lockEntry, len(lockKeys))
+		sem      = make(chan struct{}, scanFanout)
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		scanErr  error
+	)
+	for i, lockKey := range lockKeys {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		// locks/<type>/<id>/<action>[/<run_version>]
-		segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
-		if len(segments) < 3 {
-			logger.Warn("malformed lock key")
-			continue
-		}
-		resourceType, typeErr := unescapeSegment(segments[0])
-		resourceID, idErr := unescapeSegment(segments[1])
-		action, actionErr := unescapeSegment(segments[2])
-		if err := errors.Join(typeErr, idErr, actionErr); err != nil {
-			logger.WithError(err).Warn("malformed lock key")
-			continue
-		}
-
-		owner, _, err := s.getObject(ctx, lockKey)
-		if err != nil {
-			logger.WithError(err).Error("failed to read resource lock")
-			continue
-		}
-		var version ulid.ULID
-		if err := version.UnmarshalText(owner); err != nil {
-			logger.WithError(err).Error("failed to unmarshal lock owner version")
-			continue
-		}
-
-		manifest, _, err := s.getManifest(ctx, version)
-		switch {
-		case errors.Is(err, ErrFsmNotFound):
-			// Crash window between lock acquisition and manifest creation. Leave the lock for
-			// the periodic recovery scan (Phase 4) rather than racing an in-flight START.
-			logger.Warn("lock held but manifest missing, skipping")
-			continue
-		case err != nil:
-			return nil, err
-		}
-
-		if manifestTerminal(manifest) {
-			// Crash window between manifest completion and lock deletion: finish the cleanup.
-			logger.Info("completed run still holds its lock, removing")
-			if err := s.deleteObject(ctx, lockKey); err != nil {
-				logger.WithError(err).Error("failed to delete orphaned lock")
+			entry, err := s.resolveLock(ctx, lockKey)
+			if err != nil {
+				mu.Lock()
+				scanErr = errors.Join(scanErr, err)
+				mu.Unlock()
+				return
 			}
+			resolved[i] = entry
+		}()
+	}
+	wg.Wait()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+
+	entries := make([]lockEntry, 0, len(resolved))
+	for _, entry := range resolved {
+		if entry == nil {
 			continue
 		}
-
-		entries = append(entries, lockEntry{
-			resourceType: resourceType,
-			resourceID:   resourceID,
-			action:       action,
-			version:      version,
-			manifest:     manifest,
-		})
+		entries = append(entries, *entry)
 	}
 	return entries, nil
+}
+
+// resolveLock resolves a single lock key to its owning run's manifest. Skips — malformed keys,
+// crash windows, terminal-manifest cleanup — return (nil, nil).
+func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEntry, error) {
+	logger := s.logger.WithField("key", lockKey)
+
+	// locks/<type>/<id>/<action>[/<run_version>]
+	segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
+	if len(segments) < 3 {
+		logger.Warn("malformed lock key")
+		return nil, nil
+	}
+	action, err := unescapeSegment(segments[2])
+	if err != nil {
+		logger.WithError(err).Warn("malformed lock key")
+		return nil, nil
+	}
+
+	owner, _, err := s.getObject(ctx, lockKey)
+	if err != nil {
+		logger.WithError(err).Error("failed to read resource lock")
+		return nil, nil
+	}
+	var version ulid.ULID
+	if err := version.UnmarshalText(owner); err != nil {
+		logger.WithError(err).Error("failed to unmarshal lock owner version")
+		return nil, nil
+	}
+
+	manifest, _, err := s.getManifest(ctx, version)
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		// Crash window between lock acquisition and manifest creation. Leave the lock for
+		// the periodic recovery scan rather than racing an in-flight START.
+		logger.Warn("lock held but manifest missing, skipping")
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+
+	if manifestTerminal(manifest) {
+		// Crash window between manifest completion and lock deletion: finish the cleanup.
+		logger.Info("completed run still holds its lock, removing")
+		if err := s.deleteObject(ctx, lockKey); err != nil {
+			logger.WithError(err).Error("failed to delete orphaned lock")
+		}
+		return nil, nil
+	}
+
+	return &lockEntry{action: action, version: version, manifest: manifest}, nil
 }
 
 // Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
@@ -610,7 +646,7 @@ var errRunInFlight = errors.New("run still in flight")
 func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	var outcome error
 	op := func() error {
-		if runErr, ok := s.finishedOutcome(runVersion); ok {
+		if runErr, state := s.localFinish(runVersion); state == finishDone {
 			outcome = runErr.Err
 			return nil
 		}
@@ -623,16 +659,19 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		case err != nil:
 			return backoff.Permanent(err)
 		}
-
-		if !manifestTerminal(manifest) || s.isFinishing(runVersion) {
+		if !manifestTerminal(manifest) {
 			return errRunInFlight
 		}
-		// A finish on this process may have fully landed between the map check above and the
-		// manifest read; the outcome is recorded before the finishing mark clears, so check
-		// once more before falling back to the manifest's error string.
-		if runErr, ok := s.finishedOutcome(runVersion); ok {
+
+		// The terminal manifest is durable truth; localFinish decides atomically whether this
+		// process's finish cleanup supplies a typed outcome, is still landing, or never ran
+		// here (a run finished by another node).
+		switch runErr, state := s.localFinish(runVersion); state {
+		case finishDone:
 			outcome = runErr.Err
 			return nil
+		case finishInFlight:
+			return errRunInFlight
 		}
 		if manifest.GetError() != "" {
 			outcome = &haltError{err: errors.New(manifest.GetError())}
@@ -682,15 +721,15 @@ func (s *objectStore) ForgetRun(run Run) error {
 	return nil
 }
 
-// maxFinishedOutcomes bounds the finished map; when full, arbitrary entries are evicted, and
-// their waiters fall back to the manifest's recorded error.
+// maxFinishedOutcomes bounds the finished map; when full, an arbitrary entry is evicted, and
+// its waiters fall back to the manifest's recorded error.
 const maxFinishedOutcomes = 4096
 
 func (s *objectStore) rememberFinished(version ulid.ULID, runErr RunErr) {
 	s.finishedMu.Lock()
 	defer s.finishedMu.Unlock()
 
-	for len(s.finished) >= maxFinishedOutcomes {
+	if len(s.finished) >= maxFinishedOutcomes {
 		for evict := range s.finished {
 			delete(s.finished, evict)
 			break
@@ -699,12 +738,29 @@ func (s *objectStore) rememberFinished(version ulid.ULID, runErr RunErr) {
 	s.finished[version] = runErr
 }
 
-func (s *objectStore) finishedOutcome(version ulid.ULID) (RunErr, bool) {
+// finishState is this process's knowledge of a run's finish.
+type finishState int
+
+const (
+	finishUnknown  finishState = iota // never finished here; the manifest is all there is
+	finishInFlight                    // appendFinish is mid-cleanup here; the outcome is coming
+	finishDone                        // finished here; the typed outcome is recorded
+)
+
+// localFinish reports the run's finish state and recorded outcome under a single lock, so a
+// caller that observed a terminal manifest gets an atomic answer: use the typed outcome, keep
+// waiting for it, or fall back to the manifest.
+func (s *objectStore) localFinish(version ulid.ULID) (RunErr, finishState) {
 	s.finishedMu.Lock()
 	defer s.finishedMu.Unlock()
 
-	runErr, ok := s.finished[version]
-	return runErr, ok
+	if runErr, ok := s.finished[version]; ok {
+		return runErr, finishDone
+	}
+	if _, ok := s.finishing[version]; ok {
+		return RunErr{}, finishInFlight
+	}
+	return RunErr{}, finishUnknown
 }
 
 func (s *objectStore) markFinishing(version ulid.ULID) {
@@ -717,13 +773,6 @@ func (s *objectStore) unmarkFinishing(version ulid.ULID) {
 	s.finishedMu.Lock()
 	defer s.finishedMu.Unlock()
 	delete(s.finishing, version)
-}
-
-func (s *objectStore) isFinishing(version ulid.ULID) bool {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	_, ok := s.finishing[version]
-	return ok
 }
 
 // History returns the archived record for a completed run. History objects are written at

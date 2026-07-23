@@ -51,39 +51,32 @@ func (c *ObjectStorageConfig) prefix() string {
 	return "fsm/"
 }
 
-func (c *ObjectStorageConfig) leaseTimeout() time.Duration {
-	if c.LeaseTimeout > 0 {
-		return c.LeaseTimeout
+// orDefault returns d when set (positive), def otherwise.
+func orDefault(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
 	}
-	return 30 * time.Second
+	return def
+}
+
+func (c *ObjectStorageConfig) leaseTimeout() time.Duration {
+	return orDefault(c.LeaseTimeout, 30*time.Second)
 }
 
 func (c *ObjectStorageConfig) heartbeatPeriod() time.Duration {
-	if c.HeartbeatPeriod > 0 {
-		return c.HeartbeatPeriod
-	}
-	return 10 * time.Second
+	return orDefault(c.HeartbeatPeriod, 10*time.Second)
 }
 
 func (c *ObjectStorageConfig) claimInterval() time.Duration {
-	if c.ClaimInterval > 0 {
-		return c.ClaimInterval
-	}
-	return c.leaseTimeout() / 2
+	return orDefault(c.ClaimInterval, c.leaseTimeout()/2)
 }
 
 func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
-	if c.WaitPollInterval > 0 {
-		return c.WaitPollInterval
-	}
-	return 100 * time.Millisecond
+	return orDefault(c.WaitPollInterval, 100*time.Millisecond)
 }
 
 func (c *ObjectStorageConfig) waitPollMaxInterval() time.Duration {
-	if c.WaitPollMaxInterval > 0 {
-		return c.WaitPollMaxInterval
-	}
-	return 2 * time.Second
+	return orDefault(c.WaitPollMaxInterval, 2*time.Second)
 }
 
 // objectStore implements the Store interface over S3-compatible object storage.
@@ -248,24 +241,26 @@ const maxConditionalRetries = 5
 
 var errEtagMismatch = errors.New("precondition failed: etag mismatch")
 
+// expBackoff builds the exponential backoff shared by the store's retry loops: bounded by the
+// caller's wrapper (max retries) or context, never wall-clock.
+func expBackoff(initial, max time.Duration) *backoff.ExponentialBackOff {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = initial
+	b.MaxInterval = max
+	b.MaxElapsedTime = 0
+	return b
+}
+
 // retryBackoff returns a context-bound exponential backoff capped at maxRetries, used for the
 // transient 409 conflicts and manifest CAS contention that conditional writes hit.
 func retryBackoff(ctx context.Context, maxRetries uint64) backoff.BackOff {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = 50 * time.Millisecond
-	b.MaxInterval = 2 * time.Second
-	b.MaxElapsedTime = 0 // bounded by maxRetries (and ctx), not wall-clock
-	return backoff.WithContext(backoff.WithMaxRetries(b, maxRetries), ctx)
+	return backoff.WithContext(backoff.WithMaxRetries(expBackoff(50*time.Millisecond, 2*time.Second), maxRetries), ctx)
 }
 
 // waitBackoff returns the backoff pacing WaitRun's manifest polls: bounded only by ctx, so a
 // wait outlives any fixed retry budget.
 func (s *objectStore) waitBackoff(ctx context.Context) backoff.BackOff {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = s.cfg.waitPollInterval()
-	b.MaxInterval = s.cfg.waitPollMaxInterval()
-	b.MaxElapsedTime = 0
-	return backoff.WithContext(b, ctx)
+	return backoff.WithContext(expBackoff(s.cfg.waitPollInterval(), s.cfg.waitPollMaxInterval()), ctx)
 }
 
 // putConditional issues a conditional PutObject — set applies the condition header — and retries

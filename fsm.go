@@ -583,6 +583,13 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		m.running[runVersion] = cancel
 		m.mu.Unlock()
 
+		// A lease-coordinated run may have lost ownership before reaching execution — a
+		// delayed or queued dispatch can trail its claim by arbitrarily long. Cancel before
+		// any side effects run rather than waiting to be fenced on the first write.
+		if m.lc != nil && !m.lc.owns(runVersion) {
+			cancel(ErrLeaseLost)
+		}
+
 		defer func() {
 			span.End()
 			m.mu.Lock()

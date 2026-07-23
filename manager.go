@@ -36,6 +36,9 @@ type Manager struct {
 
 	store Store
 
+	// lc is non-nil when store coordinates run ownership via leases.
+	lc leaseCoordinator
+
 	fsms map[fsmKey]*fsm
 
 	queues map[string]*queuedRunner
@@ -126,10 +129,11 @@ func New(cfg Config) (*Manager, error) {
 	}
 
 	if lc, ok := store.(leaseCoordinator); ok {
+		man.lc = lc
 		man.wg.Add(1)
 		go func() {
 			defer man.wg.Done()
-			man.coordinate(lc, cfg.ObjectStorage.heartbeatPeriod(), cfg.ObjectStorage.claimInterval())
+			man.coordinate(lc)
 		}()
 	}
 
@@ -243,20 +247,30 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 	return active, nil
 }
 
-// registeredTypes returns the distinct resource type names registered with this manager. A
-// type's runs are the same regardless of which action registered it.
-func (m *Manager) registeredTypes() []string {
+// registeredFSMs returns a snapshot of the registered FSMs; the claim loop and queries read
+// the registry concurrently with registration.
+func (m *Manager) registeredFSMs() []*fsm {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	fsms := make([]*fsm, 0, len(m.fsms))
+	for _, f := range m.fsms {
+		fsms = append(fsms, f)
+	}
+	return fsms
+}
+
+// registeredTypes returns the distinct resource type names registered with this manager. A
+// type's runs are the same regardless of which action registered it.
+func (m *Manager) registeredTypes() []string {
 	seen := map[string]struct{}{}
-	types := make([]string, 0, len(m.fsms))
-	for fk := range m.fsms {
-		if _, ok := seen[fk.name]; ok {
+	var types []string
+	for _, f := range m.registeredFSMs() {
+		if _, ok := seen[f.typeName]; ok {
 			continue
 		}
-		seen[fk.name] = struct{}{}
-		types = append(types, fk.name)
+		seen[f.typeName] = struct{}{}
+		types = append(types, f.typeName)
 	}
 	return types
 }
@@ -320,15 +334,23 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 // Cancel sends a cancel signal to the FSM should it exist. It does not block until the FSM has
 // completed so callers should use Wait to ensure the FSM has stopped, if needed.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
-	m.mu.RLock()
-	f, ok := m.running[version]
-	m.mu.RUnlock()
-	if !ok {
+	if !m.cancelRunning(version, errors.New(cause)) {
 		return ErrFsmNotFound
 	}
-
-	f(errors.New(cause))
 	return nil
+}
+
+// cancelRunning cancels the run's local context with the given cause, reporting whether a
+// running context was found.
+func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
+	m.mu.RLock()
+	cancel, ok := m.running[version]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	cancel(cause)
+	return true
 }
 
 // Wait blocks until the run with the given version completes.
