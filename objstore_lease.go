@@ -88,19 +88,20 @@ func (s *objectStore) coordinationIntervals() (heartbeatEvery, claimEvery time.D
 	return s.cfg.heartbeatPeriod(), s.cfg.claimInterval()
 }
 
-// forEachOwned runs fn over a snapshot of the owned leases, scanFanout at a time. Both the
-// heartbeat and release passes go through it: serially, a node owning many runs could outrun
-// the heartbeat interval and expire the very leases it was extending.
+// forEachOwned runs fn over a snapshot of the owned leases, scanFanout at a time — the sem's
+// buffer is the bound on in-flight object storage operations. Both the heartbeat and release
+// passes go through it: serially, a node owning many runs could outrun the heartbeat interval
+// and expire the very leases it was extending.
 func (s *objectStore) forEachOwned(fn func(version ulid.ULID, epoch int64)) {
 	var (
 		sem = make(chan struct{}, scanFanout)
 		wg  sync.WaitGroup
 	)
 	for version, epoch := range s.snapshotOwned() {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			fn(version, epoch)
 		}()
@@ -198,18 +199,8 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 // action registered on it; failures on individual runs are logged and skipped so one bad
 // manifest cannot block the rest.
 func (s *objectStore) claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error) {
-	byType := map[string]map[string]*fsm{}
-	for _, f := range fsms {
-		actions, ok := byType[f.typeName]
-		if !ok {
-			actions = map[string]*fsm{}
-			byType[f.typeName] = actions
-		}
-		actions[f.action] = f
-	}
-
 	var claimed []claimedRun
-	for typeName, actions := range byType {
+	for typeName, actions := range fsmsByType(fsms) {
 		entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
 		if err != nil {
 			return nil, err
@@ -219,24 +210,50 @@ func (s *objectStore) claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun,
 			if !ok {
 				continue
 			}
-			// Runs this store already holds or is mid-claim on fall out at reserveClaim,
-			// which checks atomically; the manifest filter here just avoids pointless CAS
-			// attempts.
-			if !s.claimable(e.manifest, time.Now()) {
+			run, won := s.claimEntry(ctx, f, e)
+			if !won {
 				continue
 			}
-			manifest, err := s.claimManifest(ctx, e.version)
-			switch {
-			case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
-				continue
-			case err != nil:
-				s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim run")
-				continue
-			}
-			claimed = append(claimed, claimedRun{f: f, resource: manifestResource(e.version, manifest)})
+			claimed = append(claimed, run)
 		}
 	}
 	return claimed, nil
+}
+
+// fsmsByType groups the FSMs by resource type, then action, so one lock scan per distinct
+// type serves every action registered on it.
+func fsmsByType(fsms []*fsm) map[string]map[string]*fsm {
+	byType := map[string]map[string]*fsm{}
+	for _, f := range fsms {
+		actions, ok := byType[f.typeName]
+		if !ok {
+			actions = map[string]*fsm{}
+			byType[f.typeName] = actions
+		}
+		actions[f.action] = f
+	}
+	return byType
+}
+
+// claimEntry attempts to claim one scanned run for f, reporting whether it was won. A run
+// this store already holds or is mid-claim on falls out at reserveClaim, which checks
+// atomically; the claimable pre-filter just avoids pointless CAS attempts. Lost races and
+// individual failures are skipped so one bad manifest cannot block the rest of the pass.
+func (s *objectStore) claimEntry(ctx context.Context, f *fsm, e lockEntry) (claimedRun, bool) {
+	if !s.claimable(e.manifest, time.Now()) {
+		return claimedRun{}, false
+	}
+
+	manifest, err := s.claimManifest(ctx, e.version)
+	switch {
+	case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
+		return claimedRun{}, false
+	case err != nil:
+		s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim run")
+		return claimedRun{}, false
+	}
+
+	return claimedRun{f: f, resource: manifestResource(e.version, manifest)}, true
 }
 
 // releaseLease clears this node's ownership under the fence so peers can claim the run
