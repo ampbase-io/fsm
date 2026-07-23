@@ -37,7 +37,7 @@ var (
 	)
 )
 
-func finisher[R, W any](m *Manager, finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
+func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
 	return func(ctx context.Context, req *Request[R, W]) (*Response[W], error) {
 		logger := req.Log()
 		run := req.Run()

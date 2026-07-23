@@ -291,24 +291,22 @@ type runState struct {
 // backend-defined: a lease-coordinated backend hands out only runs this node claimed. Every
 // run is dispatched even when another fails — the claims are already this node's, and an
 // undispatched claimed run would stay heartbeat-extended but never execute.
-func resume(m *Manager, f *fsm) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
-		resources, err := m.resumable(ctx, f)
-		if err != nil {
-			return err
-		}
-
-		var errs error
-		for _, resource := range resources {
-			errs = errors.Join(errs, f.resumeOne(ctx, resource))
-		}
-		return errs
+func (m *Manager) resume(ctx context.Context, f *fsm) error {
+	resources, err := m.resumable(ctx, f)
+	if err != nil {
+		return err
 	}
+
+	var errs error
+	for _, resource := range resources {
+		errs = errors.Join(errs, f.resumeOne(ctx, resource))
+	}
+	return errs
 }
 
 // resumeOne rebuilds the typed request from a persisted resource and dispatches run() with
 // restart semantics, honoring the run's recorded queue, delay, and dependency options.
-func resumeOne[R, W any](m *Manager, f *fsm) func(ctx context.Context, resource *activeResource) error {
+func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource *activeResource) error {
 	return func(ctx context.Context, resource *activeResource) error {
 		clearRun := func(run Run) {
 			if err := m.store.ForgetRun(run); err != nil {
@@ -443,7 +441,7 @@ func WithParent(parent ulid.ULID) StartOptionsFn {
 
 // start attempts to start the FSM using the provided id and request. The id is used to uniquely
 // identify the FSM associated with the req type along with the action used to register it.
-func start[R, W any](m *Manager, f *fsm) func(ctx context.Context, id string, request *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error) {
+func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, request *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error) {
 	return func(ctx context.Context, id string, request *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error) {
 		var startOpt startOptions
 		for _, opt := range opts {
