@@ -239,15 +239,29 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		return err
 	}
 
-	// 2b. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
+	// 3. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
 	// events (deleted at archival), index markers persist, so past runs stay enumerable.
 	indexKey := s.runIndexKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.StartVersion)
 	if err := s.putIdempotent(ctx, indexKey, nil); err != nil {
 		return err
 	}
 
-	// 3. Create the manifest, leased to this node from the start: the starting worker executes
-	// the run immediately and heartbeats from the first tick.
+	// 4. Create the manifest, leased to this node.
+	manifestBytes, err := s.startManifest(ctx, run, event, queue, ao, eventKey, runVersionBytes)
+	if err != nil {
+		return err
+	}
+	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes); err != nil {
+		return err
+	}
+
+	// 5. Record the parent-child relationship.
+	return s.linkParent(ctx, ao.parent, run.StartVersion)
+}
+
+// startManifest materializes a new run's initial manifest, leased to this node from the
+// start: the starting worker executes the run immediately and heartbeats from the first tick.
+func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
 	manifest := &fsmv1.RunManifest{
 		Status:         fsmv1.RunState_RUN_STATE_PENDING,
 		ResourceType:   event.GetResourceType(),
@@ -272,48 +286,59 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	}
 	(propagation.TraceContext{}).Inject(ctx, propagation.MapCarrier(manifest.TraceContext))
 
-	manifestBytes, err := proto.Marshal(manifest)
-	if err != nil {
-		return err
-	}
+	return proto.Marshal(manifest)
+}
+
+// createRunManifest writes the run's initial manifest and tracks its lease. A manifest that
+// already exists belongs to a crashed earlier attempt of this same run and is adopted instead.
+func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifestBytes []byte) error {
 	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
 	case err == nil:
 		s.trackLease(run.StartVersion, 1)
+		return nil
 	case errors.Is(err, errPreconditionFailed):
-		// A crashed earlier attempt of this same run already created the manifest; it is
-		// authoritative. Adopt its lease if this node still owns it — but never a terminal
-		// manifest: a START retry arriving after the run finished must not re-execute it, and
-		// the lock re-acquired above is undone so the duplicate leaves no trace.
-		existing, _, getErr := s.getManifest(ctx, run.StartVersion)
-		if getErr != nil {
-			return getErr
-		}
-		if manifestTerminal(existing) {
-			if err := s.deleteObject(ctx, lockKey); err != nil {
-				s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete lock of completed run")
-			}
-			return &AlreadyRunningError{Version: run.StartVersion}
-		}
-		if existing.GetOwnerNode() != s.nodeID {
-			return ErrLeaseLost
-		}
-		s.trackLease(run.StartVersion, existing.GetLeaseEpoch())
+		return s.adoptRunManifest(ctx, run, lockKey)
 	default:
 		return err
 	}
+}
 
-	// 4. Record the parent-child relationship.
-	if ao.parent != nil {
-		var parent ulid.ULID
-		if err := parent.UnmarshalText(ao.parent); err != nil {
-			return fmt.Errorf("invalid parent version: %w", err)
-		}
-		if err := s.writeChild(ctx, parent, run.StartVersion); err != nil {
-			return err
-		}
+// adoptRunManifest resumes a START whose earlier attempt already created the manifest; the
+// existing manifest is authoritative. Its lease is adopted if this node still owns it — but
+// never from a terminal manifest: a START retry arriving after the run finished must not
+// re-execute it, and the lock the retry re-acquired is undone so the duplicate leaves no
+// trace.
+func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey string) error {
+	existing, _, err := s.getManifest(ctx, run.StartVersion)
+	if err != nil {
+		return err
 	}
 
+	if manifestTerminal(existing) {
+		if err := s.deleteObject(ctx, lockKey); err != nil {
+			s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete lock of completed run")
+		}
+		return &AlreadyRunningError{Version: run.StartVersion}
+	}
+	if existing.GetOwnerNode() != s.nodeID {
+		return ErrLeaseLost
+	}
+
+	s.trackLease(run.StartVersion, existing.GetLeaseEpoch())
 	return nil
+}
+
+// linkParent records the parent-child relationship for runs started with a parent.
+func (s *objectStore) linkParent(ctx context.Context, parent []byte, child ulid.ULID) error {
+	if parent == nil {
+		return nil
+	}
+
+	var parentVersion ulid.ULID
+	if err := parentVersion.UnmarshalText(parent); err != nil {
+		return fmt.Errorf("invalid parent version: %w", err)
+	}
+	return s.writeChild(ctx, parentVersion, child)
 }
 
 func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
