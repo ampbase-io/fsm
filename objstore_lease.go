@@ -26,7 +26,6 @@ const (
 	leaseHeld                       // lease held at epoch; extended by the heartbeat
 )
 
-// lease is one run's entry in the leases map.
 type lease struct {
 	state leaseState
 
@@ -135,15 +134,6 @@ func (s *objectStore) extendLeases(ctx context.Context) {
 	})
 }
 
-// eligible reports whether this node may claim the run: the manifest is claimable and the
-// store neither holds the run nor has a claim on it in flight.
-func (s *objectStore) eligible(version ulid.ULID, m *fsmv1.RunManifest, now time.Time) bool {
-	if s.hasLease(version) {
-		return false
-	}
-	return s.claimable(m, now)
-}
-
 // claimable reports the manifest-side claim conditions: the run is non-terminal and either
 // unowned, left over from a previous incarnation of this node (the epoch bump fences the
 // zombie), or past its lease expiry. Expiry uses the local clock as a liveness heuristic
@@ -162,18 +152,10 @@ func (s *objectStore) claimable(m *fsmv1.RunManifest, now time.Time) bool {
 	}
 }
 
-// hasLease reports whether this node holds or is mid-claim on the run's lease.
-func (s *objectStore) hasLease(version ulid.ULID) bool {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	_, ok := s.leases[version]
-	return ok
-}
-
 // reserveClaim serializes same-store claimers on a run: only one goroutine may be mid-claim,
-// and a run already held is never re-claimed. Without it, a caller-invoked Resume racing the
-// claim tick could both pass the eligibility check (the winner's lease is recorded only after
-// its CAS returns) and claim the run twice, dispatching it twice.
+// and a run already held or mid-claim is never re-claimed. Without it, a caller-invoked
+// Resume racing the claim tick could claim the run twice (the winner's lease is recorded only
+// after its CAS returns), dispatching it twice.
 func (s *objectStore) reserveClaim(version ulid.ULID) bool {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -182,17 +164,6 @@ func (s *objectStore) reserveClaim(version ulid.ULID) bool {
 	}
 	s.leases[version] = lease{state: leaseClaiming}
 	return true
-}
-
-// settleClaim resolves a reservation: a won claim is held at its epoch, a lost one is gone.
-func (s *objectStore) settleClaim(version ulid.ULID, epoch int64, won bool) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	if !won {
-		delete(s.leases, version)
-		return
-	}
-	s.leases[version] = lease{state: leaseHeld, epoch: epoch}
 }
 
 // claimManifest takes ownership of the run via manifest CAS. The local reservation excludes
@@ -213,10 +184,10 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 		return nil
 	})
 	if err != nil {
-		s.settleClaim(version, 0, false)
+		s.dropLease(version)
 		return nil, err
 	}
-	s.settleClaim(version, manifest.GetLeaseEpoch(), true)
+	s.trackLease(version, manifest.GetLeaseEpoch())
 	return manifest, nil
 }
 
@@ -248,7 +219,10 @@ func (s *objectStore) claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun,
 			if !ok {
 				continue
 			}
-			if !s.eligible(e.version, e.manifest, time.Now()) {
+			// Runs this store already holds or is mid-claim on fall out at reserveClaim,
+			// which checks atomically; the manifest filter here just avoids pointless CAS
+			// attempts.
+			if !s.claimable(e.manifest, time.Now()) {
 				continue
 			}
 			manifest, err := s.claimManifest(ctx, e.version)

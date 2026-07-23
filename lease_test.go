@@ -76,17 +76,21 @@ func startRun(t *testing.T, s *objectStore, id string) Run {
 	t.Helper()
 
 	run := Run{ID: id, StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
-	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
-		Type:         fsmv1.EventType_EVENT_TYPE_START,
-		Id:           id,
-		ResourceType: "orderReq",
-		Action:       "deploy",
-		State:        "created",
-	}, "", withStartOption([]byte("{}"), []string{"created", "done"}))
-	if err != nil {
+	if err := appendStarted(s, run); err != nil {
 		t.Fatalf("failed to append start event: %v", err)
 	}
 	return run
+}
+
+func appendStarted(s *objectStore, run Run) error {
+	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        "created",
+	}, "", withStartOption([]byte("{}"), []string{"created", "done"}))
+	return err
 }
 
 func appendComplete(s *objectStore, run Run) error {
@@ -109,6 +113,33 @@ func appendFinished(s *objectStore, run Run) error {
 		State:        "done",
 	}, "")
 	return err
+}
+
+// finishRun drives a started run through completion and finish.
+func finishRun(t *testing.T, s *objectStore, run Run) {
+	t.Helper()
+	if err := appendComplete(s, run); err != nil {
+		t.Fatalf("failed to append complete event: %v", err)
+	}
+	if err := appendFinished(s, run); err != nil {
+		t.Fatalf("failed to append finish event: %v", err)
+	}
+}
+
+// putLock plants a resource lock recording version as its holder.
+func putLock(t *testing.T, s *objectStore, key string, version ulid.ULID) {
+	t.Helper()
+	versionBytes, err := version.MarshalText()
+	if err != nil {
+		t.Fatalf("failed to marshal version: %v", err)
+	}
+	if err := s.putIfAbsent(context.Background(), key, versionBytes); err != nil {
+		t.Fatalf("failed to create lock: %v", err)
+	}
+}
+
+func runLockKey(s *objectStore, run Run) string {
+	return s.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
 }
 
 func TestLeaseStampedAtStart(t *testing.T) {
@@ -163,8 +194,7 @@ func TestFencedAppendAfterSteal(t *testing.T) {
 	if _, err := a.readHistory(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("fenced finish still wrote history: %v", err)
 	}
-	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
-	if _, _, err := a.getObject(ctx, lockKey); err != nil {
+	if _, _, err := a.getObject(ctx, runLockKey(a, run)); err != nil {
 		t.Fatalf("expected the resource lock to survive a fenced finish, got %v", err)
 	}
 
@@ -350,22 +380,10 @@ func TestStartRetryAfterFinishRejected(t *testing.T) {
 	a := h.store("node-a", 10*time.Second)
 
 	run := startRun(t, a, "replay-1")
-	if err := appendComplete(a, run); err != nil {
-		t.Fatalf("failed to append complete event: %v", err)
-	}
-	if err := appendFinished(a, run); err != nil {
-		t.Fatalf("failed to append finish event: %v", err)
-	}
+	finishRun(t, a, run)
 
-	_, err := a.Append(ctx, run, &fsmv1.StateEvent{
-		Type:         fsmv1.EventType_EVENT_TYPE_START,
-		Id:           run.ID,
-		ResourceType: run.TypeName,
-		Action:       run.Action,
-		State:        "created",
-	}, "", withStartOption([]byte("{}"), []string{"created", "done"}))
-	if _, ok := errors.AsType[*AlreadyRunningError](err); !ok {
-		t.Fatalf("expected AlreadyRunningError for a finished run's START retry, got %v", err)
+	if _, ok := errors.AsType[*AlreadyRunningError](appendStarted(a, run)); !ok {
+		t.Fatal("expected AlreadyRunningError for a finished run's START retry")
 	}
 
 	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
@@ -374,8 +392,7 @@ func TestStartRetryAfterFinishRejected(t *testing.T) {
 	if got := mustManifest(t, a, run.StartVersion).GetStatus(); got != fsmv1.RunState_RUN_STATE_COMPLETE {
 		t.Fatalf("expected the manifest to stay COMPLETE, got %v", got)
 	}
-	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
-	if _, _, err := a.getObject(ctx, lockKey); !errors.Is(err, ErrFsmNotFound) {
+	if _, _, err := a.getObject(ctx, runLockKey(a, run)); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("expected the retry's lock removed, got %v", err)
 	}
 }
@@ -389,21 +406,10 @@ func TestCompletedRunLockCleanedAtStart(t *testing.T) {
 	a := h.store("node-a", 10*time.Second)
 
 	run := startRun(t, a, "restart-1")
-	if err := appendComplete(a, run); err != nil {
-		t.Fatalf("failed to append complete event: %v", err)
-	}
-	if err := appendFinished(a, run); err != nil {
-		t.Fatalf("failed to append finish event: %v", err)
-	}
+	finishRun(t, a, run)
 
-	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
-	versionBytes, err := run.StartVersion.MarshalText()
-	if err != nil {
-		t.Fatalf("failed to marshal version: %v", err)
-	}
-	if err := a.putIfAbsent(ctx, lockKey, versionBytes); err != nil {
-		t.Fatalf("failed to recreate the orphaned lock: %v", err)
-	}
+	lockKey := runLockKey(a, run)
+	putLock(t, a, lockKey, run.StartVersion)
 
 	next := startRun(t, a, "restart-1")
 	owner, err := a.lockOwner(ctx, lockKey)
@@ -421,17 +427,11 @@ func TestStaleOrphanLockReaped(t *testing.T) {
 
 	staleVersion := testULID(t, uint64(time.Now().Add(-time.Minute).UnixMilli()))
 	staleKey := a.lockKey("orderReq", "stale-1", "deploy", "", staleVersion)
-	staleBytes, _ := staleVersion.MarshalText()
-	if err := a.putIfAbsent(ctx, staleKey, staleBytes); err != nil {
-		t.Fatalf("failed to create stale lock: %v", err)
-	}
+	putLock(t, a, staleKey, staleVersion)
 
 	freshVersion := ulid.Make()
 	freshKey := a.lockKey("orderReq", "fresh-1", "deploy", "", freshVersion)
-	freshBytes, _ := freshVersion.MarshalText()
-	if err := a.putIfAbsent(ctx, freshKey, freshBytes); err != nil {
-		t.Fatalf("failed to create fresh lock: %v", err)
-	}
+	putLock(t, a, freshKey, freshVersion)
 
 	entries, err := a.scanLocks(ctx, a.lockPrefix("orderReq"))
 	if err != nil {
@@ -478,12 +478,7 @@ func TestFinishDropsLease(t *testing.T) {
 	b := h.store("node-b", 10*time.Second)
 
 	run := startRun(t, a, "finish-1")
-	if err := appendComplete(a, run); err != nil {
-		t.Fatalf("failed to append complete event: %v", err)
-	}
-	if err := appendFinished(a, run); err != nil {
-		t.Fatalf("failed to append finish event: %v", err)
-	}
+	finishRun(t, a, run)
 
 	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
 		t.Fatal("expected the lease dropped at finish")

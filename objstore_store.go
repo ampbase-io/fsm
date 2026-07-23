@@ -204,8 +204,7 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 		return &AlreadyRunningError{Version: ownerVersion}
 	}
 
-	s.logger.WithField("key", lockKey).Info("completed run still holds its lock, removing")
-	if err := s.deleteObject(ctx, lockKey); err != nil {
+	if err := s.reapTerminalLock(ctx, lockKey); err != nil {
 		return fmt.Errorf("failed to delete orphaned lock %s: %w", lockKey, err)
 	}
 	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
@@ -566,14 +565,9 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 		return nil, nil
 	}
 
-	owner, _, err := s.getObject(ctx, lockKey)
+	version, err := s.lockOwner(ctx, lockKey)
 	if err != nil {
-		logger.WithError(err).Error("failed to read resource lock")
-		return nil, nil
-	}
-	var version ulid.ULID
-	if err := version.UnmarshalText(owner); err != nil {
-		logger.WithError(err).Error("failed to unmarshal lock owner version")
+		logger.WithError(err).Error("failed to resolve lock owner")
 		return nil, nil
 	}
 
@@ -597,15 +591,20 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	}
 
 	if manifestTerminal(manifest) {
-		// Crash window between manifest completion and lock deletion: finish the cleanup.
-		logger.Info("completed run still holds its lock, removing")
-		if err := s.deleteObject(ctx, lockKey); err != nil {
+		if err := s.reapTerminalLock(ctx, lockKey); err != nil {
 			logger.WithError(err).Error("failed to delete orphaned lock")
 		}
 		return nil, nil
 	}
 
 	return &lockEntry{action: action, version: version, manifest: manifest}, nil
+}
+
+// reapTerminalLock finishes the cleanup of a completed run's lock — the crash window between
+// manifest completion and lock deletion.
+func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) error {
+	s.logger.WithField("key", lockKey).Info("completed run still holds its lock, removing")
+	return s.deleteObject(ctx, lockKey)
 }
 
 // Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
@@ -792,16 +791,13 @@ const (
 	finishDone                        // finished here; the typed outcome is recorded
 )
 
-// runFinish is one run's entry in the finishes map.
 type runFinish struct {
 	state finishState
 
 	err RunErr
 }
 
-// maxFinishes bounds the finishes map; when full, an arbitrary settled entry is evicted, and
-// its waiters fall back to the manifest's recorded error. In-flight entries are never evicted
-// (they gate waiter release) and are naturally bounded by concurrent finishes.
+// maxFinishes bounds the finishes map; see evictSettledFinish for the eviction policy.
 const maxFinishes = 4096
 
 // beginFinish marks the run's finish as in flight before the manifest turns terminal, so a

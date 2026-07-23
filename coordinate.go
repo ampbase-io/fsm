@@ -2,7 +2,9 @@ package fsm
 
 import (
 	"context"
+	"maps"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -107,11 +109,7 @@ func (m *Manager) cancelUnleased(lc leaseCoordinator) {
 func (m *Manager) runningVersions() []ulid.ULID {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	versions := make([]ulid.ULID, 0, len(m.running))
-	for version := range m.running {
-		versions = append(versions, version)
-	}
-	return versions
+	return slices.Collect(maps.Keys(m.running))
 }
 
 // claimPass claims and dispatches eligible runs across every registered FSM.
