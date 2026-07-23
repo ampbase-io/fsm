@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,9 @@ type ObjectStorageConfig struct {
 
 	LeaseTimeout    time.Duration // Default 30s
 	HeartbeatPeriod time.Duration // Default 10s
+
+	// ClaimInterval is how often the claim loop scans for runs this node can take over.
+	ClaimInterval time.Duration // Default LeaseTimeout / 2
 
 	// WaitPollInterval and WaitPollMaxInterval bound the exponential backoff of WaitRun's
 	// manifest poll floor.
@@ -61,6 +65,13 @@ func (c *ObjectStorageConfig) heartbeatPeriod() time.Duration {
 	return 10 * time.Second
 }
 
+func (c *ObjectStorageConfig) claimInterval() time.Duration {
+	if c.ClaimInterval > 0 {
+		return c.ClaimInterval
+	}
+	return c.leaseTimeout() / 2
+}
+
 func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
 	if c.WaitPollInterval > 0 {
 		return c.WaitPollInterval
@@ -81,6 +92,17 @@ type objectStore struct {
 	client *s3.Client
 	cfg    *ObjectStorageConfig
 
+	// nodeID identifies this node in run manifests for lease ownership. It must be unique per
+	// process: a zombie sharing a NodeID is still fenced by the lease epoch.
+	nodeID string
+
+	// owned maps each run this node holds a lease on to the lease epoch it claimed with; every
+	// run-mutating manifest CAS re-verifies both. fenced buffers runs whose fence tripped in
+	// Append so the next heartbeat pass reports them for local cancellation.
+	leaseMu sync.Mutex
+	owned   map[ulid.ULID]int64
+	fenced  []ulid.ULID
+
 	// finished records terminal outcomes of runs this process completed, preserving typed run
 	// errors for same-process waiters. It is a bounded convenience, not state: absence just
 	// means WaitRun consults the manifest, whose recorded error string is the durable outcome.
@@ -92,9 +114,13 @@ type objectStore struct {
 	finishing  map[ulid.ULID]struct{}
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
+	}
+	if nodeID == "" {
+		host, _ := os.Hostname()
+		nodeID = host + "-" + ulid.Make().String()
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -112,9 +138,11 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	})
 
 	return &objectStore{
-		logger:    logger,
+		logger:    logger.WithField("node_id", nodeID),
 		client:    client,
 		cfg:       cfg,
+		nodeID:    nodeID,
+		owned:     map[ulid.ULID]int64{},
 		finished:  map[ulid.ULID]RunErr{},
 		finishing: map[ulid.ULID]struct{}{},
 	}, nil

@@ -17,6 +17,9 @@ type adminServer struct {
 }
 
 func (s *adminServer) ListRegistered(context.Context, *connect.Request[fsmv1.ListRegisteredRequest]) (*connect.Response[fsmv1.ListRegisteredResponse], error) {
+	s.m.mu.RLock()
+	defer s.m.mu.RUnlock()
+
 	fsms := make([]*fsmv1.FSM, 0, len(s.m.fsms))
 	for _, fsm := range s.m.fsms {
 		f := &fsmv1.FSM{

@@ -190,6 +190,11 @@ type fsm struct {
 
 	// transitions is used to lookup a transition by key in order to execute it.
 	registeredTransitions map[transitionKey]*transition
+
+	// resumeOne dispatches a single persisted resource through the typed resume path. It is
+	// registered at End() so the claim loop can resume runs of this FSM without knowing its
+	// R/W types.
+	resumeOne func(context.Context, *activeResource) error
 }
 
 func (f *fsm) transitionSlice() []string {
@@ -286,107 +291,115 @@ type runState struct {
 	Error RunErr
 }
 
-func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
+// resume drives every resumable run of f through resumeOne. Which runs are resumable is
+// backend-defined: a lease-coordinated backend hands out only runs this node claimed.
+func resume(m *Manager, f *fsm) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
+		resources, err := m.resumable(ctx, f)
+		if err != nil {
+			return err
+		}
+
+		for _, resource := range resources {
+			if err := f.resumeOne(ctx, resource); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// resumeOne rebuilds the typed request from a persisted resource and dispatches run() with
+// restart semantics, honoring the run's recorded queue, delay, and dependency options.
+func resumeOne[R, W any](m *Manager, f *fsm) func(ctx context.Context, resource *activeResource) error {
+	return func(ctx context.Context, resource *activeResource) error {
 		clearRun := func(run Run) {
 			if err := m.store.ForgetRun(run); err != nil {
 				m.logger.WithError(err).Error("failed to update fsm state store")
 			}
 		}
 
-		resources, err := m.store.Active(ctx, f)
-		if err != nil {
+		// Restore the run options from the persisted event; the queue and parent must reflect
+		// this resource, not whatever the most recent Start call left on f.
+		var startOpt startOptions
+		if delayUntil := resource.active.GetOptions().GetDelayUntil(); delayUntil > 0 {
+			startOpt.until = time.Unix(delayUntil, 0)
+		}
+
+		if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
+			if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
+				m.logger.WithError(err).Error("failed to unmarshal run_after")
+			}
+		}
+
+		startOpt.queue = resource.active.GetOptions().GetQueue()
+
+		if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
+			if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
+				m.logger.WithError(err).Error("failed to unmarshal parent")
+			}
+		}
+
+		r := Run{
+			ID:           resource.active.GetResourceId(),
+			StartVersion: resource.version,
+			Action:       f.action,
+			ResourceName: f.alias,
+			TypeName:     f.typeName,
+			Queue:        startOpt.queue,
+			Parent:       startOpt.parent,
+			fsmErr:       resource.fsmError,
+		}
+
+		var req R
+		if err := f.rCodec.Unmarshal(resource.active.Resource, &req); err != nil {
+			m.logger.WithError(err).Error("failed to unmarshal resource, unable to resume")
+			clearRun(r)
 			return err
 		}
 
-		for _, resource := range resources {
-			// Restore the run options from the persisted event before building the Run so the
-			// queue and parent reflect this resource, not whatever a previous iteration left on f.
-			var startOpt startOptions
-			if delayUntil := resource.active.GetOptions().GetDelayUntil(); delayUntil > 0 {
-				startOpt.until = time.Unix(delayUntil, 0)
-			}
-
-			if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
-				if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
-					m.logger.WithError(err).Error("failed to unmarshal run_after")
-				}
-			}
-
-			startOpt.queue = resource.active.GetOptions().GetQueue()
-			f.queue = startOpt.queue
-
-			if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
-				if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
-					m.logger.WithError(err).Error("failed to unmarshal parent")
-				}
-
-				if startOpt.parent.Compare(ulid.ULID{}) != 0 {
-					f.parent = startOpt.parent
-				}
-			}
-
-			r := Run{
-				ID:           resource.active.GetResourceId(),
-				StartVersion: resource.version,
-				Action:       f.action,
-				ResourceName: f.alias,
-				TypeName:     f.typeName,
-				Queue:        startOpt.queue,
-				Parent:       startOpt.parent,
-				fsmErr:       resource.fsmError,
-			}
-
-			var req R
-			if err := f.rCodec.Unmarshal(resource.active.Resource, &req); err != nil {
-				m.logger.WithError(err).Error("failed to unmarshal resource, unable to resume")
-				defer clearRun(r)
+		var w W
+		if resource.response != nil {
+			if err := f.wCodec.Unmarshal(resource.response, &w); err != nil {
+				m.logger.WithField("response_bytes", string(resource.response)).WithError(err).Error("failed to unmarshal response, unable to resume")
+				clearRun(r)
 				return err
 			}
-
-			var w W
-			if resource.response != nil {
-				if err := f.wCodec.Unmarshal(resource.response, &w); err != nil {
-					m.logger.WithField("response_bytes", string(resource.response)).WithError(err).Error("failed to unmarshal response, unable to resume")
-					defer clearRun(r)
-					return err
-				}
-			}
-			m.logger.WithField("completed", resource.completedTransitions).Debug("pruning completed transitions")
-
-			remainingTransitions := immutable.NewList[*transition]()
-			for _, name := range resource.active.Transitions {
-				if !slices.Contains(resource.completedTransitions, name) {
-					transition, ok := f.registeredTransitions[transitionKey{
-						action:   f.action,
-						typeName: f.typeName,
-						name:     name,
-					}]
-					if !ok {
-						m.logger.Warn("transition did not exist")
-						transition = newTransition(name, noOp, TransitionConfig[R, W]{
-							interceptors: []TransitionInterceptorFunc{
-								skipper(),
-								canceller(m.store, f.wCodec),
-							},
-						})
-					}
-					remainingTransitions = remainingTransitions.Append(transition)
-				}
-			}
-
-			ctx := withRetry(ctx, resource.retryCount)
-			ctx = withRestart(ctx, true)
-
-			ctx = (propagation.TraceContext{}).Extract(ctx, propagation.MapCarrier(resource.active.TraceContext))
-
-			runner := runnerFromOpts(&startOpt, m)
-
-			request := NewRequest(&req, &w)
-			request.run = r
-
-			run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions})
 		}
+		m.logger.WithField("completed", resource.completedTransitions).Debug("pruning completed transitions")
+
+		remainingTransitions := immutable.NewList[*transition]()
+		for _, name := range resource.active.Transitions {
+			if !slices.Contains(resource.completedTransitions, name) {
+				transition, ok := f.registeredTransitions[transitionKey{
+					action:   f.action,
+					typeName: f.typeName,
+					name:     name,
+				}]
+				if !ok {
+					m.logger.Warn("transition did not exist")
+					transition = newTransition(name, noOp, TransitionConfig[R, W]{
+						interceptors: []TransitionInterceptorFunc{
+							skipper(),
+							canceller(m.store, f.wCodec),
+						},
+					})
+				}
+				remainingTransitions = remainingTransitions.Append(transition)
+			}
+		}
+
+		ctx = withRetry(ctx, resource.retryCount)
+		ctx = withRestart(ctx, true)
+
+		ctx = (propagation.TraceContext{}).Extract(ctx, propagation.MapCarrier(resource.active.TraceContext))
+
+		runner := runnerFromOpts(&startOpt, m)
+
+		request := NewRequest(&req, &w)
+		request.run = r
+
+		run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions})
 		return nil
 	}
 }
@@ -613,6 +626,10 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				case errors.Is(ctxErr, context.Canceled):
 					logger.Info("context canceled, fsm shutting down")
 					return
+				case errors.Is(ctxErr, ErrLeaseLost):
+					// The new owner drives the run to completion; nothing may be recorded here.
+					logger.Warn("run lease lost, halting")
+					return
 				default:
 					// continue running through the transitions until we reach the end
 				}
@@ -643,6 +660,13 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 			if err == nil {
 				continue
+			}
+
+			if errors.Is(err, ErrLeaseLost) {
+				// Halt without finalizers or FINISH: this node may no longer write to the run,
+				// and the new owner runs them at its own finish.
+				logger.Warn("run lease lost, halting")
+				return
 			}
 
 			var (

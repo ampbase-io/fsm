@@ -72,13 +72,11 @@ type Config struct {
 	// value is the maximum number of FSMs that can run concurrently.
 	Queues map[string]int
 
-	// NodeID is a unique identifier for this node. Used by the object storage backend's cluster
-	// coordination (Phase 4 of the object storage RFC); ignored for BoltDB.
+	// NodeID uniquely identifies this node in the object storage backend's run leases, for
+	// fencing and observability. It is an identity, never a network address; no component
+	// needs a routable address for any other. Defaults to "<hostname>-<ulid>". Ignored for
+	// BoltDB.
 	NodeID string
-
-	// NodeAddr is the address reachable by other nodes for cancel RPC. Used by the object
-	// storage backend's cluster coordination (Phase 4); ignored for BoltDB.
-	NodeAddr string
 }
 
 // New creates a new FSM manager to register and run FSMs.
@@ -127,6 +125,14 @@ func New(cfg Config) (*Manager, error) {
 		go q.run(done, cfg.Logger.WithField("queue", name))
 	}
 
+	if lc, ok := store.(leaseCoordinator); ok {
+		man.wg.Add(1)
+		go func() {
+			defer man.wg.Done()
+			man.coordinate(lc, cfg.ObjectStorage.heartbeatPeriod(), cfg.ObjectStorage.claimInterval())
+		}()
+	}
+
 	socket := cfg.AdminSocketPath
 	if socket == "" && cfg.DBPath != "" {
 		socket = filepath.Join(cfg.DBPath, "fsm.sock")
@@ -146,7 +152,7 @@ func New(cfg Config) (*Manager, error) {
 // ObjectStorage is set; the caller validates that.
 func newBackend(cfg Config, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
 	if cfg.ObjectStorage != nil {
-		return newObjectStore(context.Background(), logger, cfg.ObjectStorage)
+		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID)
 	}
 	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)
@@ -240,6 +246,9 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 // registeredTypes returns the distinct resource type names registered with this manager. A
 // type's runs are the same regardless of which action registered it.
 func (m *Manager) registeredTypes() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	seen := map[string]struct{}{}
 	types := make([]string, 0, len(m.fsms))
 	for fk := range m.fsms {
@@ -295,6 +304,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 
 	// Manifests don't record the resource alias, so the object backend returns runs without
 	// one; restore it from the registered FSM.
+	m.mu.RLock()
 	for i, child := range children {
 		f, ok := m.fsms[fsmKey{name: child.TypeName, action: child.Action}]
 		if !ok {
@@ -302,6 +312,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 		}
 		children[i].ResourceName = f.alias
 	}
+	m.mu.RUnlock()
 
 	return children, nil
 }

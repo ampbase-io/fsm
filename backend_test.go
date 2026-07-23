@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"sync"
@@ -54,6 +55,13 @@ func newBoltFactory(t *testing.T) *managerFactory {
 }
 
 func newObjectFactory(t *testing.T) *managerFactory {
+	return newObjectFactoryWith(t, nil)
+}
+
+// newObjectFactoryWith lets a test adjust the object storage config (e.g. lease timings)
+// before each manager is created. Every manager gets a distinct NodeID, as distinct nodes
+// sharing a bucket would in production.
+func newObjectFactoryWith(t *testing.T, configure func(*ObjectStorageConfig)) *managerFactory {
 	t.Helper()
 
 	const bucket = "test-bucket"
@@ -66,18 +74,25 @@ func newObjectFactory(t *testing.T) *managerFactory {
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 	f := &managerFactory{name: "object"}
+	nodes := 0
 	f.newManager = func(queues map[string]int) (*Manager, func()) {
+		cfg := &ObjectStorageConfig{
+			Bucket:   bucket,
+			Endpoint: server.URL,
+			Region:   "auto",
+			// The fake S3 answers instantly, so tight poll intervals keep object-backend
+			// waits from eating the default 100ms floor per Wait.
+			WaitPollInterval:    1 * time.Millisecond,
+			WaitPollMaxInterval: 10 * time.Millisecond,
+		}
+		if configure != nil {
+			configure(cfg)
+		}
+		nodes++
 		m, err := New(Config{
-			ObjectStorage: &ObjectStorageConfig{
-				Bucket:   bucket,
-				Endpoint: server.URL,
-				Region:   "auto",
-				// The fake S3 answers instantly, so tight poll intervals keep object-backend
-				// waits from eating the default 100ms floor per Wait.
-				WaitPollInterval:    1 * time.Millisecond,
-				WaitPollMaxInterval: 10 * time.Millisecond,
-			},
-			Queues: queues,
+			ObjectStorage: cfg,
+			NodeID:        fmt.Sprintf("node-%d", nodes),
+			Queues:        queues,
 		})
 		return f.manage(t, m, err)
 	}

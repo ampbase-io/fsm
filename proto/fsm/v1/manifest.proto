@@ -55,9 +55,12 @@ message RunManifest {
 
   string error_state = 21;
 
-  // Cluster coordination (used from Phase 4 onward).
+  // Cluster coordination (used from Phase 4 onward). owner_node is a node identity, never a
+  // network address.
   string owner_node = 22;
 
+  // lease_expiry is Unix milliseconds: lease timeouts are fractions of a minute, where
+  // second granularity would cost up to a second of takeover latency per comparison.
   int64 lease_expiry = 23;
 
   int64 lease_epoch = 24;

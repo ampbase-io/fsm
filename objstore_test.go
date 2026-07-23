@@ -152,7 +152,7 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 		Bucket:   bucket,
 		Endpoint: server.URL,
 		Region:   "auto",
-	})
+	}, "node-test")
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
@@ -170,7 +170,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}); err == nil {
+	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}, "node-test"); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }

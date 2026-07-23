@@ -226,7 +226,10 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		action: s.f.action,
 	}
 
-	if _, ok := s.m.fsms[fk]; ok {
+	s.m.mu.RLock()
+	_, registered := s.m.fsms[fk]
+	s.m.mu.RUnlock()
+	if registered {
 		s.m.logger.WithField("fsm", s.f.typeName).Error("fsm already registered")
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("fsm %s:%s already registered", s.f.typeName, s.f.action))
 		return &fsmEnd[R, W]{s.transitionStep}
@@ -260,8 +263,12 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	s.f.registeredTransitions[tk] = newTransition(name, finisher[R, W](s.m, finalizers), cfg)
 	s.f.transitions = s.f.transitions.Append(name)
 	s.f.endState = name
+	s.f.resumeOne = resumeOne[R, W](s.m, s.f)
 
+	// The claim loop reads the registry concurrently with registration.
+	s.m.mu.Lock()
 	s.m.fsms[fk] = s.f
+	s.m.mu.Unlock()
 
 	return &fsmEnd[R, W]{s.transitionStep}
 }
@@ -278,7 +285,7 @@ func (s *fsmEnd[R, W]) Build(ctx context.Context) (Start[R, W], Resume, error) {
 	}
 
 	wrappedResume := func(ctx context.Context) error {
-		if err := resume[R, W](s.m, s.f)(ctx); err != nil {
+		if err := resume(s.m, s.f)(ctx); err != nil {
 			return fmt.Errorf("failed to resume active FSMs: %w", err)
 		}
 		return nil

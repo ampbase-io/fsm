@@ -66,8 +66,10 @@ func (s *objectStore) getManifest(ctx context.Context, runVersion ulid.ULID) (*f
 }
 
 // casManifest applies mutate to the manifest under an If-Match compare-and-swap, re-reading and
-// retrying on concurrent modification. It returns the manifest as written.
-func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest)) (*fsmv1.RunManifest, error) {
+// retrying on concurrent modification, so mutate always observes fresh state. A mutate error
+// (a tripped fence, a lost claim race) aborts the CAS and is returned as-is. It returns the
+// manifest as written.
+func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest) error) (*fsmv1.RunManifest, error) {
 	key := s.manifestKey(runVersion)
 	var updated *fsmv1.RunManifest
 	op := func() error {
@@ -76,7 +78,9 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			return backoff.Permanent(err)
 		}
 
-		mutate(manifest)
+		if err := mutate(manifest); err != nil {
+			return backoff.Permanent(err)
+		}
 		manifest.UpdatedAt = time.Now().Unix()
 
 		body, err := proto.Marshal(manifest)
@@ -194,8 +198,8 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		return err
 	}
 
-	// 3. Create the manifest. A 412 means a crashed earlier attempt of this same run already
-	// created it; the existing manifest is authoritative.
+	// 3. Create the manifest, leased to this node from the start: the starting worker executes
+	// the run immediately and heartbeats from the first tick.
 	manifest := &fsmv1.RunManifest{
 		Status:         fsmv1.RunState_RUN_STATE_PENDING,
 		ResourceType:   event.GetResourceType(),
@@ -211,6 +215,9 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		Parent:         ao.parent,
 		DelayUntil:     ao.delayUntil,
 		RunAfter:       ao.runAfter,
+		OwnerNode:      s.nodeID,
+		LeaseExpiry:    time.Now().Add(s.cfg.leaseTimeout()).UnixMilli(),
+		LeaseEpoch:     1,
 		TraceContext:   map[string]string{},
 		CreatedAt:      time.Now().Unix(),
 		UpdatedAt:      time.Now().Unix(),
@@ -221,7 +228,21 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	if err != nil {
 		return err
 	}
-	if err := s.putIdempotent(ctx, s.manifestKey(run.StartVersion), manifestBytes); err != nil {
+	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
+	case err == nil:
+		s.trackLease(run.StartVersion, 1)
+	case errors.Is(err, errPreconditionFailed):
+		// A crashed earlier attempt of this same run already created the manifest; it is
+		// authoritative. Adopt its lease if this node still owns it.
+		existing, _, getErr := s.getManifest(ctx, run.StartVersion)
+		if getErr != nil {
+			return getErr
+		}
+		if existing.GetOwnerNode() != s.nodeID {
+			return ErrLeaseLost
+		}
+		s.trackLease(run.StartVersion, existing.GetLeaseEpoch())
+	default:
 		return err
 	}
 
@@ -240,11 +261,21 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 }
 
 func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
+	// The local ownership guard keeps a fenced writer from creating orphan event objects in
+	// the common case; the fence check inside the CAS is authoritative for the true race.
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
+
 	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
-	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
+	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
 		if m.Status == fsmv1.RunState_RUN_STATE_PENDING {
@@ -264,7 +295,11 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		case fsmv1.EventType_EVENT_TYPE_ERROR:
 			m.RetryCount = event.GetRetryCount()
 		}
+		return nil
 	})
+	if errors.Is(err, ErrLeaseLost) {
+		s.noteFence(run.StartVersion)
+	}
 	return err
 }
 
@@ -274,11 +309,19 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	s.markFinishing(run.StartVersion)
 	defer s.unmarkFinishing(run.StartVersion)
 
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
+
 	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
-	manifest, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
+	manifest, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
 		m.Status = fsmv1.RunState_RUN_STATE_COMPLETE
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
@@ -287,14 +330,20 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 			m.Error = run.fsmErr.Err.Error()
 			m.ErrorState = run.fsmErr.State
 		}
+		return nil
 	})
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
 		s.logger.WithField("run_version", run.StartVersion.String()).Warn("manifest not found for finish event")
 		return nil
+	case errors.Is(err, ErrLeaseLost):
+		s.noteFence(run.StartVersion)
+		return err
 	case err != nil:
 		return err
 	}
+
+	s.dropLease(run.StartVersion)
 
 	// The lock is deleted after the manifest records completion; a crash in between leaves an
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
@@ -473,16 +522,21 @@ func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, er
 		if e.action != f.action {
 			continue
 		}
-		active = append(active, &activeResource{
-			version:              e.version,
-			active:               activeEventFromManifest(e.manifest),
-			completedTransitions: e.manifest.GetCompletedStates(),
-			response:             e.manifest.GetLatestResponse(),
-			retryCount:           e.manifest.GetRetryCount(),
-			fsmError:             manifestRunErr(e.manifest),
-		})
+		active = append(active, manifestResource(e.version, e.manifest))
 	}
 	return active, nil
+}
+
+// manifestResource rebuilds the resume-path DTO from the manifest's materialized fields.
+func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
+	return &activeResource{
+		version:              version,
+		active:               activeEventFromManifest(m),
+		completedTransitions: m.GetCompletedStates(),
+		response:             m.GetLatestResponse(),
+		retryCount:           m.GetRetryCount(),
+		fsmError:             manifestRunErr(m),
+	}
 }
 
 func (s *objectStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
@@ -614,9 +668,17 @@ func (s *objectStore) SetRunning(run Run) error {
 	return nil
 }
 
-// ForgetRun is a no-op: the object backend holds no local run state, and the resource lock
-// stays visible until recovery succeeds.
+// ForgetRun releases this node's claim on the run after a failed resume so another node (or a
+// later claim pass) can adopt it; the resource lock stays visible until recovery succeeds.
 func (s *objectStore) ForgetRun(run Run) error {
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	s.releaseLease(ctx, run.StartVersion, epoch)
 	return nil
 }
 
@@ -708,9 +770,13 @@ func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string)
 	return runs, nil
 }
 
-// Close shuts down the store. The object storage backend holds no local resources or background
-// loops in Phase 3; history is written at FINISH time rather than by an archive loop.
+// Close releases every lease this node still holds so peers can claim its runs immediately
+// instead of waiting out the lease timeout.
 func (s *objectStore) Close() error {
 	s.logger.Info("shutting down object store")
+
+	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	s.releaseLeases(ctx)
 	return nil
 }

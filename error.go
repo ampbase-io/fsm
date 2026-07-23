@@ -9,6 +9,10 @@ import (
 
 var (
 	ErrFsmNotFound = errors.New("FSM not found")
+
+	// ErrLeaseLost signals that this node no longer owns a run's lease. The run halts locally
+	// without recording FINISH; the new owner drives it to completion.
+	ErrLeaseLost = errors.New("run lease lost")
 )
 
 type AlreadyRunningError struct {
