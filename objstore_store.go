@@ -361,10 +361,8 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 }
 
 func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, eventKey string, eventBytes []byte) error {
-	// Marked before the manifest turns terminal, so a waiter that observes completion holds
-	// until the cleanup below lands and the typed outcome is recorded.
-	s.markFinishing(run.StartVersion)
-	defer s.unmarkFinishing(run.StartVersion)
+	s.beginFinish(run.StartVersion)
+	defer s.settleFinish(run.StartVersion)
 
 	epoch, ok := s.ownedEpoch(run.StartVersion)
 	if !ok {
@@ -416,7 +414,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		return err
 	}
 
-	s.rememberFinished(run.StartVersion, run.fsmErr)
+	s.completeFinish(run.StartVersion, run.fsmErr)
 
 	return nil
 }
@@ -785,23 +783,6 @@ func (s *objectStore) ForgetRun(run Run) error {
 	return nil
 }
 
-// maxFinishedOutcomes bounds the finished map; when full, an arbitrary entry is evicted, and
-// its waiters fall back to the manifest's recorded error.
-const maxFinishedOutcomes = 4096
-
-func (s *objectStore) rememberFinished(version ulid.ULID, runErr RunErr) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-
-	if len(s.finished) >= maxFinishedOutcomes {
-		for evict := range s.finished {
-			delete(s.finished, evict)
-			break
-		}
-	}
-	s.finished[version] = runErr
-}
-
 // finishState is this process's knowledge of a run's finish.
 type finishState int
 
@@ -811,32 +792,66 @@ const (
 	finishDone                        // finished here; the typed outcome is recorded
 )
 
-// localFinish reports the run's finish state and recorded outcome under a single lock, so a
-// caller that observed a terminal manifest gets an atomic answer: use the typed outcome, keep
-// waiting for it, or fall back to the manifest.
+// runFinish is one run's entry in the finishes map.
+type runFinish struct {
+	state finishState
+
+	err RunErr
+}
+
+// maxFinishes bounds the finishes map; when full, an arbitrary settled entry is evicted, and
+// its waiters fall back to the manifest's recorded error. In-flight entries are never evicted
+// (they gate waiter release) and are naturally bounded by concurrent finishes.
+const maxFinishes = 4096
+
+// beginFinish marks the run's finish as in flight before the manifest turns terminal, so a
+// waiter that observes completion holds until the cleanup lands.
+func (s *objectStore) beginFinish(version ulid.ULID) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+	s.finishes[version] = runFinish{state: finishInFlight}
+}
+
+// completeFinish records the run's typed outcome once the finish cleanup has landed.
+func (s *objectStore) completeFinish(version ulid.ULID, runErr RunErr) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+
+	if len(s.finishes) >= maxFinishes {
+		for evict, finish := range s.finishes {
+			if finish.state != finishDone {
+				continue
+			}
+			delete(s.finishes, evict)
+			break
+		}
+	}
+	s.finishes[version] = runFinish{state: finishDone, err: runErr}
+}
+
+// settleFinish clears a finish that failed mid-cleanup. A completed finish was already
+// overwritten to done, which this leaves in place — the deferred call cannot clobber a
+// recorded outcome.
+func (s *objectStore) settleFinish(version ulid.ULID) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+	if finish, ok := s.finishes[version]; ok && finish.state == finishInFlight {
+		delete(s.finishes, version)
+	}
+}
+
+// localFinish reports the run's finish state and recorded outcome in one atomic lookup, so a
+// caller that observed a terminal manifest gets a definitive answer: use the typed outcome,
+// keep waiting for it, or fall back to the manifest.
 func (s *objectStore) localFinish(version ulid.ULID) (RunErr, finishState) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
 
-	if runErr, ok := s.finished[version]; ok {
-		return runErr, finishDone
+	finish, ok := s.finishes[version]
+	if !ok {
+		return RunErr{}, finishUnknown
 	}
-	if _, ok := s.finishing[version]; ok {
-		return RunErr{}, finishInFlight
-	}
-	return RunErr{}, finishUnknown
-}
-
-func (s *objectStore) markFinishing(version ulid.ULID) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	s.finishing[version] = struct{}{}
-}
-
-func (s *objectStore) unmarkFinishing(version ulid.ULID) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	delete(s.finishing, version)
+	return finish.err, finish.state
 }
 
 // History returns the archived record for a completed run. History objects are written at

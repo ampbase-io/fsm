@@ -99,15 +99,14 @@ type objectStore struct {
 	claiming map[ulid.ULID]struct{}
 	fenced   []ulid.ULID
 
-	// finished records terminal outcomes of runs this process completed, preserving typed run
-	// errors for same-process waiters. It is a bounded convenience, not state: absence just
-	// means WaitRun consults the manifest, whose recorded error string is the durable outcome.
-	// finishing tracks runs mid-appendFinish here so WaitRun releases waiters only after the
-	// finish cleanup (lock delete, history write) lands, matching the pre-terminal-manifest
-	// visibility BoltDB waiters get.
-	finishedMu sync.Mutex
-	finished   map[ulid.ULID]RunErr
-	finishing  map[ulid.ULID]struct{}
+	// finishes records this process's knowledge of run finishes, preserving typed run errors
+	// for same-process waiters and holding their release until the finish cleanup (lock
+	// delete, history write) lands — the visibility BoltDB waiters get. An entry is created
+	// when appendFinish begins, overwritten with the outcome when it completes, and removed if
+	// the finish fails; absence means the manifest is all there is. It is a bounded
+	// convenience, not state: evicted waiters fall back to the manifest's recorded error.
+	finishMu sync.Mutex
+	finishes map[ulid.ULID]runFinish
 }
 
 func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string) (*objectStore, error) {
@@ -134,14 +133,13 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	})
 
 	return &objectStore{
-		logger:    logger.WithField("node_id", nodeID),
-		client:    client,
-		cfg:       cfg,
-		nodeID:    nodeID,
-		owned:     map[ulid.ULID]int64{},
-		claiming:  map[ulid.ULID]struct{}{},
-		finished:  map[ulid.ULID]RunErr{},
-		finishing: map[ulid.ULID]struct{}{},
+		logger:   logger.WithField("node_id", nodeID),
+		client:   client,
+		cfg:      cfg,
+		nodeID:   nodeID,
+		owned:    map[ulid.ULID]int64{},
+		claiming: map[ulid.ULID]struct{}{},
+		finishes: map[ulid.ULID]runFinish{},
 	}, nil
 }
 
