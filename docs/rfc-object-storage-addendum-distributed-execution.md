@@ -99,8 +99,8 @@ Because addressing is by subject, **no component ever needs another node's netwo
 
 These are load-bearing; the event system is easy to get subtly wrong, and the invariants are what preserve reliability and the object-storage-only guarantee.
 
-1. **Publish after the durable write, never before.** A consumer observing a "finished" event must be able to trust that the manifest already reflects it. Publishing before the write would surface phantom events on crash.
-2. **Best-effort, non-blocking, correctness-neutral.** The transition has already committed durably before `Publish` is called. A slow or dead bus must never block, delay, or fail a transition. Delivery is fire-and-forget through a bounded buffer with drop-and-log on overflow.
+1. **Publish after the state a subject announces is fully observable, never before.** A consumer observing an event must be able to trust that everything the event implies has already happened. For most subjects that means after the durable write. For `fsm.run.done.<version>` it means after **finish cleanup** — the manifest flipped to COMPLETE *and* the resource lock deleted *and* the history object written — not merely after the COMPLETE flip: a waiter released at the flip can restart the same resource id into the not-yet-deleted lock (spurious `AlreadyRunning`) or look up history before it exists. (The object backend's poll path gates on exactly this finish-cleanup point for the same reason.)
+2. **Best-effort, non-blocking, correctness-neutral — on both sides.** The transition has already committed durably before `Publish` is called; a slow or dead bus must never block, delay, or fail a transition, and delivery is fire-and-forget through a bounded buffer with drop-and-log on overflow. The same rule applies to the subscribe side: a slow subscriber callback must not block the bus or the loops that consume it (heartbeat, claim); implementations dispatch callbacks asynchronously.
 3. **The log is the source of truth; the stream is an accelerator.** `Wait` may subscribe for a fast path but reconciles against the manifest and falls back to polling. A dropped event therefore never hangs a waiter. This mirrors the base RFC's "events are an audit trail, not the recovery source."
 4. **Every control signal has a durable counterpart.** A signal carried on the bus (cancel, pending) is written to object storage first; the bus only accelerates its discovery. A bus outage degrades latency to the relevant polling floor, never behavior.
 5. **No-op default preserves object-storage-only.** The default bus is a no-op; consumers who want the stream can tail the `events/` prefix. A live bus is injected via `Config`. The library never imports a pub/sub client.
@@ -120,10 +120,11 @@ An earlier sketch proposed a purpose-built "notifier" for cross-node `Wait`. Tha
 
 The base RFC's cancel flow — read the manifest for the owner's address, send a direct RPC to that node, fall back to a sentinel object — is replaced. Routing by stored node address hand-rolls service discovery on top of eventually-stale bucket objects, leaks network topology into domain state, and implies point-to-point worker RPC. Subject addressing removes the need for any of it:
 
-1. **Durable first.** Cancel (arriving via the RPC ingress on any worker) writes a write-once sentinel object `cancel/<run_version>` — the durable, idempotent record of cancellation intent.
+1. **Durable first.** Cancel (arriving via the RPC ingress on any worker) writes a write-once sentinel object `cancel/<run_version>` whose body carries the cancellation cause. Write-once (`If-None-Match: *`) gives first-cancel-wins semantics: a second cancel observes the 412 and reports success — the run is already canceled — rather than an error.
 2. **Then accelerate.** The accepting worker publishes `fsm.run.cancel.<run_version>` on the bus.
 3. **Owner reacts.** Every worker subscribes to cancel subjects and checks the version against its local running set: the owner cancels the run's context; everyone else ignores the message.
-4. **Polling floor.** During each lease heartbeat the owner also checks for sentinels on the runs it holds. With the bus down, cancel latency is bounded by the heartbeat interval — the same bound the base RFC's fallback path already accepted.
+4. **Polling floor.** During each lease heartbeat the owner also checks for sentinels covering the runs it holds — as **one keys-only listing** of the `cancel/` prefix intersected with the owned set, not a GET per run, so the check is a single request per tick regardless of how many runs a node holds (the sentinel body is fetched only on a match, and cancels are rare). With the bus down, cancel latency is bounded by the heartbeat interval — the same bound the base RFC's fallback path already accepted.
+5. **Canceled before execution.** A run can be canceled while pending, delayed, or queued — before any run context exists to cancel, and before the run loop that normally records CANCEL/FINISH events has started. Whichever node holds the run (or next claims it) must, on discovering the sentinel, drive the manifest to a terminal canceled state itself — recording the cause, deleting the lock, and writing history — so waiters resolve instead of polling to their deadline. No transitions run and no finalizers fire for a run canceled before execution began: nothing has happened that needs finalizing.
 
 Consequences:
 
@@ -178,6 +179,8 @@ The concern that dropping memdb means "a GET on every poll" only holds without a
 ## Interaction with the claim loop
 
 In the distributed topology the Phase 4 claim loop becomes the **primary work-distribution mechanism**, not merely a failover path: workers obtain work by claiming pending runs from object storage. The event stream's "pending" event provides low-latency wakeup so an idle worker claims immediately rather than on its next scan tick; the periodic scan remains the correctness floor.
+
+A broadcast wakeup stampedes by construction: every idle worker hears `fsm.run.pending` and races the claim CAS. That is *safe* — the lease epoch CAS picks exactly one winner — but it costs N lock-scans per wakeup. Workers should therefore apply a small random delay before scanning on a wakeup (jitter), which composes naturally with the claim tick they already run; the winner is simply whoever wakes first.
 
 ## Dependency invariant
 
