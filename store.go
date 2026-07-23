@@ -51,7 +51,92 @@ type Store interface {
 	// completed runs. Backends differ in retention: BoltDB serves runs whose events have not
 	// yet been archived, while the object storage backend indexes runs durably.
 	Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error)
+
+	// Run-state queries. The BoltDB backend answers from its private in-memory index; the
+	// object storage backend answers from object storage (locks/, index/, children/, and run
+	// manifests), so the answers hold across nodes sharing a bucket.
+
+	// ActiveRuns returns the incomplete runs recorded for the resource.
+	ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error)
+	// ActiveChildren returns the incomplete runs started from the given parent.
+	ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error)
+	// ResolveRun resolves a resource id to a run version, preferring an active run and falling
+	// back to the most recently recorded one. A miss returns a zero version.
+	ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error)
+	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
+	// recorded error (nil on success, and nil for runs no longer known to the backend).
+	WaitRun(ctx context.Context, runVersion ulid.ULID) error
+	// ListActive returns every incomplete run the backend knows about.
+	ListActive(ctx context.Context) ([]runState, error)
+
+	// Run-state notes from the executor.
+
+	// SetRunning records that the run has begun executing transitions on this node.
+	SetRunning(run Run) error
+	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
+	ForgetRun(run Run) error
+
 	Close() error
+}
+
+const (
+	fsmTable          = "fsm"
+	idIndex           = "id"
+	runIndex          = "run"
+	parentIndex       = "parent"
+	parentPrefixIndex = parentIndex + "_prefix"
+)
+
+// fsmSchema indexes run state for the BoltDB backend's run-state queries. It is private to
+// boltStore: the object storage backend answers the same queries from object storage.
+var fsmSchema = &memdb.DBSchema{
+	Tables: map[string]*memdb.TableSchema{
+		fsmTable: {
+			Name: fsmTable,
+			Indexes: map[string]*memdb.IndexSchema{
+				idIndex: {
+					Name:   idIndex,
+					Unique: true,
+					Indexer: ulidIndexer{
+						fieldFn: func(rs runState) ulid.ULID {
+							return rs.StartVersion
+						},
+					},
+				},
+				runIndex: {
+					Name:    runIndex,
+					Unique:  false,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+				parentIndex: {
+					Name:         parentIndex,
+					AllowMissing: true,
+					Unique:       false,
+					Indexer: ulidIndexer{
+						fieldFn: func(rs runState) ulid.ULID {
+							return rs.Parent
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+// historyOutcome reports a completed run's terminal result from the store, mapping a missing
+// record to a nil error (the run is gone) and a recorded error to a haltError.
+func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
+	he, err := s.History(ctx, version)
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		return nil
+	case err != nil:
+		return err
+	case he.GetLastEvent().GetError() != "":
+		return &haltError{err: errors.New(he.GetLastEvent().GetError())}
+	default:
+		return nil
+	}
 }
 
 var _ Store = (*boltStore)(nil)
@@ -73,7 +158,12 @@ type boltStore struct {
 	archiveCh chan struct{}
 }
 
-func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string, memDB *memdb.MemDB) (*boltStore, error) {
+func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string) (*boltStore, error) {
+	memDB, err := memdb.NewMemDB(fsmSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create memdb, %w", err)
+	}
+
 	db, err := bbolt.Open(filepath.Join(path, stateDB), 0o600, &bbolt.Options{
 		Timeout: 1 * time.Second,
 	})
@@ -456,6 +546,138 @@ func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, erro
 	txn.Commit()
 
 	return activeEvents, nil
+}
+
+// ActiveRuns answers from the in-memory index. resourceType is unused because memdb rows are
+// keyed by resource id alone (matching Runs).
+func (s *boltStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
+	txn := s.memDB.Txn(false)
+	defer txn.Abort()
+
+	it, err := txn.Get(fsmTable, runIndex, resourceID)
+	if err != nil {
+		return nil, err
+	}
+
+	active := ActiveSet{}
+	for next := it.Next(); next != nil; next = it.Next() {
+		rs := next.(runState)
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			continue
+		}
+		active[ActiveKey{Action: rs.Action, Version: rs.StartVersion}] = rs.State
+	}
+
+	return active, nil
+}
+
+func (s *boltStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error) {
+	txn := s.memDB.Txn(false)
+	defer txn.Abort()
+
+	it, err := txn.Get(fsmTable, parentPrefixIndex, parent)
+	if err != nil {
+		return nil, err
+	}
+
+	children := []Run{}
+	for next := it.Next(); next != nil; next = it.Next() {
+		rs := next.(runState)
+		if rs.StartVersion.Compare(ulid.ULID{}) == 0 {
+			continue
+		}
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			continue
+		}
+		children = append(children, rs.Run)
+	}
+
+	return children, nil
+}
+
+func (s *boltStore) ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error) {
+	txn := s.memDB.Txn(false)
+	defer txn.Abort()
+
+	item, err := txn.First(fsmTable, runIndex, resourceID)
+	if err != nil || item == nil {
+		return ulid.ULID{}, err
+	}
+	return item.(runState).StartVersion, nil
+}
+
+// WaitRun parks on the index's watch channel, which fires on the next state change of the
+// watched run. A run missing from the index is answered from history: the store is
+// authoritative for a run that already finished.
+func (s *boltStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
+	for {
+		txn := s.memDB.Txn(false)
+		ch, item, err := txn.FirstWatch(fsmTable, idIndex, runVersion.String())
+		txn.Abort()
+		switch {
+		case err != nil:
+			s.logger.WithError(err).Error("failed to wait for FSM")
+			return err
+		case item == nil:
+			return historyOutcome(ctx, s, runVersion)
+		}
+
+		rs, ok := item.(runState)
+		if !ok {
+			return fmt.Errorf("unexpected type %T", item)
+		}
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			return rs.Error.Err
+		}
+
+		ws := memdb.NewWatchSet()
+		ws.Add(ch)
+		if err := ws.WatchCtx(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *boltStore) ListActive(ctx context.Context) ([]runState, error) {
+	txn := s.memDB.Txn(false)
+	defer txn.Abort()
+
+	it, err := txn.Get(fsmTable, idIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	active := []runState{}
+	for next := it.Next(); next != nil; next = it.Next() {
+		rs := next.(runState)
+		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			continue
+		}
+		active = append(active, rs)
+	}
+	return active, nil
+}
+
+func (s *boltStore) SetRunning(run Run) error {
+	txn := s.memDB.Txn(true)
+	defer txn.Abort()
+
+	if err := txn.Insert(fsmTable, runState{Run: run, State: fsmv1.RunState_RUN_STATE_RUNNING}); err != nil {
+		return err
+	}
+	txn.Commit()
+	return nil
+}
+
+func (s *boltStore) ForgetRun(run Run) error {
+	txn := s.memDB.Txn(true)
+	defer txn.Abort()
+
+	if err := txn.Delete(fsmTable, runState{Run: run}); err != nil {
+		return err
+	}
+	txn.Commit()
+	return nil
 }
 
 type appendOptionFunc func(*appendOption) error

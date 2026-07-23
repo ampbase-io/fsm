@@ -177,7 +177,7 @@ func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOp
 	s.f.startState = name
 
 	opts := make([]Option[R, W], 0, len(startOpts)+1)
-	opts = append(opts, WithInitializers(setStarted[R, W](s.m.db)))
+	opts = append(opts, WithInitializers(setStarted[R, W](s.m.store)))
 	for _, o := range startOpts {
 		opts = append(opts, o)
 	}

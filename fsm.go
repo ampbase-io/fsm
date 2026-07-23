@@ -289,18 +289,9 @@ type runState struct {
 func resume[R, W any](m *Manager, f *fsm) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		clearRun := func(run Run) {
-			txn := m.db.Txn(true)
-			defer txn.Abort()
-
-			rs := runState{
-				Run:   run,
-				State: fsmv1.RunState_RUN_STATE_PENDING,
-			}
-			if err := txn.Delete(fsmTable, rs); err != nil {
+			if err := m.store.ForgetRun(run); err != nil {
 				m.logger.WithError(err).Error("failed to update fsm state store")
 			}
-			txn.Commit()
-			return
 		}
 
 		resources, err := m.store.Active(ctx, f)

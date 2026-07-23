@@ -16,7 +16,6 @@ import (
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
-	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 )
@@ -149,16 +148,11 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
-	memDB, err := memdb.NewMemDB(fsmSchema)
-	if err != nil {
-		t.Fatalf("failed to create memdb: %v", err)
-	}
-
 	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
 		Bucket:   bucket,
 		Endpoint: server.URL,
 		Region:   "auto",
-	}, memDB)
+	})
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
@@ -176,7 +170,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}, nil); err == nil {
+	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }

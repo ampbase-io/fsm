@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -34,6 +33,11 @@ type ObjectStorageConfig struct {
 
 	LeaseTimeout    time.Duration // Default 30s
 	HeartbeatPeriod time.Duration // Default 10s
+
+	// WaitPollInterval and WaitPollMaxInterval bound the exponential backoff of WaitRun's
+	// manifest poll floor.
+	WaitPollInterval    time.Duration // Default 100ms
+	WaitPollMaxInterval time.Duration // Default 2s
 }
 
 func (c *ObjectStorageConfig) prefix() string {
@@ -57,17 +61,38 @@ func (c *ObjectStorageConfig) heartbeatPeriod() time.Duration {
 	return 10 * time.Second
 }
 
-// objectStore implements low-level object storage operations for events, history,
-// and children. It does not yet implement the full Store interface — that comes in Phase 3
-// when the run manifest and Append()/Active() are added.
+func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
+	if c.WaitPollInterval > 0 {
+		return c.WaitPollInterval
+	}
+	return 100 * time.Millisecond
+}
+
+func (c *ObjectStorageConfig) waitPollMaxInterval() time.Duration {
+	if c.WaitPollMaxInterval > 0 {
+		return c.WaitPollMaxInterval
+	}
+	return 2 * time.Second
+}
+
+// objectStore implements the Store interface over S3-compatible object storage.
 type objectStore struct {
 	logger logrus.FieldLogger
 	client *s3.Client
 	cfg    *ObjectStorageConfig
-	memDB  *memdb.MemDB
+
+	// finished records terminal outcomes of runs this process completed, preserving typed run
+	// errors for same-process waiters. It is a bounded convenience, not state: absence just
+	// means WaitRun consults the manifest, whose recorded error string is the durable outcome.
+	// finishing tracks runs mid-appendFinish here so WaitRun releases waiters only after the
+	// finish cleanup (lock delete, history write) lands, matching the pre-terminal-manifest
+	// visibility BoltDB waiters get.
+	finishedMu sync.Mutex
+	finished   map[ulid.ULID]RunErr
+	finishing  map[ulid.ULID]struct{}
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, memDB *memdb.MemDB) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -87,10 +112,11 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	})
 
 	return &objectStore{
-		logger: logger,
-		client: client,
-		cfg:    cfg,
-		memDB:  memDB,
+		logger:    logger,
+		client:    client,
+		cfg:       cfg,
+		finished:  map[ulid.ULID]RunErr{},
+		finishing: map[ulid.ULID]struct{}{},
 	}, nil
 }
 
@@ -202,6 +228,16 @@ func retryBackoff(ctx context.Context, maxRetries uint64) backoff.BackOff {
 	b.MaxInterval = 2 * time.Second
 	b.MaxElapsedTime = 0 // bounded by maxRetries (and ctx), not wall-clock
 	return backoff.WithContext(backoff.WithMaxRetries(b, maxRetries), ctx)
+}
+
+// waitBackoff returns the backoff pacing WaitRun's manifest polls: bounded only by ctx, so a
+// wait outlives any fixed retry budget.
+func (s *objectStore) waitBackoff(ctx context.Context) backoff.BackOff {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = s.cfg.waitPollInterval()
+	b.MaxInterval = s.cfg.waitPollMaxInterval()
+	b.MaxElapsedTime = 0
+	return backoff.WithContext(b, ctx)
 }
 
 // putConditional issues a conditional PutObject — set applies the condition header — and retries

@@ -40,6 +40,16 @@ func (s *objectStore) lockPrefix(resourceType string) string {
 	return s.key("locks", escapeSegment(resourceType)) + "/"
 }
 
+func (s *objectStore) locksPrefix() string {
+	return s.key("locks") + "/"
+}
+
+// lockResourcePrefix narrows a lock listing to a single resource. The trailing slash keeps ids
+// that are prefixes of one another (machine-1, machine-10) from matching each other's locks.
+func (s *objectStore) lockResourcePrefix(resourceType, resourceID string) string {
+	return s.key("locks", escapeSegment(resourceType), escapeSegment(resourceID)) + "/"
+}
+
 // getManifest reads a run manifest with a consistent read, returning the manifest and the ETag
 // to CAS against.
 func (s *objectStore) getManifest(ctx context.Context, runVersion ulid.ULID) (*fsmv1.RunManifest, string, error) {
@@ -226,28 +236,6 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		}
 	}
 
-	// 5. Mirror into memdb, clearing completed rows for this resource id first (in-flight runs
-	// for the same id under a different action are left alone).
-	txn := s.memDB.Txn(true)
-	defer txn.Abort()
-	iter, err := txn.Get(fsmTable, runIndex, run.ID)
-	if err != nil {
-		return err
-	}
-	for next := iter.Next(); next != nil; next = iter.Next() {
-		rs := next.(runState)
-		if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
-			continue
-		}
-		if err := txn.Delete(fsmTable, rs); err != nil {
-			return err
-		}
-	}
-	if err := txn.Insert(fsmTable, runState{Run: run, State: fsmv1.RunState_RUN_STATE_PENDING}); err != nil {
-		return fmt.Errorf("failed to update state: %w", err)
-	}
-	txn.Commit()
-
 	return nil
 }
 
@@ -281,6 +269,11 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 }
 
 func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, eventKey string, eventBytes []byte) error {
+	// Marked before the manifest turns terminal, so a waiter that observes completion holds
+	// until the cleanup below lands and the typed outcome is recorded.
+	s.markFinishing(run.StartVersion)
+	defer s.unmarkFinishing(run.StartVersion)
+
 	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
@@ -317,16 +310,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		return err
 	}
 
-	txn := s.memDB.Txn(true)
-	defer txn.Abort()
-	if err := txn.Insert(fsmTable, runState{
-		Run:   run,
-		State: fsmv1.RunState_RUN_STATE_COMPLETE,
-		Error: run.fsmErr,
-	}); err != nil {
-		return fmt.Errorf("failed to update state: %w", err)
-	}
-	txn.Commit()
+	s.rememberFinished(run.StartVersion, run.fsmErr)
 
 	return nil
 }
@@ -361,27 +345,77 @@ func activeEventFromManifest(m *fsmv1.RunManifest) *fsmv1.ActiveEvent {
 	}
 }
 
-// Active returns all incomplete runs for the given FSM. Enumeration is driven by the locks/
-// prefix (keys-only listing plus one lock GET and one manifest GET per active run) — event
-// bodies are never read, per the RFC's resumability contract.
-func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	lockKeys, err := s.listKeys(ctx, s.lockPrefix(f.typeName))
+// manifestTerminal reports whether the manifest records a run that will make no further
+// progress.
+func manifestTerminal(m *fsmv1.RunManifest) bool {
+	return m.GetStatus() == fsmv1.RunState_RUN_STATE_COMPLETE || m.GetStatus() == fsmv1.RunState_RUN_STATE_ARCHIVED
+}
+
+// manifestRunErr rebuilds the run error recorded in the manifest.
+func manifestRunErr(m *fsmv1.RunManifest) RunErr {
+	if m.GetErrorState() == "" {
+		return RunErr{}
+	}
+	return RunErr{
+		Err:   errors.New(m.GetError()),
+		State: m.GetErrorState(),
+	}
+}
+
+// runFromManifest rebuilds a Run from the manifest's materialized fields. The resource alias is
+// not recorded in the manifest; the Manager restores it from the registered FSM.
+func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
+	var parent ulid.ULID
+	if parentBytes := m.GetParent(); parentBytes != nil {
+		if err := parent.UnmarshalText(parentBytes); err != nil {
+			parent = ulid.ULID{}
+		}
+	}
+	return Run{
+		ID:           m.GetResourceId(),
+		StartVersion: version,
+		Action:       m.GetAction(),
+		TypeName:     m.GetResourceType(),
+		Queue:        m.GetQueue(),
+		Parent:       parent,
+		fsmErr:       manifestRunErr(m),
+	}
+}
+
+// lockEntry pairs an active resource lock with the manifest of the run holding it.
+type lockEntry struct {
+	resourceType, resourceID, action string
+
+	version ulid.ULID
+
+	manifest *fsmv1.RunManifest
+}
+
+// scanLocks lists resource locks under prefix and resolves each to its owning run's manifest
+// (keys-only listing plus one lock GET and one manifest GET per active run — event bodies are
+// never read, per the RFC's resumability contract). Crash windows are handled inline: a lock
+// without a manifest is skipped, and a lock whose manifest is terminal is deleted.
+func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry, error) {
+	lockKeys, err := s.listKeys(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	var active []*activeResource
+	var entries []lockEntry
 	for _, lockKey := range lockKeys {
 		logger := s.logger.WithField("key", lockKey)
 
-		// locks/<type>/<id>/<action>[/<run_version>] — filter to this FSM's action.
-		segments := strings.Split(strings.TrimPrefix(lockKey, s.lockPrefix(f.typeName)), "/")
-		if len(segments) < 2 {
+		// locks/<type>/<id>/<action>[/<run_version>]
+		segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
+		if len(segments) < 3 {
 			logger.Warn("malformed lock key")
 			continue
 		}
-		action, err := unescapeSegment(segments[1])
-		if err != nil || action != f.action {
+		resourceType, typeErr := unescapeSegment(segments[0])
+		resourceID, idErr := unescapeSegment(segments[1])
+		action, actionErr := unescapeSegment(segments[2])
+		if err := errors.Join(typeErr, idErr, actionErr); err != nil {
+			logger.WithError(err).Warn("malformed lock key")
 			continue
 		}
 
@@ -407,7 +441,7 @@ func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, er
 			return nil, err
 		}
 
-		if manifest.GetStatus() == fsmv1.RunState_RUN_STATE_COMPLETE || manifest.GetStatus() == fsmv1.RunState_RUN_STATE_ARCHIVED {
+		if manifestTerminal(manifest) {
 			// Crash window between manifest completion and lock deletion: finish the cleanup.
 			logger.Info("completed run still holds its lock, removing")
 			if err := s.deleteObject(ctx, lockKey); err != nil {
@@ -416,53 +450,218 @@ func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, er
 			continue
 		}
 
-		var fsmError RunErr
-		if manifest.GetErrorState() != "" {
-			fsmError = RunErr{
-				Err:   errors.New(manifest.GetError()),
-				State: manifest.GetErrorState(),
-			}
-		}
-
-		active = append(active, &activeResource{
-			version:              version,
-			active:               activeEventFromManifest(manifest),
-			completedTransitions: manifest.GetCompletedStates(),
-			response:             manifest.GetLatestResponse(),
-			retryCount:           manifest.GetRetryCount(),
-			fsmError:             fsmError,
+		entries = append(entries, lockEntry{
+			resourceType: resourceType,
+			resourceID:   resourceID,
+			action:       action,
+			version:      version,
+			manifest:     manifest,
 		})
 	}
+	return entries, nil
+}
 
-	txn := s.memDB.Txn(true)
-	defer txn.Abort()
-	for _, ar := range active {
-		var parent ulid.ULID
-		if parentBytes := ar.active.GetOptions().GetParent(); parentBytes != nil {
-			if err := parent.UnmarshalText(parentBytes); err != nil {
-				s.logger.WithError(err).Error("failed to unmarshal parent")
-			}
+// Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
+func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
+	entries, err := s.scanLocks(ctx, s.lockPrefix(f.typeName))
+	if err != nil {
+		return nil, err
+	}
+
+	var active []*activeResource
+	for _, e := range entries {
+		if e.action != f.action {
+			continue
 		}
-		rs := runState{
-			Run: Run{
-				ID:           ar.active.GetResourceId(),
-				StartVersion: ar.version,
-				Action:       f.action,
-				ResourceName: f.alias,
-				TypeName:     f.typeName,
-				Queue:        ar.active.GetOptions().GetQueue(),
-				Parent:       parent,
-				fsmErr:       ar.fsmError,
-			},
-			State: fsmv1.RunState_RUN_STATE_PENDING,
-		}
-		if err := txn.Insert(fsmTable, rs); err != nil {
+		active = append(active, &activeResource{
+			version:              e.version,
+			active:               activeEventFromManifest(e.manifest),
+			completedTransitions: e.manifest.GetCompletedStates(),
+			response:             e.manifest.GetLatestResponse(),
+			retryCount:           e.manifest.GetRetryCount(),
+			fsmError:             manifestRunErr(e.manifest),
+		})
+	}
+	return active, nil
+}
+
+func (s *objectStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
+	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
+	if err != nil {
+		return nil, err
+	}
+
+	active := ActiveSet{}
+	for _, e := range entries {
+		active[ActiveKey{Action: e.action, Version: e.version}] = e.manifest.GetStatus()
+	}
+	return active, nil
+}
+
+func (s *objectStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error) {
+	children, err := s.listChildren(ctx, parent)
+	if err != nil {
+		return nil, err
+	}
+
+	active := []Run{}
+	for _, child := range children {
+		manifest, _, err := s.getManifest(ctx, child)
+		switch {
+		case errors.Is(err, ErrFsmNotFound):
+			continue
+		case err != nil:
 			return nil, err
 		}
+		if manifestTerminal(manifest) {
+			continue
+		}
+		active = append(active, runFromManifest(child, manifest))
 	}
-	txn.Commit()
-
 	return active, nil
+}
+
+// ResolveRun prefers the oldest active run holding a lock for the resource; with no lock held
+// it falls back to the most recent run in the index/ prefix, so a just-finished run's outcome
+// remains reachable through WaitRun.
+func (s *objectStore) ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error) {
+	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
+	if err != nil {
+		return ulid.ULID{}, err
+	}
+	if len(entries) > 0 {
+		oldest := entries[0].version
+		for _, e := range entries[1:] {
+			if e.version.Compare(oldest) < 0 {
+				oldest = e.version
+			}
+		}
+		return oldest, nil
+	}
+
+	runs, err := s.Runs(ctx, resourceType, resourceID)
+	if err != nil || len(runs) == 0 {
+		return ulid.ULID{}, err
+	}
+	return runs[len(runs)-1], nil
+}
+
+var errRunInFlight = errors.New("run still in flight")
+
+// WaitRun polls the run's manifest under exponential backoff until it records a terminal
+// state. Outcomes of runs this process completed are answered from the in-process finished
+// map, which preserves typed run errors; a missing manifest is answered from history. A
+// terminal manifest whose finish is still being cleaned up by this process keeps the waiter
+// polling until the outcome is recorded.
+func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
+	var outcome error
+	op := func() error {
+		if runErr, ok := s.finishedOutcome(runVersion); ok {
+			outcome = runErr.Err
+			return nil
+		}
+
+		manifest, _, err := s.getManifest(ctx, runVersion)
+		switch {
+		case errors.Is(err, ErrFsmNotFound):
+			outcome = historyOutcome(ctx, s, runVersion)
+			return nil
+		case err != nil:
+			return backoff.Permanent(err)
+		}
+
+		if !manifestTerminal(manifest) || s.isFinishing(runVersion) {
+			return errRunInFlight
+		}
+		// A finish on this process may have fully landed between the map check above and the
+		// manifest read; the outcome is recorded before the finishing mark clears, so check
+		// once more before falling back to the manifest's error string.
+		if runErr, ok := s.finishedOutcome(runVersion); ok {
+			outcome = runErr.Err
+			return nil
+		}
+		if manifest.GetError() != "" {
+			outcome = &haltError{err: errors.New(manifest.GetError())}
+		}
+		return nil
+	}
+	if err := backoff.Retry(op, s.waitBackoff(ctx)); err != nil {
+		return err
+	}
+	return outcome
+}
+
+func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {
+	entries, err := s.scanLocks(ctx, s.locksPrefix())
+	if err != nil {
+		return nil, err
+	}
+
+	active := make([]runState, 0, len(entries))
+	for _, e := range entries {
+		active = append(active, runState{
+			Run:   runFromManifest(e.version, e.manifest),
+			State: e.manifest.GetStatus(),
+			Error: manifestRunErr(e.manifest),
+		})
+	}
+	return active, nil
+}
+
+// SetRunning is a no-op: the manifest's status, maintained by Append, is the object backend's
+// run state, so a run reads as PENDING until its first transition writes an event.
+func (s *objectStore) SetRunning(run Run) error {
+	return nil
+}
+
+// ForgetRun is a no-op: the object backend holds no local run state, and the resource lock
+// stays visible until recovery succeeds.
+func (s *objectStore) ForgetRun(run Run) error {
+	return nil
+}
+
+// maxFinishedOutcomes bounds the finished map; when full, arbitrary entries are evicted, and
+// their waiters fall back to the manifest's recorded error.
+const maxFinishedOutcomes = 4096
+
+func (s *objectStore) rememberFinished(version ulid.ULID, runErr RunErr) {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+
+	for len(s.finished) >= maxFinishedOutcomes {
+		for evict := range s.finished {
+			delete(s.finished, evict)
+			break
+		}
+	}
+	s.finished[version] = runErr
+}
+
+func (s *objectStore) finishedOutcome(version ulid.ULID) (RunErr, bool) {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+
+	runErr, ok := s.finished[version]
+	return runErr, ok
+}
+
+func (s *objectStore) markFinishing(version ulid.ULID) {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+	s.finishing[version] = struct{}{}
+}
+
+func (s *objectStore) unmarkFinishing(version ulid.ULID) {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+	delete(s.finishing, version)
+}
+
+func (s *objectStore) isFinishing(version ulid.ULID) bool {
+	s.finishedMu.Lock()
+	defer s.finishedMu.Unlock()
+	_, ok := s.finishing[version]
+	return ok
 }
 
 // History returns the archived record for a completed run. History objects are written at
