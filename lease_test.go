@@ -163,6 +163,10 @@ func TestFencedAppendAfterSteal(t *testing.T) {
 	if _, err := a.readHistory(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("fenced finish still wrote history: %v", err)
 	}
+	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
+	if _, _, err := a.getObject(ctx, lockKey); err != nil {
+		t.Fatalf("expected the resource lock to survive a fenced finish, got %v", err)
+	}
 
 	// The tripped fence is reported by the next heartbeat pass so the local run is canceled.
 	lost := a.extendLeases(ctx)
@@ -289,6 +293,164 @@ func TestClaimRace(t *testing.T) {
 	}
 	if total := <-results + <-results; total != 1 {
 		t.Fatalf("expected exactly one node to win the claim race, got %d claims", total)
+	}
+}
+
+// TestClaimRaceSameStore races two claimers on one store — a caller-invoked Resume against
+// the claim tick — which the claim reservation must resolve to a single claim and a single
+// epoch bump.
+func TestClaimRaceSameStore(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 50*time.Millisecond)
+	run := startRun(t, a, "selfrace-1")
+	time.Sleep(120 * time.Millisecond)
+
+	b := h.store("node-b", 10*time.Second)
+	results := make(chan int, 2)
+	for range 2 {
+		go func() {
+			claimed, err := b.claimRuns(ctx, []*fsm{deployFSM})
+			if err != nil {
+				t.Errorf("claimRuns failed: %v", err)
+			}
+			results <- len(claimed)
+		}()
+	}
+	if total := <-results + <-results; total != 1 {
+		t.Fatalf("expected exactly one same-store claim, got %d", total)
+	}
+	if epoch := mustManifest(t, b, run.StartVersion).GetLeaseEpoch(); epoch != 2 {
+		t.Fatalf("expected a single epoch bump to 2, got %d", epoch)
+	}
+}
+
+func TestForgetRunReleasesLease(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 10*time.Second)
+	b := h.store("node-b", 10*time.Second)
+
+	run := startRun(t, a, "forget-1")
+	if err := a.ForgetRun(run); err != nil {
+		t.Fatalf("failed to forget run: %v", err)
+	}
+
+	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
+		t.Fatal("expected the lease dropped by ForgetRun")
+	}
+	if owner := mustManifest(t, b, run.StartVersion).GetOwnerNode(); owner != "" {
+		t.Fatalf("expected ownership released, still owned by %q", owner)
+	}
+	if claimed, err := b.claimRuns(ctx, []*fsm{deployFSM}); err != nil || len(claimed) != 1 {
+		t.Fatalf("expected the released run claimable, got %v (err=%v)", claimed, err)
+	}
+}
+
+// TestStartRetryAfterFinishRejected covers the manifest-adopt path: a crash-retry of a START
+// whose run already completed must not re-execute the run, and must leave no lock behind.
+func TestStartRetryAfterFinishRejected(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 10*time.Second)
+
+	run := startRun(t, a, "replay-1")
+	if err := appendComplete(a, run); err != nil {
+		t.Fatalf("failed to append complete event: %v", err)
+	}
+	if err := appendFinished(a, run); err != nil {
+		t.Fatalf("failed to append finish event: %v", err)
+	}
+
+	_, err := a.Append(ctx, run, &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        "created",
+	}, "", withStartOption([]byte("{}"), []string{"created", "done"}))
+	if _, ok := errors.AsType[*AlreadyRunningError](err); !ok {
+		t.Fatalf("expected AlreadyRunningError for a finished run's START retry, got %v", err)
+	}
+
+	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
+		t.Fatal("expected no lease adopted from a terminal manifest")
+	}
+	if got := mustManifest(t, a, run.StartVersion).GetStatus(); got != fsmv1.RunState_RUN_STATE_COMPLETE {
+		t.Fatalf("expected the manifest to stay COMPLETE, got %v", got)
+	}
+	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
+	if _, _, err := a.getObject(ctx, lockKey); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected the retry's lock removed, got %v", err)
+	}
+}
+
+// TestCompletedRunLockCleanedAtStart covers the crash window between manifest completion and
+// lock deletion: a new run for the resource finishes the cleanup instead of reporting a
+// spurious AlreadyRunning.
+func TestCompletedRunLockCleanedAtStart(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 10*time.Second)
+
+	run := startRun(t, a, "restart-1")
+	if err := appendComplete(a, run); err != nil {
+		t.Fatalf("failed to append complete event: %v", err)
+	}
+	if err := appendFinished(a, run); err != nil {
+		t.Fatalf("failed to append finish event: %v", err)
+	}
+
+	lockKey := a.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
+	versionBytes, err := run.StartVersion.MarshalText()
+	if err != nil {
+		t.Fatalf("failed to marshal version: %v", err)
+	}
+	if err := a.putIfAbsent(ctx, lockKey, versionBytes); err != nil {
+		t.Fatalf("failed to recreate the orphaned lock: %v", err)
+	}
+
+	next := startRun(t, a, "restart-1")
+	owner, err := a.lockOwner(ctx, lockKey)
+	if err != nil || owner != next.StartVersion {
+		t.Fatalf("expected the lock held by the new run %s, got %s (err=%v)", next.StartVersion, owner, err)
+	}
+}
+
+// TestStaleOrphanLockReaped covers lock-without-manifest recovery: a lock old enough that no
+// START can still be writing its manifest is reaped; a fresh one is left alone.
+func TestStaleOrphanLockReaped(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 50*time.Millisecond)
+
+	staleVersion := testULID(t, uint64(time.Now().Add(-time.Minute).UnixMilli()))
+	staleKey := a.lockKey("orderReq", "stale-1", "deploy", "", staleVersion)
+	staleBytes, _ := staleVersion.MarshalText()
+	if err := a.putIfAbsent(ctx, staleKey, staleBytes); err != nil {
+		t.Fatalf("failed to create stale lock: %v", err)
+	}
+
+	freshVersion := ulid.Make()
+	freshKey := a.lockKey("orderReq", "fresh-1", "deploy", "", freshVersion)
+	freshBytes, _ := freshVersion.MarshalText()
+	if err := a.putIfAbsent(ctx, freshKey, freshBytes); err != nil {
+		t.Fatalf("failed to create fresh lock: %v", err)
+	}
+
+	entries, err := a.scanLocks(ctx, a.lockPrefix("orderReq"))
+	if err != nil {
+		t.Fatalf("scanLocks failed: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no resolvable entries, got %v", entries)
+	}
+
+	if _, _, err := a.getObject(ctx, staleKey); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected the stale lock reaped, got %v", err)
+	}
+	if _, _, err := a.getObject(ctx, freshKey); err != nil {
+		t.Fatalf("expected the fresh lock left in place, got %v", err)
 	}
 }
 
@@ -462,6 +624,116 @@ func TestLeaseLossCancelsRun(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("the old owner's run was never canceled after losing its lease")
+	}
+}
+
+// TestResumeContinuesPastFailedRun verifies a caller-invoked Resume dispatches every claimed
+// run even when one fails: the claims are already this node's, so stopping at the first
+// failure would leave the remainder heartbeat-extended but never executed.
+func TestResumeContinuesPastFailedRun(t *testing.T) {
+	nodes := 0
+	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+		nodes++
+		cfg.LeaseTimeout = 150 * time.Millisecond
+		cfg.ClaimInterval = time.Hour // the explicit Resume is the only claim path
+		cfg.HeartbeatPeriod = 75 * time.Millisecond
+		if nodes == 1 {
+			cfg.HeartbeatPeriod = time.Hour
+		}
+	})
+	ctx := context.Background()
+
+	m1, _ := f.newManager(nil)
+	var (
+		entered = make(chan struct{}, 2)
+		block   = make(chan struct{})
+	)
+	defer close(block)
+	start := blockingFSM(t, m1, "poison", entered, block)
+
+	// poison-1 sorts before poison-2 in the lock listing, so the failing run is dispatched
+	// first and the healthy one only completes if Resume keeps going.
+	v1, err := start(ctx, "poison-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	<-entered
+	v2, err := start(ctx, "poison-2", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	<-entered
+
+	// Corrupt the first run's persisted resource so its resume fails to unmarshal.
+	store := m1.store.(*objectStore)
+	if _, err := store.casManifest(ctx, v1, func(m *fsmv1.RunManifest) error {
+		m.Resource = []byte("corrupt")
+		return nil
+	}); err != nil {
+		t.Fatalf("failed to corrupt resource: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond) // let m1's undefended leases lapse
+
+	m2, _ := f.newManager(nil)
+	resume := completingFSM(t, m2, "poison")
+	if err := resume(ctx); err == nil {
+		t.Fatal("expected Resume to report the poisoned run")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m2.Wait(waitCtx, v2); err != nil {
+		t.Fatalf("healthy run after the poisoned one completed with error: %v", err)
+	}
+
+	// The poisoned run's claim was released for another node (or a later pass) to retry.
+	if owner := mustManifest(t, store, v1).GetOwnerNode(); owner != "" {
+		t.Fatalf("expected the poisoned run's lease released, still owned by %q", owner)
+	}
+}
+
+// TestLostLeaseDelayedRunNeverExecutes verifies the ownership check at execute-start: a
+// delayed run whose lease was claimed by another node during the delay must cancel before its
+// first transition's side effects run, no matter how long after the loss it dispatches.
+func TestLostLeaseDelayedRunNeverExecutes(t *testing.T) {
+	f := newObjectFactoryWith(t, asymmetricTimings(400*time.Millisecond))
+	ctx := context.Background()
+
+	m1, _ := f.newManager(nil)
+	var executed atomic.Int32
+	start, _, err := m1.Register[orderReq, orderResp]("dsteal").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			executed.Add(1)
+			return nil, nil
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+	dispatchAt := time.Now().Add(1200 * time.Millisecond)
+	version, err := start(ctx, "dsteal-1", NewRequest(&orderReq{}, &orderResp{}), WithDelayedStart(dispatchAt))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+
+	// m2's claim loop takes the run while it waits out its delay (m1's slow heartbeat lets
+	// the lease lapse) and completes it after the delay elapses.
+	m2, _ := f.newManager(nil)
+	completingFSM(t, m2, "dsteal")
+
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := m2.Wait(waitCtx, version); err != nil {
+		t.Fatalf("claimed run completed with error: %v", err)
+	}
+
+	// Wait until well past m1's own dispatch moment (the persisted delay truncates to seconds,
+	// so m2 may have finished earlier), then confirm m1 never ran user code.
+	time.Sleep(time.Until(dispatchAt) + 500*time.Millisecond)
+	if got := executed.Load(); got != 0 {
+		t.Fatalf("the old owner executed a stolen delayed run %d times", got)
 	}
 }
 

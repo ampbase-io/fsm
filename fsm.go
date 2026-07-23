@@ -180,10 +180,6 @@ type fsm struct {
 
 	startState, endState string
 
-	queue string
-
-	parent ulid.ULID
-
 	initializers []InitializerFunc
 
 	transitions *immutable.List[string]
@@ -292,7 +288,9 @@ type runState struct {
 }
 
 // resume drives every resumable run of f through resumeOne. Which runs are resumable is
-// backend-defined: a lease-coordinated backend hands out only runs this node claimed.
+// backend-defined: a lease-coordinated backend hands out only runs this node claimed. Every
+// run is dispatched even when another fails — the claims are already this node's, and an
+// undispatched claimed run would stay heartbeat-extended but never execute.
 func resume(m *Manager, f *fsm) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		resources, err := m.resumable(ctx, f)
@@ -300,12 +298,11 @@ func resume(m *Manager, f *fsm) func(ctx context.Context) error {
 			return err
 		}
 
+		var errs error
 		for _, resource := range resources {
-			if err := f.resumeOne(ctx, resource); err != nil {
-				return err
-			}
+			errs = errors.Join(errs, f.resumeOne(ctx, resource))
 		}
-		return nil
+		return errs
 	}
 }
 
@@ -468,10 +465,6 @@ func start[R, W any](m *Manager, f *fsm) func(ctx context.Context, id string, re
 		runVersion := ulid.Make()
 
 		ctx = withRestart(ctx, false)
-		f.queue = startOpt.queue
-		if startOpt.parent.Compare(ulid.ULID{}) != 0 {
-			f.parent = startOpt.parent
-		}
 
 		r := runnerFromOpts(&startOpt, m)
 
@@ -481,8 +474,8 @@ func start[R, W any](m *Manager, f *fsm) func(ctx context.Context, id string, re
 			Action:       f.action,
 			ResourceName: f.alias,
 			TypeName:     f.typeName,
-			Queue:        f.queue,
-			Parent:       f.parent,
+			Queue:        startOpt.queue,
+			Parent:       startOpt.parent,
 		}
 
 		transitions := immutable.NewList[*transition]()

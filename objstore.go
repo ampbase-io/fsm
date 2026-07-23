@@ -90,11 +90,14 @@ type objectStore struct {
 	nodeID string
 
 	// owned maps each run this node holds a lease on to the lease epoch it claimed with; every
-	// run-mutating manifest CAS re-verifies both. fenced buffers runs whose fence tripped in
-	// Append so the next heartbeat pass reports them for local cancellation.
-	leaseMu sync.Mutex
-	owned   map[ulid.ULID]int64
-	fenced  []ulid.ULID
+	// run-mutating manifest CAS re-verifies both. claiming reserves runs mid-claim so
+	// concurrent same-store claimers (a caller-invoked Resume racing the claim tick) cannot
+	// both win. fenced buffers runs whose fence tripped in Append so the next heartbeat pass
+	// reports them for local cancellation.
+	leaseMu  sync.Mutex
+	owned    map[ulid.ULID]int64
+	claiming map[ulid.ULID]struct{}
+	fenced   []ulid.ULID
 
 	// finished records terminal outcomes of runs this process completed, preserving typed run
 	// errors for same-process waiters. It is a bounded convenience, not state: absence just
@@ -136,6 +139,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		cfg:       cfg,
 		nodeID:    nodeID,
 		owned:     map[ulid.ULID]int64{},
+		claiming:  map[ulid.ULID]struct{}{},
 		finished:  map[ulid.ULID]RunErr{},
 		finishing: map[ulid.ULID]struct{}{},
 	}, nil

@@ -156,12 +156,71 @@ func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEve
 	default:
 		err = fmt.Errorf("%T: %w", event.Type, errInvalidEventType)
 	}
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrLeaseLost):
+		// Expected control flow after a takeover, not a storage failure.
+		s.logger.WithError(err).Warn("append fenced, run no longer owned")
+		return ulid.ULID{}, err
+	case err != nil:
 		s.logger.WithError(err).Error("failed to append event")
 		return ulid.ULID{}, err
 	}
 
 	return eventVersion, nil
+}
+
+// lockOwner reads the run version a resource lock records as its holder.
+func (s *objectStore) lockOwner(ctx context.Context, lockKey string) (ulid.ULID, error) {
+	owner, _, err := s.getObject(ctx, lockKey)
+	if err != nil {
+		return ulid.ULID{}, fmt.Errorf("resource lock %s is held but unreadable: %w", lockKey, err)
+	}
+	var ownerVersion ulid.ULID
+	if err := ownerVersion.UnmarshalText(owner); err != nil {
+		return ulid.ULID{}, fmt.Errorf("resource lock %s has invalid owner: %w", lockKey, err)
+	}
+	return ownerVersion, nil
+}
+
+// acquireRunLock takes the resource lock. A lock held by a run whose manifest is already
+// terminal is a crash (or in-flight cleanup) window between manifest completion and lock
+// deletion: the cleanup is finished here and the acquire retried once, so a caller that
+// restarts a resource right after waiting on its completion doesn't see a spurious
+// AlreadyRunning.
+func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVersionBytes []byte) error {
+	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	case err == nil:
+		return nil
+	case !errors.Is(err, errPreconditionFailed):
+		return err
+	}
+
+	ownerVersion, err := s.lockOwner(ctx, lockKey)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := s.getManifest(ctx, ownerVersion)
+	if err != nil || !manifestTerminal(manifest) {
+		return &AlreadyRunningError{Version: ownerVersion}
+	}
+
+	s.logger.WithField("key", lockKey).Info("completed run still holds its lock, removing")
+	if err := s.deleteObject(ctx, lockKey); err != nil {
+		return fmt.Errorf("failed to delete orphaned lock %s: %w", lockKey, err)
+	}
+	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	case err == nil:
+		return nil
+	case !errors.Is(err, errPreconditionFailed):
+		return err
+	}
+
+	// Lost the re-acquire race to another starter.
+	ownerVersion, err = s.lockOwner(ctx, lockKey)
+	if err != nil {
+		return err
+	}
+	return &AlreadyRunningError{Version: ownerVersion}
 }
 
 func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, eventBytes []byte) error {
@@ -172,19 +231,8 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 
 	// 1. Acquire the resource lock. A 412 means another run holds it.
 	lockKey := s.lockKey(event.GetResourceType(), event.GetId(), event.GetAction(), queue, run.StartVersion)
-	if err := s.putIfAbsent(ctx, lockKey, runVersionBytes); err != nil {
-		if !errors.Is(err, errPreconditionFailed) {
-			return err
-		}
-		owner, _, gerr := s.getObject(ctx, lockKey)
-		if gerr != nil {
-			return fmt.Errorf("resource lock %s is held but unreadable: %w", lockKey, gerr)
-		}
-		var ownerVersion ulid.ULID
-		if err := ownerVersion.UnmarshalText(owner); err != nil {
-			return fmt.Errorf("resource lock %s has invalid owner: %w", lockKey, err)
-		}
-		return &AlreadyRunningError{Version: ownerVersion}
+	if err := s.acquireRunLock(ctx, lockKey, runVersionBytes); err != nil {
+		return err
 	}
 
 	// 2. Write the START event.
@@ -234,10 +282,18 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		s.trackLease(run.StartVersion, 1)
 	case errors.Is(err, errPreconditionFailed):
 		// A crashed earlier attempt of this same run already created the manifest; it is
-		// authoritative. Adopt its lease if this node still owns it.
+		// authoritative. Adopt its lease if this node still owns it — but never a terminal
+		// manifest: a START retry arriving after the run finished must not re-execute it, and
+		// the lock re-acquired above is undone so the duplicate leaves no trace.
 		existing, _, getErr := s.getManifest(ctx, run.StartVersion)
 		if getErr != nil {
 			return getErr
+		}
+		if manifestTerminal(existing) {
+			if err := s.deleteObject(ctx, lockKey); err != nil {
+				s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete lock of completed run")
+			}
+			return &AlreadyRunningError{Version: run.StartVersion}
 		}
 		if existing.GetOwnerNode() != s.nodeID {
 			return ErrLeaseLost
@@ -526,8 +582,16 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	manifest, _, err := s.getManifest(ctx, version)
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
-		// Crash window between lock acquisition and manifest creation. Leave the lock for
-		// the periodic recovery scan rather than racing an in-flight START.
+		// Crash window between lock acquisition and manifest creation. A recent lock may
+		// belong to an in-flight START and is left alone; one old enough that no START can
+		// still be writing it (the run version carries its creation time) is reaped.
+		if time.Since(ulid.Time(version.Time())) > 2*s.cfg.leaseTimeout() {
+			logger.Warn("stale lock with no manifest, removing")
+			if err := s.deleteObject(ctx, lockKey); err != nil {
+				logger.WithError(err).Error("failed to delete stale lock")
+			}
+			return nil, nil
+		}
 		logger.Warn("lock held but manifest missing, skipping")
 		return nil, nil
 	case err != nil:

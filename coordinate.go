@@ -80,6 +80,12 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 				m.cancelRunning(version, ErrLeaseLost)
 			}
 		case <-claim.C:
+			// A tick can race shutdown; don't start a claim pass the manager won't wait out.
+			select {
+			case <-m.done:
+				return
+			default:
+			}
 			m.claimPass(ctx, lc)
 			claim.Reset(withJitter(claimEvery))
 		}
@@ -97,6 +103,8 @@ func (m *Manager) claimPass(ctx context.Context, lc leaseCoordinator) {
 	for _, c := range claimed {
 		logger := m.logger.WithField("run_version", c.resource.version.String())
 		logger.Info("claimed run")
+		// TODO: a run that repeatedly fails to resume is released by ForgetRun and re-claimed
+		// by every node's next pass; add per-run claim backoff or dead-lettering.
 		if err := c.f.resumeOne(ctx, c.resource); err != nil {
 			logger.WithError(err).Error("failed to resume claimed run")
 		}
@@ -105,5 +113,8 @@ func (m *Manager) claimPass(ctx context.Context, lc leaseCoordinator) {
 
 // withJitter spreads periodic work across nodes: d scaled uniformly into [0.75d, 1.25d).
 func withJitter(d time.Duration) time.Duration {
+	if d < 2 {
+		return d
+	}
 	return 3*d/4 + rand.N(d/2)
 }

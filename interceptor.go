@@ -114,13 +114,14 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 				}
 			}
 
-			if _, appendErr := store.Append(ctx, run, event, run.Queue); appendErr != nil {
-				logger.WithError(appendErr).Error("failed to append complete event")
+			switch _, appendErr := store.Append(ctx, run, event, run.Queue); {
+			case errors.Is(appendErr, ErrLeaseLost):
 				// A fenced append means the run must halt here even though the transition
 				// itself succeeded; swallowing it would keep executing without a durable record.
-				if errors.Is(appendErr, ErrLeaseLost) {
-					return resp, appendErr
-				}
+				logger.WithError(appendErr).Warn("append fenced, halting run")
+				return resp, appendErr
+			case appendErr != nil:
+				logger.WithError(appendErr).Error("failed to append complete event")
 			}
 
 			return resp, err

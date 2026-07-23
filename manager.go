@@ -128,6 +128,20 @@ func New(cfg Config) (*Manager, error) {
 		go q.run(done, cfg.Logger.WithField("queue", name))
 	}
 
+	socket := cfg.AdminSocketPath
+	if socket == "" && cfg.DBPath != "" {
+		socket = filepath.Join(cfg.DBPath, "fsm.sock")
+	}
+	switch {
+	case socket == "":
+		man.logger.Info("no admin socket path configured, admin service disabled")
+	default:
+		if err := man.serveAdmin(socket); err != nil {
+			return nil, err
+		}
+	}
+
+	// Started after the last fallible step, so a failed New leaks no coordination goroutine.
 	if lc, ok := store.(leaseCoordinator); ok {
 		man.lc = lc
 		man.wg.Add(1)
@@ -135,18 +149,6 @@ func New(cfg Config) (*Manager, error) {
 			defer man.wg.Done()
 			man.coordinate(lc)
 		}()
-	}
-
-	socket := cfg.AdminSocketPath
-	if socket == "" && cfg.DBPath != "" {
-		socket = filepath.Join(cfg.DBPath, "fsm.sock")
-	}
-	if socket == "" {
-		man.logger.Info("no admin socket path configured, admin service disabled")
-		return man, nil
-	}
-	if err := man.serveAdmin(socket); err != nil {
-		return nil, err
 	}
 
 	return man, nil

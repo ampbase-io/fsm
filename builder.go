@@ -220,16 +220,18 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 }
 
 // End sets the final state of the FSM and applies any options as a global option for the FSM.
+// The registry lock covers the whole registration so concurrent End calls cannot both pass the
+// duplicate check; the claim loop reads the registry concurrently.
 func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[R, W] {
 	fk := fsmKey{
 		name:   s.f.typeName,
 		action: s.f.action,
 	}
 
-	s.m.mu.RLock()
-	_, registered := s.m.fsms[fk]
-	s.m.mu.RUnlock()
-	if registered {
+	s.m.mu.Lock()
+	defer s.m.mu.Unlock()
+
+	if _, ok := s.m.fsms[fk]; ok {
 		s.m.logger.WithField("fsm", s.f.typeName).Error("fsm already registered")
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("fsm %s:%s already registered", s.f.typeName, s.f.action))
 		return &fsmEnd[R, W]{s.transitionStep}
@@ -265,10 +267,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	s.f.endState = name
 	s.f.resumeOne = resumeOne[R, W](s.m, s.f)
 
-	// The claim loop reads the registry concurrently with registration.
-	s.m.mu.Lock()
 	s.m.fsms[fk] = s.f
-	s.m.mu.Unlock()
 
 	return &fsmEnd[R, W]{s.transitionStep}
 }

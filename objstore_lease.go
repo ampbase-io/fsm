@@ -129,6 +129,8 @@ func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
 			mu.Lock()
 			lost = append(lost, version)
 			mu.Unlock()
+		case errors.Is(err, context.Canceled):
+			// Shutdown mid-pass; Close releases the leases.
 		default:
 			s.logger.WithError(err).WithField("run_version", version.String()).Error("failed to extend lease")
 		}
@@ -136,15 +138,21 @@ func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
 	return lost
 }
 
-// eligible reports whether this node may claim the run: it is non-terminal, not already held
-// by this store, and either unowned, left over from a previous incarnation of this node (the
-// epoch bump fences the zombie), or past its lease expiry. Expiry uses the local clock as a
-// liveness heuristic only; correctness rests on the epoch CAS.
+// eligible reports whether this node may claim the run: the manifest is claimable and the
+// store neither holds the run nor has a claim on it in flight.
 func (s *objectStore) eligible(version ulid.ULID, m *fsmv1.RunManifest, now time.Time) bool {
-	if manifestTerminal(m) {
+	if s.trackedOrClaiming(version) {
 		return false
 	}
-	if _, tracked := s.ownedEpoch(version); tracked {
+	return s.claimable(m, now)
+}
+
+// claimable reports the manifest-side claim conditions: the run is non-terminal and either
+// unowned, left over from a previous incarnation of this node (the epoch bump fences the
+// zombie), or past its lease expiry. Expiry uses the local clock as a liveness heuristic
+// only; correctness rests on the epoch CAS.
+func (s *objectStore) claimable(m *fsmv1.RunManifest, now time.Time) bool {
+	if manifestTerminal(m) {
 		return false
 	}
 	switch {
@@ -157,12 +165,51 @@ func (s *objectStore) eligible(version ulid.ULID, m *fsmv1.RunManifest, now time
 	}
 }
 
-// claimManifest takes ownership of the run via manifest CAS. Eligibility is re-checked against
-// the fresh manifest on every attempt, so losing a race to a competitor surfaces as
-// errClaimLost rather than a steal.
+func (s *objectStore) trackedOrClaiming(version ulid.ULID) bool {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	_, owned := s.owned[version]
+	_, claiming := s.claiming[version]
+	return owned || claiming
+}
+
+// reserveClaim serializes same-store claimers on a run: only one goroutine may be mid-claim,
+// and a run already held is never re-claimed. Without it, a caller-invoked Resume racing the
+// claim tick could both pass the eligibility check (the winner's lease is tracked only after
+// its CAS returns) and claim the run twice, dispatching it twice.
+func (s *objectStore) reserveClaim(version ulid.ULID) bool {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if _, ok := s.owned[version]; ok {
+		return false
+	}
+	if _, ok := s.claiming[version]; ok {
+		return false
+	}
+	s.claiming[version] = struct{}{}
+	return true
+}
+
+// settleClaim clears the in-progress mark, recording the lease epoch when the claim won.
+func (s *objectStore) settleClaim(version ulid.ULID, epoch int64, won bool) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	delete(s.claiming, version)
+	if won {
+		s.owned[version] = epoch
+	}
+}
+
+// claimManifest takes ownership of the run via manifest CAS. The local reservation excludes
+// same-store competitors; claimability is re-checked against the fresh manifest on every CAS
+// attempt, so losing a race to another node surfaces as errClaimLost rather than a steal.
 func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fsmv1.RunManifest, error) {
+	if !s.reserveClaim(version) {
+		return nil, errClaimLost
+	}
+
 	manifest, err := s.casManifest(ctx, version, func(m *fsmv1.RunManifest) error {
-		if !s.eligible(version, m, time.Now()) {
+		if !s.claimable(m, time.Now()) {
 			return errClaimLost
 		}
 		m.OwnerNode = s.nodeID
@@ -171,9 +218,10 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 		return nil
 	})
 	if err != nil {
+		s.settleClaim(version, 0, false)
 		return nil, err
 	}
-	s.trackLease(version, manifest.GetLeaseEpoch())
+	s.settleClaim(version, manifest.GetLeaseEpoch(), true)
 	return manifest, nil
 }
 
