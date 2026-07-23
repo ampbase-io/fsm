@@ -74,13 +74,18 @@ All objects live under a configurable prefix (default `fsm/`) within a single S3
 |Prefix     |Key Format                                            |Mutability              |Purpose                                            |
 |-----------|------------------------------------------------------|------------------------|---------------------------------------------------|
 |`events/`  |`<resource_id>/<action>/<run_version>/<event_version>`|Immutable (write-once)  |Append-only event log per run                      |
-|`runs/`    |`<resource_id>/<action>/<run_version>`                |Mutable (CAS)           |Run manifest: linearization point for all run state|
-|`locks/`   |`<resource_type>/<resource_id>/<action>`              |Mutable (create/delete) |Enforces one-active-run-per-resource constraint    |
+|`runs/`    |`<run_version>`                                       |Mutable (CAS)           |Run manifest: linearization point for all run state|
+|`locks/`   |`<resource_type>/<resource_id>/<action>`              |Mutable (create/delete) |Enforces one-active-run-per-resource constraint; body holds the owning run version|
 |`children/`|`<parent_run_version>/<child_run_version>`            |Immutable (write-once)  |Parent-to-child run index                          |
+|`index/`   |`<resource_type>/<resource_id>/<action>/<run_version>`|Immutable (write-once)  |Per-resource run index for past-run queries        |
 |`history/` |`<date>/<run_version>`                                |Immutable (write-once)  |Archived completed runs                            |
 |`queues/`  |`<queue_name>`                                        |Mutable (CAS via broker)|Brokered queue state file                          |
 
 **Key design property:** ULID-based event versions are both monotonically increasing and lexicographically sortable. S3's `ListObjectsV2` returns keys in lexicographic order. This means prefix listing under `events/<resource_id>/<action>/<run_version>/` returns events in chronological order with no additional sorting, directly replacing BoltDB's cursor-based iteration.
+
+**Manifest key revision (Phase 3):** manifests are keyed by `run_version` alone rather than `<resource_id>/<action>/<run_version>` as originally drafted. Run versions are the identifier every caller already holds (`Wait`, `Cancel`, `GetManifest`, `run_after`, parent/child links), so version-keyed manifests make those lookups one GET with no secondary index. The manifest itself carries `resource_id`/`action`, and per-type enumeration (`Active`) goes through the `locks/` prefix, whose body holds the owning run version. Queued runs append the run version to the lock key (`locks/<type>/<id>/<action>/<run_version>`) to allow multiple concurrent runs per resource.
+
+Tuple-first lookups ("show me the runs for this resource") are served by the `index/` prefix: START writes an empty write-once marker at `index/<type>/<id>/<action>/<run_version>`. Unlike the lock (deleted at FINISH) and events (deleted at archival), index markers persist, so a keys-only listing under `index/<type>/<id>/` enumerates a resource's full run history — including completed and archived runs — with no object bodies read; details for any version are one manifest or history GET away. Index markers are subject to the operator's retention policy (S3 lifecycle rules alongside `history/`).
 
 ### Run Manifest
 
@@ -148,7 +153,7 @@ If the write returns 412 (object already exists), the event was already written 
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
 
 3. Write run manifest:
-   PUT fsm/runs/<id>/<action>/<run_ver>        [If-None-Match: *]
+   PUT fsm/runs/<run_ver>        [If-None-Match: *]
    Body: RunManifest { status: "pending", owner_node: self, ... }
 ```
 
@@ -163,10 +168,10 @@ For queued runs, the lock key includes the run version (`locks/<type>/<id>/<acti
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
 
 2. Update manifest (CAS):
-   GET fsm/runs/<id>/<action>/<run_ver>        [X-Tigris-Consistent: true]
+   GET fsm/runs/<run_ver>        [X-Tigris-Consistent: true]
    → read current ETag
    Modify: bump latest_event_key, event_count, append to completed_states
-   PUT fsm/runs/<id>/<action>/<run_ver>        [If-Match: <etag>]
+   PUT fsm/runs/<run_ver>        [If-Match: <etag>]
    → 412 means concurrent modification → re-read and retry
 ```
 
@@ -179,7 +184,7 @@ The retry loop on the manifest CAS is bounded (e.g., 10 attempts). In practice, 
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
 
 2. Update manifest:
-   PUT fsm/runs/<id>/<action>/<run_ver>        [If-Match: <etag>]
+   PUT fsm/runs/<run_ver>        [If-Match: <etag>]
    Body: RunManifest { status: "complete", end_event_key: ... }
 
 3. Delete resource lock:

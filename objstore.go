@@ -18,6 +18,8 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -62,9 +64,10 @@ type objectStore struct {
 	logger logrus.FieldLogger
 	client *s3.Client
 	cfg    *ObjectStorageConfig
+	memDB  *memdb.MemDB
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, memDB *memdb.MemDB) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -87,6 +90,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		logger: logger,
 		client: client,
 		cfg:    cfg,
+		memDB:  memDB,
 	}, nil
 }
 
@@ -105,6 +109,11 @@ func consistentRead(o *s3.Options) {
 // path-cleaned, so segments like ".." remain literal segment names with no traversal semantics.
 func escapeSegment(s string) string {
 	return url.PathEscape(s)
+}
+
+// unescapeSegment reverses escapeSegment when parsing values back out of listed keys.
+func unescapeSegment(s string) (string, error) {
+	return url.PathUnescape(s)
 }
 
 // key joins the configured prefix and the given segments verbatim. Caller-supplied segments
@@ -126,6 +135,14 @@ func (s *objectStore) eventPrefix(resourceID, action string, runVersion ulid.ULI
 
 func (s *objectStore) historyKey(date string, runVersion ulid.ULID) string {
 	return s.key("history", date, runVersion.String())
+}
+
+func (s *objectStore) runIndexKey(resourceType, resourceID, action string, runVersion ulid.ULID) string {
+	return s.key("index", escapeSegment(resourceType), escapeSegment(resourceID), escapeSegment(action), runVersion.String())
+}
+
+func (s *objectStore) runIndexPrefix(resourceType, resourceID string) string {
+	return s.key("index", escapeSegment(resourceType), escapeSegment(resourceID)) + "/"
 }
 
 func (s *objectStore) childKey(parent, child ulid.ULID) string {
@@ -175,34 +192,86 @@ func isNotFound(err error) bool {
 // maxConditionalRetries bounds retries of conditional writes that fail with 409 Conflict.
 const maxConditionalRetries = 5
 
-// putIfAbsent writes an object only if it does not already exist (If-None-Match: *).
-// Returns errPreconditionFailed if the object already exists. Retries on 409 Conflict,
-// which S3 returns when concurrent conditional writes race on the same key.
-func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) error {
-	for attempt := 0; ; attempt++ {
-		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      &s.cfg.Bucket,
-			Key:         &key,
-			Body:        bytes.NewReader(body),
-			IfNoneMatch: aws.String("*"),
-		})
-		switch {
+var errEtagMismatch = errors.New("precondition failed: etag mismatch")
+
+// retryBackoff returns a context-bound exponential backoff capped at maxRetries, used for the
+// transient 409 conflicts and manifest CAS contention that conditional writes hit.
+func retryBackoff(ctx context.Context, maxRetries uint64) backoff.BackOff {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = 50 * time.Millisecond
+	b.MaxInterval = 2 * time.Second
+	b.MaxElapsedTime = 0 // bounded by maxRetries (and ctx), not wall-clock
+	return backoff.WithContext(backoff.WithMaxRetries(b, maxRetries), ctx)
+}
+
+// putConditional issues a conditional PutObject — set applies the condition header — and retries
+// on 409 Conflict, which S3 returns when concurrent conditional writes race on a key. It returns
+// the raw PutObject error otherwise; callers map a 412 to their own sentinel.
+func (s *objectStore) putConditional(ctx context.Context, key string, body []byte, set func(*s3.PutObjectInput)) error {
+	op := func() error {
+		in := &s3.PutObjectInput{Bucket: &s.cfg.Bucket, Key: &key, Body: bytes.NewReader(body)}
+		set(in)
+		switch _, err := s.client.PutObject(ctx, in); {
 		case err == nil:
 			return nil
-		case isPreconditionFailed(err):
-			return errPreconditionFailed
-		case isConditionalConflict(err) && attempt < maxConditionalRetries:
-			delay := time.Duration(50<<attempt) * time.Millisecond
-			s.logger.WithField("key", key).WithField("attempt", attempt).Debug("conditional write conflict, retrying")
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
+		case isConditionalConflict(err):
+			s.logger.WithField("key", key).Debug("conditional write conflict, retrying")
+			return err
 		default:
-			return fmt.Errorf("put object %s: %w", key, err)
+			return backoff.Permanent(err)
 		}
 	}
+	return backoff.Retry(op, retryBackoff(ctx, maxConditionalRetries))
+}
+
+// putIfAbsent writes an object only if it does not already exist (If-None-Match: *), returning
+// errPreconditionFailed if it does.
+func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) error {
+	switch err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
+		in.IfNoneMatch = aws.String("*")
+	}); {
+	case err == nil:
+		return nil
+	case isPreconditionFailed(err):
+		return errPreconditionFailed
+	default:
+		return fmt.Errorf("put object %s: %w", key, err)
+	}
+}
+
+// putIfMatch writes an object only if its current ETag matches (If-Match), giving compare-and-
+// swap semantics. Returns errEtagMismatch if the object changed since etag was read.
+func (s *objectStore) putIfMatch(ctx context.Context, key string, body []byte, etag string) error {
+	switch err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
+		in.IfMatch = aws.String(etag)
+	}); {
+	case err == nil:
+		return nil
+	case isPreconditionFailed(err):
+		return errEtagMismatch
+	default:
+		return fmt.Errorf("put object %s: %w", key, err)
+	}
+}
+
+// putIdempotent writes a write-once object, treating an already-existing object (412) as
+// success. Used for records a crash-retry may re-issue with identical content.
+func (s *objectStore) putIdempotent(ctx context.Context, key string, body []byte) error {
+	if err := s.putIfAbsent(ctx, key, body); err != nil && !errors.Is(err, errPreconditionFailed) {
+		return err
+	}
+	return nil
+}
+
+// deleteObject removes an object. Deleting a missing key is not an error.
+func (s *objectStore) deleteObject(ctx context.Context, key string) error {
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.cfg.Bucket,
+		Key:    &key,
+	}); err != nil {
+		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
 }
 
 // getObject reads an object and returns its body and ETag.
@@ -263,15 +332,7 @@ func (s *objectStore) appendEvent(ctx context.Context, resourceID, action string
 		return fmt.Errorf("marshal event: %w", err)
 	}
 
-	key := s.eventKey(resourceID, action, runVersion, eventVersion)
-	if err := s.putIfAbsent(ctx, key, body); err != nil {
-		if errors.Is(err, errPreconditionFailed) {
-			s.logger.WithField("key", key).Debug("event already exists, ignoring duplicate")
-			return nil
-		}
-		return err
-	}
-	return nil
+	return s.putIdempotent(ctx, s.eventKey(resourceID, action, runVersion, eventVersion), body)
 }
 
 // listEventFetchers bounds the concurrent object reads performed by listRunEvents.
@@ -342,15 +403,7 @@ func (s *objectStore) writeHistory(ctx context.Context, runVersion ulid.ULID, hi
 	}
 
 	date := ulid.Time(runVersion.Time()).Format(time.DateOnly)
-	key := s.historyKey(date, runVersion)
-	if err := s.putIfAbsent(ctx, key, body); err != nil {
-		if errors.Is(err, errPreconditionFailed) {
-			s.logger.WithField("key", key).Debug("history already exists, ignoring duplicate")
-			return nil
-		}
-		return err
-	}
-	return nil
+	return s.putIdempotent(ctx, s.historyKey(date, runVersion), body)
 }
 
 // readHistory reads the history record for a completed run.
@@ -375,15 +428,7 @@ func (s *objectStore) readHistory(ctx context.Context, runVersion ulid.ULID) (*f
 // writeChild records a parent-to-child run relationship.
 // Idempotent — duplicate writes are silently ignored.
 func (s *objectStore) writeChild(ctx context.Context, parent, child ulid.ULID) error {
-	key := s.childKey(parent, child)
-	body := []byte(child.String())
-	if err := s.putIfAbsent(ctx, key, body); err != nil {
-		if errors.Is(err, errPreconditionFailed) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return s.putIdempotent(ctx, s.childKey(parent, child), []byte(child.String()))
 }
 
 // listChildren returns all child run versions for a parent.

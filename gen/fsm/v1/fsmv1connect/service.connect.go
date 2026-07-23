@@ -5,14 +5,12 @@
 package fsmv1connect
 
 import (
+	connect "connectrpc.com/connect"
 	context "context"
 	errors "errors"
+	v1 "github.com/superfly/fsm/gen/fsm/v1"
 	http "net/http"
 	strings "strings"
-
-	v1 "github.com/superfly/fsm/gen/fsm/v1"
-
-	connect "connectrpc.com/connect"
 )
 
 // This is a compile-time assertion to ensure that this generated file and the connect package are
@@ -45,14 +43,6 @@ const (
 	FSMServiceGetHistoryEventProcedure = "/fsm.v1.FSMService/GetHistoryEvent"
 )
 
-// These variables are the protoreflect.Descriptor objects for the RPCs defined in this package.
-var (
-	fSMServiceServiceDescriptor               = v1.File_fsm_v1_service_proto.Services().ByName("FSMService")
-	fSMServiceListRegisteredMethodDescriptor  = fSMServiceServiceDescriptor.Methods().ByName("ListRegistered")
-	fSMServiceListActiveMethodDescriptor      = fSMServiceServiceDescriptor.Methods().ByName("ListActive")
-	fSMServiceGetHistoryEventMethodDescriptor = fSMServiceServiceDescriptor.Methods().ByName("GetHistoryEvent")
-)
-
 // FSMServiceClient is a client for the fsm.v1.FSMService service.
 type FSMServiceClient interface {
 	ListRegistered(context.Context, *connect.Request[v1.ListRegisteredRequest]) (*connect.Response[v1.ListRegisteredResponse], error)
@@ -69,23 +59,24 @@ type FSMServiceClient interface {
 // http://api.acme.com or https://acme.com/grpc).
 func NewFSMServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) FSMServiceClient {
 	baseURL = strings.TrimRight(baseURL, "/")
+	fSMServiceMethods := v1.File_fsm_v1_service_proto.Services().ByName("FSMService").Methods()
 	return &fSMServiceClient{
 		listRegistered: connect.NewClient[v1.ListRegisteredRequest, v1.ListRegisteredResponse](
 			httpClient,
 			baseURL+FSMServiceListRegisteredProcedure,
-			connect.WithSchema(fSMServiceListRegisteredMethodDescriptor),
+			connect.WithSchema(fSMServiceMethods.ByName("ListRegistered")),
 			connect.WithClientOptions(opts...),
 		),
 		listActive: connect.NewClient[v1.ListActiveRequest, v1.ListActiveResponse](
 			httpClient,
 			baseURL+FSMServiceListActiveProcedure,
-			connect.WithSchema(fSMServiceListActiveMethodDescriptor),
+			connect.WithSchema(fSMServiceMethods.ByName("ListActive")),
 			connect.WithClientOptions(opts...),
 		),
 		getHistoryEvent: connect.NewClient[v1.GetHistoryEventRequest, v1.HistoryEvent](
 			httpClient,
 			baseURL+FSMServiceGetHistoryEventProcedure,
-			connect.WithSchema(fSMServiceGetHistoryEventMethodDescriptor),
+			connect.WithSchema(fSMServiceMethods.ByName("GetHistoryEvent")),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -126,22 +117,23 @@ type FSMServiceHandler interface {
 // By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
 // and JSON codecs. They also support gzip compression.
 func NewFSMServiceHandler(svc FSMServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
+	fSMServiceMethods := v1.File_fsm_v1_service_proto.Services().ByName("FSMService").Methods()
 	fSMServiceListRegisteredHandler := connect.NewUnaryHandler(
 		FSMServiceListRegisteredProcedure,
 		svc.ListRegistered,
-		connect.WithSchema(fSMServiceListRegisteredMethodDescriptor),
+		connect.WithSchema(fSMServiceMethods.ByName("ListRegistered")),
 		connect.WithHandlerOptions(opts...),
 	)
 	fSMServiceListActiveHandler := connect.NewUnaryHandler(
 		FSMServiceListActiveProcedure,
 		svc.ListActive,
-		connect.WithSchema(fSMServiceListActiveMethodDescriptor),
+		connect.WithSchema(fSMServiceMethods.ByName("ListActive")),
 		connect.WithHandlerOptions(opts...),
 	)
 	fSMServiceGetHistoryEventHandler := connect.NewUnaryHandler(
 		FSMServiceGetHistoryEventProcedure,
 		svc.GetHistoryEvent,
-		connect.WithSchema(fSMServiceGetHistoryEventMethodDescriptor),
+		connect.WithSchema(fSMServiceMethods.ByName("GetHistoryEvent")),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/fsm.v1.FSMService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

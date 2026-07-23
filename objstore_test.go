@@ -16,16 +16,18 @@ import (
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
 
+	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
 )
 
 // fakeS3 is a minimal path-style S3 implementation covering the operations objectStore uses:
-// conditional PUT (If-None-Match: *), GET, and ListObjectsV2. It can inject 409 Conflict
-// responses to exercise the conditional-write retry path.
+// conditional PUT (If-None-Match: * and If-Match CAS), GET, DELETE, and ListObjectsV2. It can
+// inject 409 Conflict responses to exercise the conditional-write retry path.
 type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
+	revs    map[string]int
 
 	// conflicts is the number of conditional PUTs to reject with 409 before accepting.
 	conflicts int
@@ -36,7 +38,13 @@ type fakeS3 struct {
 }
 
 func newFakeS3() *fakeS3 {
-	return &fakeS3{objects: map[string][]byte{}}
+	return &fakeS3{objects: map[string][]byte{}, revs: map[string]int{}}
+}
+
+// etag returns the current ETag for a key; it changes on every accepted write so If-Match
+// detects concurrent modification.
+func (f *fakeS3) etag(key string) string {
+	return fmt.Sprintf("%q", fmt.Sprintf("%s#%d", key, f.revs[key]))
 }
 
 func (f *fakeS3) handler(bucket string) http.Handler {
@@ -49,21 +57,34 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 		switch {
 		case r.Method == http.MethodPut:
 			f.puts++
+			conditional := r.Header.Get("If-None-Match") == "*" || r.Header.Get("If-Match") != ""
+			if conditional && f.conflicts > 0 {
+				f.conflicts--
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			if r.Header.Get("If-None-Match") == "*" {
-				if f.conflicts > 0 {
-					f.conflicts--
-					w.WriteHeader(http.StatusConflict)
+				if _, ok := f.objects[key]; ok {
+					w.WriteHeader(http.StatusPreconditionFailed)
 					return
 				}
-				if _, ok := f.objects[key]; ok {
+			}
+			if im := r.Header.Get("If-Match"); im != "" {
+				if _, ok := f.objects[key]; !ok || im != f.etag(key) {
 					w.WriteHeader(http.StatusPreconditionFailed)
 					return
 				}
 			}
 			body, _ := io.ReadAll(r.Body)
 			f.objects[key] = body
-			w.Header().Set("ETag", fmt.Sprintf("%q", key))
+			f.revs[key]++
+			w.Header().Set("ETag", f.etag(key))
 			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodDelete:
+			delete(f.objects, key)
+			delete(f.revs, key)
+			w.WriteHeader(http.StatusNoContent)
 
 		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
 			if r.Header.Get("X-Tigris-Consistent") == "true" {
@@ -107,7 +128,7 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.Header().Set("ETag", fmt.Sprintf("%q", key))
+			w.Header().Set("ETag", f.etag(key))
 			w.Write(body)
 
 		default:
@@ -128,11 +149,16 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 
+	memDB, err := memdb.NewMemDB(fsmSchema)
+	if err != nil {
+		t.Fatalf("failed to create memdb: %v", err)
+	}
+
 	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
 		Bucket:   bucket,
 		Endpoint: server.URL,
 		Region:   "auto",
-	})
+	}, memDB)
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
@@ -150,7 +176,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}); err == nil {
+	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}, nil); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }
@@ -177,6 +203,45 @@ func TestPutIfAbsentRetriesConflict(t *testing.T) {
 	}
 	if fake.puts != 3 {
 		t.Fatalf("expected 3 put attempts (2 conflicts + success), got %d", fake.puts)
+	}
+}
+
+func TestPutIfMatchCAS(t *testing.T) {
+	store, _ := newTestObjectStore(t)
+	ctx := context.Background()
+
+	const key = "fsm/cas/key"
+	if err := store.putIfAbsent(ctx, key, []byte("v1")); err != nil {
+		t.Fatalf("initial write failed: %v", err)
+	}
+	_, etag, err := store.getObject(ctx, key)
+	if err != nil {
+		t.Fatalf("failed to read object: %v", err)
+	}
+
+	if err := store.putIfMatch(ctx, key, []byte("v2"), etag); err != nil {
+		t.Fatalf("CAS with current etag failed: %v", err)
+	}
+	if err := store.putIfMatch(ctx, key, []byte("v3"), etag); !errors.Is(err, errEtagMismatch) {
+		t.Fatalf("expected errEtagMismatch for stale etag, got %v", err)
+	}
+
+	body, _, err := store.getObject(ctx, key)
+	if err != nil {
+		t.Fatalf("failed to read object: %v", err)
+	}
+	if string(body) != "v2" {
+		t.Fatalf("stale CAS overwrote object: %q", body)
+	}
+
+	if err := store.deleteObject(ctx, key); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+	if _, _, err := store.getObject(ctx, key); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected ErrFsmNotFound after delete, got %v", err)
+	}
+	if err := store.deleteObject(ctx, key); err != nil {
+		t.Fatalf("deleting a missing key should be a no-op, got %v", err)
 	}
 }
 

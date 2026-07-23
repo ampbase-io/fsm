@@ -34,8 +34,10 @@ func blockingFSM(t *testing.T, m *Manager, action string, entered chan<- struct{
 	return start
 }
 
-func TestAlreadyRunning(t *testing.T) {
-	m := newTestManager(t)
+func TestAlreadyRunning(t *testing.T) { runBackends(t, testAlreadyRunning) }
+
+func testAlreadyRunning(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -65,8 +67,10 @@ func TestAlreadyRunning(t *testing.T) {
 	}
 }
 
-func TestCancel(t *testing.T) {
-	m := newTestManager(t)
+func TestCancel(t *testing.T) { runBackends(t, testCancel) }
+
+func testCancel(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -109,8 +113,10 @@ func TestCancel(t *testing.T) {
 	}
 }
 
-func TestQueueLimitsConcurrency(t *testing.T) {
-	m := newTestManagerWithQueues(t, map[string]int{"deploys": 1})
+func TestQueueLimitsConcurrency(t *testing.T) { runBackends(t, testQueueLimitsConcurrency) }
+
+func testQueueLimitsConcurrency(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(map[string]int{"deploys": 1})
 	ctx := context.Background()
 
 	var (
@@ -153,8 +159,10 @@ func TestQueueLimitsConcurrency(t *testing.T) {
 	}
 }
 
-func TestRunAfter(t *testing.T) {
-	m := newTestManager(t)
+func TestRunAfter(t *testing.T) { runBackends(t, testRunAfter) }
+
+func testRunAfter(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -200,8 +208,10 @@ func TestRunAfter(t *testing.T) {
 	}
 }
 
-func TestChildren(t *testing.T) {
-	m := newTestManager(t)
+func TestChildren(t *testing.T) { runBackends(t, testChildren) }
+
+func testChildren(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	parentStart, _, err := m.Register[orderReq, orderResp]("parent").
@@ -273,8 +283,10 @@ func TestChildren(t *testing.T) {
 	}
 }
 
-func TestDelayedStart(t *testing.T) {
-	m := newTestManager(t)
+func TestDelayedStart(t *testing.T) { runBackends(t, testDelayedStart) }
+
+func testDelayedStart(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
 	ranAt := make(chan time.Time, 1)
