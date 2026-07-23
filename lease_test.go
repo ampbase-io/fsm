@@ -372,6 +372,43 @@ func TestForgetRunReleasesLease(t *testing.T) {
 	}
 }
 
+// TestAdoptRunManifest exercises the crash-retry adoption seam directly: a START whose
+// earlier attempt already created the manifest adopts the lease at the manifest's recorded
+// epoch when this node owns it, and is fenced when another node does.
+func TestAdoptRunManifest(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a1 := h.store("node-a", 10*time.Second)
+
+	run := startRun(t, a1, "adopt-1")
+	// Move the epoch off its initial value so adoption provably reads the manifest rather
+	// than assuming a fresh lease.
+	if _, err := a1.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		m.LeaseEpoch = 7
+		return nil
+	}); err != nil {
+		t.Fatalf("failed to bump lease epoch: %v", err)
+	}
+
+	// A restarted incarnation of the owning node adopts the existing lease.
+	a2 := h.store("node-a", 10*time.Second)
+	if err := a2.adoptRunManifest(ctx, run, runLockKey(a2, run)); err != nil {
+		t.Fatalf("expected the owning node to adopt its manifest, got %v", err)
+	}
+	if epoch, ok := a2.ownedEpoch(run.StartVersion); !ok || epoch != 7 {
+		t.Fatalf("expected the manifest's epoch 7 adopted, got %d (tracked=%v)", epoch, ok)
+	}
+
+	// A foreign node is fenced.
+	b := h.store("node-b", 10*time.Second)
+	if err := b.adoptRunManifest(ctx, run, runLockKey(b, run)); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expected a foreign adopter fenced with ErrLeaseLost, got %v", err)
+	}
+	if b.owns(run.StartVersion) {
+		t.Fatal("expected no lease tracked by the fenced adopter")
+	}
+}
+
 // TestStartRetryAfterFinishRejected covers the manifest-adopt path: a crash-retry of a START
 // whose run already completed must not re-execute the run, and must leave no lock behind.
 func TestStartRetryAfterFinishRejected(t *testing.T) {
