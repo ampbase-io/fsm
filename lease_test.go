@@ -168,13 +168,10 @@ func TestFencedAppendAfterSteal(t *testing.T) {
 		t.Fatalf("expected the resource lock to survive a fenced finish, got %v", err)
 	}
 
-	// The tripped fence is reported by the next heartbeat pass so the local run is canceled.
-	lost := a.extendLeases(ctx)
-	if len(lost) != 1 || lost[0] != run.StartVersion {
-		t.Fatalf("expected the fenced run reported as lost, got %v", lost)
-	}
-	if lost := a.extendLeases(ctx); len(lost) != 0 {
-		t.Fatalf("expected a fence to be reported once, got %v", lost)
+	// The tripped fence dropped the lease, so the coordinate loop's sweep of executing runs
+	// without a lease cancels the local run.
+	if a.owns(run.StartVersion) {
+		t.Fatal("expected the fenced lease dropped")
 	}
 }
 
@@ -188,8 +185,9 @@ func TestExtendLeases(t *testing.T) {
 	before := mustManifest(t, a, run.StartVersion)
 
 	time.Sleep(5 * time.Millisecond)
-	if lost := a.extendLeases(ctx); len(lost) != 0 {
-		t.Fatalf("expected no lost leases, got %v", lost)
+	a.extendLeases(ctx)
+	if !a.owns(run.StartVersion) {
+		t.Fatal("expected the heartbeat to keep a healthy lease")
 	}
 
 	after := mustManifest(t, a, run.StartVersion)
@@ -197,16 +195,13 @@ func TestExtendLeases(t *testing.T) {
 		t.Fatalf("expected the heartbeat to advance lease expiry: %d -> %d", before.GetLeaseExpiry(), after.GetLeaseExpiry())
 	}
 
-	// A steal discovered during the heartbeat reports the run as lost and drops the lease.
+	// A steal discovered during the heartbeat drops the lease from the local set.
 	time.Sleep(120 * time.Millisecond)
 	if claimed, err := b.claimRuns(ctx, []*fsm{deployFSM}); err != nil || len(claimed) != 1 {
 		t.Fatalf("expected node-b to claim the expired run, got %v (err=%v)", claimed, err)
 	}
-	lost := a.extendLeases(ctx)
-	if len(lost) != 1 || lost[0] != run.StartVersion {
-		t.Fatalf("expected the stolen run reported as lost, got %v", lost)
-	}
-	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
+	a.extendLeases(ctx)
+	if a.owns(run.StartVersion) {
 		t.Fatal("expected the stolen lease to be dropped")
 	}
 }

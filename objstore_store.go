@@ -355,7 +355,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		return nil
 	})
 	if errors.Is(err, ErrLeaseLost) {
-		s.noteFence(run.StartVersion)
+		s.dropLease(run.StartVersion)
 	}
 	return err
 }
@@ -392,7 +392,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		s.logger.WithField("run_version", run.StartVersion.String()).Warn("manifest not found for finish event")
 		return nil
 	case errors.Is(err, ErrLeaseLost):
-		s.noteFence(run.StartVersion)
+		s.dropLease(run.StartVersion)
 		return err
 	case err != nil:
 		return err

@@ -91,11 +91,11 @@ type objectStore struct {
 
 	// leases tracks this node's claim on each run: mid-claim (reserved, so concurrent
 	// same-store claimers cannot both win) or held at the epoch that every run-mutating
-	// manifest CAS re-verifies. fenced buffers runs whose fence tripped in Append so the next
-	// heartbeat pass reports them for local cancellation.
+	// manifest CAS re-verifies. Any loss — a fence tripped in Append, a steal discovered at
+	// heartbeat, a release — just drops the entry; the coordinate loop cancels local runs by
+	// sweeping for executing runs that no longer hold a lease.
 	leaseMu sync.Mutex
 	leases  map[ulid.ULID]lease
-	fenced  []ulid.ULID
 
 	// finishes records this process's knowledge of run finishes, preserving typed run errors
 	// for same-process waiters and holding their release until the finish cleanup (lock

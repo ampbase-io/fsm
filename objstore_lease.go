@@ -65,19 +65,6 @@ func (s *objectStore) dropLease(version ulid.ULID) {
 	delete(s.leases, version)
 }
 
-// noteFence drops the lease and buffers the run for the next heartbeat pass to report, so the
-// Manager cancels the local run context even though the fence tripped inside Append.
-func (s *objectStore) noteFence(version ulid.ULID) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	l, ok := s.leases[version]
-	if !ok || l.state != leaseHeld {
-		return
-	}
-	delete(s.leases, version)
-	s.fenced = append(s.fenced, version)
-}
-
 // snapshotOwned returns the held leases and their epochs; mid-claim entries are excluded.
 func (s *objectStore) snapshotOwned() map[ulid.ULID]int64 {
 	s.leaseMu.Lock()
@@ -122,24 +109,12 @@ func (s *objectStore) forEachOwned(fn func(version ulid.ULID, epoch int64)) {
 	wg.Wait()
 }
 
-func (s *objectStore) drainFenced() []ulid.ULID {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	fenced := s.fenced
-	s.fenced = nil
-	return fenced
-}
-
-// extendLeases performs one heartbeat pass: every owned lease has its expiry pushed out under
-// the fence. It returns the runs whose lease has been lost — stolen leases discovered here or
-// fences tripped by Append since the last pass — for the caller to cancel locally. Transient
+// extendLeases performs one heartbeat pass: every held lease has its expiry pushed out under
+// the fence, and a lease found lost (stolen, or its run's manifest gone) is dropped from the
+// local set — the coordinate loop's sweep then cancels the run it belonged to. Transient
 // storage errors keep the lease and retry next tick; liveness only degrades to the lease
 // timeout.
-func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
-	var (
-		mu   sync.Mutex
-		lost = s.drainFenced()
-	)
+func (s *objectStore) extendLeases(ctx context.Context) {
 	s.forEachOwned(func(version ulid.ULID, epoch int64) {
 		_, err := s.casManifest(ctx, version, func(m *fsmv1.RunManifest) error {
 			if err := s.checkFence(m, epoch); err != nil {
@@ -152,16 +127,12 @@ func (s *objectStore) extendLeases(ctx context.Context) []ulid.ULID {
 		case err == nil:
 		case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrFsmNotFound):
 			s.dropLease(version)
-			mu.Lock()
-			lost = append(lost, version)
-			mu.Unlock()
 		case errors.Is(err, context.Canceled):
 			// Shutdown mid-pass; Close releases the leases.
 		default:
 			s.logger.WithError(err).WithField("run_version", version.String()).Error("failed to extend lease")
 		}
 	})
-	return lost
 }
 
 // eligible reports whether this node may claim the run: the manifest is claimable and the

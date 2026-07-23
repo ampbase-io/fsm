@@ -11,9 +11,9 @@ import (
 // leaseCoordinator is implemented by backends whose runs are owned via leases. The BoltDB
 // backend does not implement it; the Manager starts no coordination loop without one.
 type leaseCoordinator interface {
-	// extendLeases performs one heartbeat pass over every run this node owns and returns the
-	// versions whose lease has been lost.
-	extendLeases(ctx context.Context) []ulid.ULID
+	// extendLeases performs one heartbeat pass over every held lease, dropping any found
+	// lost; the caller sweeps for executing runs left without a lease.
+	extendLeases(ctx context.Context)
 	// claimRuns claims every eligible run of the given FSMs, paired with the FSM that will
 	// resume each.
 	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
@@ -72,13 +72,8 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 		case <-m.done:
 			return
 		case <-heartbeat.C:
-			for _, version := range lc.extendLeases(ctx) {
-				m.logger.WithField("run_version", version.String()).Warn("run lease lost")
-				// A run with no cancelable context yet (delayed or queued dispatch) is covered
-				// by the ownership check at execute-start; fencing remains the correctness
-				// backstop either way. Cancellation is a latency courtesy.
-				m.cancelRunning(version, ErrLeaseLost)
-			}
+			lc.extendLeases(ctx)
+			m.cancelUnleased(lc)
 		case <-claim.C:
 			// A tick can race shutdown; don't start a claim pass the manager won't wait out.
 			select {
@@ -90,6 +85,33 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 			claim.Reset(withJitter(claimEvery))
 		}
 	}
+}
+
+// cancelUnleased enforces the invariant that an executing run holds its lease: any locally
+// running run whose lease is gone — fenced in Append, stolen at heartbeat, released — is
+// canceled with ErrLeaseLost. Runs not yet executing are covered by the same ownership check
+// at execute-start; fencing remains the correctness backstop either way, cancellation is a
+// latency courtesy. A run in its finish tail (lease already dropped, goroutine not yet
+// deregistered) may be swept benignly: its durable writes are done, and Append is
+// cancellation-immune regardless.
+func (m *Manager) cancelUnleased(lc leaseCoordinator) {
+	for _, version := range m.runningVersions() {
+		if lc.owns(version) {
+			continue
+		}
+		m.logger.WithField("run_version", version.String()).Warn("run lease lost")
+		m.cancelRunning(version, ErrLeaseLost)
+	}
+}
+
+func (m *Manager) runningVersions() []ulid.ULID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	versions := make([]ulid.ULID, 0, len(m.running))
+	for version := range m.running {
+		versions = append(versions, version)
+	}
+	return versions
 }
 
 // claimPass claims and dispatches eligible runs across every registered FSM.
