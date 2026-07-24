@@ -3,6 +3,13 @@ name: buf.build/superfly/flyd
 lint:
   use:
     - DEFAULT
+  ignore_only:
+    # GetHistoryEvent predates lint enforcement and returns HistoryEvent
+    # directly; renaming the response is a wire-visible API change, so the
+    # existing shape is grandfathered. New RPCs (e.g. the distributed-execution
+    # ingress) must use standard request/response names.
+    RPC_RESPONSE_STANDARD_NAME:
+      - fsm/v1/service.proto
 breaking:
   use:
     - FILE

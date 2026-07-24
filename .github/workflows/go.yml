@@ -1,0 +1,42 @@
+name: Go CI
+on:
+  pull_request:
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/go.yml"
+  push:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  # go.mod requires an RC toolchain (1.27rc1) that setup-go's manifests don't
+  # reliably resolve. Installing a stable Go and letting GOTOOLCHAIN=auto
+  # download the exact toolchain go.mod names mirrors local development and
+  # keeps working unchanged when go.mod moves to 1.27 final.
+  GOTOOLCHAIN: auto
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Check go.mod tidiness
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Check formatting
+        # Must be the toolchain's own gofmt: older gofmt binaries false-positive
+        # on the generic methods the builder API uses. go vet and
+        # typecheck-based linters are skipped for the same reason until their
+        # type checkers learn Go 1.27 generic methods.
+        run: |
+          unformatted="$($(go env GOROOT)/bin/gofmt -l .)"
+          test -z "$unformatted" || { echo "$unformatted"; exit 1; }
+      - name: Build
+        run: go build ./...
+      - name: Test
+        # The race detector is load-bearing here — it has caught real
+        # coordination bugs the plain suite missed.
+        run: go test -race ./...
