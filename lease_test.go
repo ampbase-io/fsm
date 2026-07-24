@@ -824,11 +824,38 @@ func TestLostLeaseDelayedRunNeverExecutes(t *testing.T) {
 		t.Fatalf("claimed run completed with error: %v", err)
 	}
 
-	// Wait until well past m1's own dispatch moment (the persisted delay truncates to seconds,
-	// so m2 may have finished earlier), then confirm m1 never ran user code.
+	// Wait until well past the dispatch moment (m2 resumes from the persisted delay_until and may
+	// finish right at it), then confirm m1 never ran user code.
 	time.Sleep(time.Until(dispatchAt) + 500*time.Millisecond)
 	if got := executed.Load(); got != 0 {
 		t.Fatalf("the old owner executed a stolen delayed run %d times", got)
+	}
+}
+
+// TestDelayUntilStoredAsMilliseconds verifies withDelayUntil records the delay at millisecond
+// precision. A regression to Unix seconds would truncate the sub-second component, making a
+// resumed delayed run's dispatch nondeterministic; the resume read-side (time.UnixMilli in
+// resumeOne) is exercised by TestLostLeaseDelayedRunNeverExecutes.
+func TestDelayUntilStoredAsMilliseconds(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	ctx := context.Background()
+
+	// A target with a guaranteed non-zero sub-second component, so seconds truncation is visible.
+	target := time.Now().Truncate(time.Second).Add(1234 * time.Millisecond)
+	run := Run{ID: "delay-ms", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+	if _, err := s.Append(ctx, run, &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        "created",
+	}, "", withStartOption([]byte("{}"), []string{"created", "done"}), withDelayUntil(target)); err != nil {
+		t.Fatalf("failed to append start: %v", err)
+	}
+
+	if got := mustManifest(t, s, run.StartVersion).GetDelayUntil(); got != target.UnixMilli() {
+		t.Fatalf("expected delay_until %d (UnixMilli), got %d", target.UnixMilli(), got)
 	}
 }
 

@@ -47,6 +47,14 @@ func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration)
 	return time.Hour, time.Hour
 }
 
+func (s *stubCoordinator) requestCancel(context.Context, ulid.ULID, error) error { return nil }
+
+func (s *stubCoordinator) pendingCancellations(context.Context) (map[ulid.ULID]error, error) {
+	return nil, nil
+}
+
+func (s *stubCoordinator) cancelOwnedRun(context.Context, ulid.ULID, error) error { return nil }
+
 // wakeCoordinator counts claim passes. It embeds stubCoordinator — whose intervals are an hour,
 // so the periodic scan never fires and only the pending wakeup drives a pass — and inherits any
 // methods the interface later grows, overriding only claimRuns to count.
@@ -161,6 +169,55 @@ func TestCancelUnleased(t *testing.T) {
 	}
 	if cause := context.Cause(unleasedCtx); !errors.Is(cause, ErrLeaseLost) {
 		t.Fatalf("expected cancellation cause ErrLeaseLost, got %v", cause)
+	}
+}
+
+// cancelStub returns a fixed set of pending cancellations and records which runs were driven
+// through cancelOwnedRun, so the sweep's routing can be asserted without an object store.
+type cancelStub struct {
+	stubCoordinator
+
+	pending      map[ulid.ULID]error
+	ownedCancels []ulid.ULID
+}
+
+func (c *cancelStub) pendingCancellations(context.Context) (map[ulid.ULID]error, error) {
+	return c.pending, nil
+}
+
+func (c *cancelStub) cancelOwnedRun(_ context.Context, version ulid.ULID, _ error) error {
+	c.ownedCancels = append(c.ownedCancels, version)
+	return nil
+}
+
+// TestSweepCancellationsRoutesByExecution verifies driveCancel's split (the cancel counterpart
+// to TestCancelUnleased): an executing run is stopped via its local context with the cause,
+// while a run this node owns but is not executing is driven to terminal via cancelOwnedRun. The
+// integration tests cover each path end to end; this asserts the routing in isolation.
+func TestSweepCancellationsRoutesByExecution(t *testing.T) {
+	executing, queued := ulid.Make(), ulid.Make()
+	execCtx, execCancel := context.WithCancelCause(context.Background())
+	defer execCancel(nil)
+
+	m := &Manager{
+		logger:  logrus.New(),
+		running: map[ulid.ULID]context.CancelCauseFunc{executing: execCancel},
+	}
+	stub := &cancelStub{pending: map[ulid.ULID]error{
+		executing: errors.New("stop executing"),
+		queued:    errors.New("stop queued"),
+	}}
+
+	m.sweepCancellations(context.Background(), stub)
+
+	if execCtx.Err() == nil {
+		t.Fatal("expected the executing run's context canceled")
+	}
+	if cause := context.Cause(execCtx); cause == nil || cause.Error() != "stop executing" {
+		t.Fatalf("expected the executing run canceled with its cause, got %v", cause)
+	}
+	if len(stub.ownedCancels) != 1 || stub.ownedCancels[0] != queued {
+		t.Fatalf("expected only the non-executing run driven via cancelOwnedRun, got %v", stub.ownedCancels)
 	}
 }
 
