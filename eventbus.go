@@ -36,7 +36,14 @@ type EventBus interface {
 
 // Subject addressing is by run, never by node, so no component ever needs another node's
 // network address.
-const subjectPending = "fsm.run.pending" // broadcast wakeup: a run became claimable
+const (
+	subjectPending = "fsm.run.pending" // broadcast wakeup: a run became claimable
+	// subjectCancel is a broadcast: every worker hears it and pulls its cancel sweep forward,
+	// and the owned-intersection in the sweep — not the subject — selects the node that reacts.
+	// A single subject (the version rides in Event.Version) keeps subscription static, matching
+	// the RFC's "every worker subscribes and checks the version against its running set".
+	subjectCancel = "fsm.run.cancel"
+)
 
 // doneSubject addresses the completion of a single run; a waiter subscribes to it to be
 // released the moment the run's finish cleanup lands.

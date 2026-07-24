@@ -519,12 +519,8 @@ func (s *objectStore) listChildren(ctx context.Context, parent ulid.ULID) ([]uli
 
 	children := make([]ulid.ULID, 0, len(keys))
 	for _, key := range keys {
-		// Extract child ULID from the last path segment
-		parts := strings.Split(key, "/")
-		childStr := parts[len(parts)-1]
-
-		var child ulid.ULID
-		if err := child.UnmarshalText([]byte(childStr)); err != nil {
+		child, err := versionFromKey(key)
+		if err != nil {
 			s.logger.WithError(err).WithField("key", key).Error("failed to parse child ULID from key")
 			continue
 		}
@@ -532,4 +528,16 @@ func (s *objectStore) listChildren(ctx context.Context, parent ulid.ULID) ([]uli
 	}
 
 	return children, nil
+}
+
+// versionFromKey parses a run version (ULID) from the last slash-delimited segment of an object
+// key — the shape of the children/, index/, and cancel/ prefixes, whose final segment is always
+// a run version.
+func versionFromKey(key string) (ulid.ULID, error) {
+	segment := key[strings.LastIndex(key, "/")+1:]
+	var version ulid.ULID
+	if err := version.UnmarshalText([]byte(segment)); err != nil {
+		return ulid.ULID{}, err
+	}
+	return version, nil
 }
