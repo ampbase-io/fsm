@@ -78,6 +78,13 @@ func startFakeS3(t *testing.T) (bucket, url string, fake *fakeS3) {
 // before each manager is created. Every manager gets a distinct NodeID, as distinct nodes
 // sharing a bucket would in production.
 func newObjectFactoryWith(t *testing.T, configure func(*ObjectStorageConfig)) *managerFactory {
+	return newObjectFactoryWithBus(t, nil, configure)
+}
+
+// newObjectFactoryWithBus is newObjectFactoryWith with a shared EventBus injected into every
+// manager, so a test can drive the cross-node fast paths (wait wakeup, claim wakeup). A nil bus
+// leaves the no-op default in place.
+func newObjectFactoryWithBus(t *testing.T, bus EventBus, configure func(*ObjectStorageConfig)) *managerFactory {
 	t.Helper()
 
 	bucket, url, _ := startFakeS3(t)
@@ -102,6 +109,7 @@ func newObjectFactoryWith(t *testing.T, configure func(*ObjectStorageConfig)) *m
 			ObjectStorage: cfg,
 			NodeID:        fmt.Sprintf("node-%d", nodes),
 			Queues:        queues,
+			EventBus:      bus,
 		})
 		return f.manage(t, m, err)
 	}

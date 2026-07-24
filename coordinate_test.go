@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +45,94 @@ func (s *stubCoordinator) owns(version ulid.ULID) bool { return s.held[version] 
 
 func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration) {
 	return time.Hour, time.Hour
+}
+
+// wakeCoordinator counts claim passes. It embeds stubCoordinator — whose intervals are an hour,
+// so the periodic scan never fires and only the pending wakeup drives a pass — and inherits any
+// methods the interface later grows, overriding only claimRuns to count.
+type wakeCoordinator struct {
+	stubCoordinator
+
+	claimCount atomic.Int32
+}
+
+func (w *wakeCoordinator) claimRuns(context.Context, []*fsm) ([]claimedRun, error) {
+	w.claimCount.Add(1)
+	return nil, nil
+}
+
+func (w *wakeCoordinator) claims() int { return int(w.claimCount.Load()) }
+
+// runWakeLoop starts a coordinate loop over a wakeCoordinator (hour-long cadence, so only the
+// pending wakeup can drive a claim pass) and waits until it has subscribed to the pending
+// subject. It returns the bus and coordinator for driving and asserting the wake.
+func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
+	t.Helper()
+
+	bus := newTestBus()
+	lc := &wakeCoordinator{}
+	m := &Manager{
+		logger:  logrus.New(),
+		bus:     bus,
+		done:    make(chan struct{}),
+		fsms:    map[fsmKey]*fsm{},
+		running: map[ulid.ULID]context.CancelCauseFunc{},
+	}
+
+	loopDone := make(chan struct{})
+	go func() { defer close(loopDone); m.coordinate(lc) }()
+	t.Cleanup(func() { close(m.done); <-loopDone })
+
+	eventually(t, 2*time.Second, func() bool {
+		return bus.subscriberCount(subjectPending) >= 1
+	}, "coordinate never subscribed to the pending subject")
+	return bus, lc
+}
+
+func publishPending(bus *testBus) {
+	bus.Publish(subjectPending, &fsmv1.RunEvent{Kind: fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING})
+}
+
+// TestClaimWakeSurvivesPendingStream covers the wakeArmed guard, which the single-event consumer
+// test cannot: a continuous stream of pending events faster than claimWakeDelay must not starve
+// the claim pass. With the guard the first event arms the wake and it fires on schedule; without
+// it, each event would reset the timer and the pass would never run.
+func TestClaimWakeSurvivesPendingStream(t *testing.T) {
+	bus, lc := runWakeLoop(t)
+
+	stop, streamDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(streamDone)
+		ticker := time.NewTicker(claimWakeDelay / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				publishPending(bus)
+			}
+		}
+	}()
+	defer func() { close(stop); <-streamDone }()
+
+	eventually(t, 2*time.Second, func() bool { return lc.claims() >= 1 },
+		"a continuous pending stream starved the claim pass — the wake never fired")
+}
+
+// TestClaimWakeRearmsAfterFiring covers the wakeArmed reset: after a wake fires, a later pending
+// event must arm a fresh one. A guard left stuck would wake exactly once and ignore every
+// subsequent event.
+func TestClaimWakeRearmsAfterFiring(t *testing.T) {
+	bus, lc := runWakeLoop(t)
+
+	publishPending(bus)
+	eventually(t, 2*time.Second, func() bool { return lc.claims() >= 1 }, "the first pending event never woke a claim pass")
+
+	// After the first wake has fired, a fresh event must wake another pass.
+	time.Sleep(claimWakeDelay + 150*time.Millisecond)
+	publishPending(bus)
+	eventually(t, 2*time.Second, func() bool { return lc.claims() >= 2 }, "a pending event after the first wake never re-armed it")
 }
 
 // TestCancelUnleased verifies the sweep's selectivity: exactly the executing runs whose lease

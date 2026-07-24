@@ -39,6 +39,11 @@ type Manager struct {
 	// lc is non-nil when store coordinates run ownership via leases.
 	lc leaseCoordinator
 
+	// bus is the subscribe half of the event transport; the coordinate loop subscribes to it
+	// for claim wakeup. The manager only ever subscribes — the object store owns publishing.
+	// Defaults to a no-op bus when none is injected.
+	bus EventSubscriber
+
 	fsms map[fsmKey]*fsm
 
 	queues map[string]*queuedRunner
@@ -80,6 +85,13 @@ type Config struct {
 	// needs a routable address for any other. Defaults to "<hostname>-<ulid>". Ignored for
 	// BoltDB.
 	NodeID string
+
+	// EventBus is an optional low-latency transport for run-lifecycle events: it accelerates
+	// cross-node Wait, wakes idle workers when a run becomes claimable, and carries cancel
+	// signals. It is a best-effort accelerator over the durable event log — a down or absent
+	// bus only degrades latency to the polling floors. The default is a no-op bus; the library
+	// never imports a broker. Applies to the object storage backend.
+	EventBus EventBus
 }
 
 // New creates a new FSM manager to register and run FSMs.
@@ -111,6 +123,7 @@ func New(cfg Config) (*Manager, error) {
 		logger:  cfg.Logger.WithField("sys", "fsm"),
 		tracer:  tracer,
 		store:   store,
+		bus:     busOrNoop(cfg.EventBus),
 		fsms:    map[fsmKey]*fsm{},
 		queues:  make(map[string]*queuedRunner, len(cfg.Queues)),
 		done:    done,
@@ -158,7 +171,7 @@ func New(cfg Config) (*Manager, error) {
 // ObjectStorage is set; the caller validates that.
 func newBackend(cfg Config, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
 	if cfg.ObjectStorage != nil {
-		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID)
+		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus)
 	}
 	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)

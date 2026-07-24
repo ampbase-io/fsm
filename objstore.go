@@ -89,6 +89,11 @@ type objectStore struct {
 	// process: a zombie sharing a NodeID is still fenced by the lease epoch.
 	nodeID string
 
+	// bus publishes lifecycle events after their durable write and backs WaitRun's completion
+	// fast path. Its liveness (busIsLive) gates the publish subject construction and relaxes
+	// WaitRun's poll ceiling — with no bus injected it is the no-op and the poll floors stand.
+	bus EventBus
+
 	// leases tracks this node's claim on each run: mid-claim (reserved, so concurrent
 	// same-store claimers cannot both win) or held at the epoch that every run-mutating
 	// manifest CAS re-verifies. Any loss — a fence tripped in Append, a steal discovered at
@@ -107,7 +112,7 @@ type objectStore struct {
 	finishes map[ulid.ULID]runFinish
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string, bus EventBus) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -135,6 +140,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		client:   client,
 		cfg:      cfg,
 		nodeID:   nodeID,
+		bus:      busOrNoop(bus),
 		leases:   map[ulid.ULID]lease{},
 		finishes: map[ulid.ULID]runFinish{},
 	}, nil
@@ -241,12 +247,16 @@ const maxConditionalRetries = 5
 var errEtagMismatch = errors.New("precondition failed: etag mismatch")
 
 // expBackoff builds the exponential backoff shared by the store's retry loops: bounded by the
-// caller's wrapper (max retries) or context, never wall-clock.
+// caller's wrapper (max retries) or context, never wall-clock. Reset syncs the live interval to
+// InitialInterval — NewExponentialBackOff seeds it from the library default, so a caller that
+// drives NextBackOff directly (WaitRun) rather than through backoff.Retry would otherwise get
+// the default 500ms first interval instead of the one configured here.
 func expBackoff(initial, max time.Duration) *backoff.ExponentialBackOff {
 	b := backoff.NewExponentialBackOff()
 	b.InitialInterval = initial
 	b.MaxInterval = max
 	b.MaxElapsedTime = 0
+	b.Reset()
 	return b
 }
 
@@ -256,10 +266,21 @@ func retryBackoff(ctx context.Context, maxRetries uint64) backoff.BackOff {
 	return backoff.WithContext(backoff.WithMaxRetries(expBackoff(50*time.Millisecond, 2*time.Second), maxRetries), ctx)
 }
 
+// busPollInsuranceInterval is WaitRun's poll ceiling when a live bus carries the completion
+// fast path: the manifest re-read becomes a rare backstop rather than a per-interval cost. It
+// is a distinct regime from the poll-only ceiling (waitPollMaxInterval, which callers tune for
+// the no-bus case), not an arithmetic scaling of it.
+const busPollInsuranceInterval = 30 * time.Second
+
 // waitBackoff returns the backoff pacing WaitRun's manifest polls: bounded only by ctx, so a
-// wait outlives any fixed retry budget.
+// wait outlives any fixed retry budget. A live bus swaps the ceiling for the insurance
+// interval; the fast path, not the poll, carries completion.
 func (s *objectStore) waitBackoff(ctx context.Context) backoff.BackOff {
-	return backoff.WithContext(expBackoff(s.cfg.waitPollInterval(), s.cfg.waitPollMaxInterval()), ctx)
+	max := s.cfg.waitPollMaxInterval()
+	if busIsLive(s.bus) {
+		max = busPollInsuranceInterval
+	}
+	return backoff.WithContext(expBackoff(s.cfg.waitPollInterval(), max), ctx)
 }
 
 // putConditional issues a conditional PutObject — set applies the condition header — and retries

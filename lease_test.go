@@ -64,7 +64,7 @@ func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectS
 		Endpoint:     h.url,
 		Region:       "auto",
 		LeaseTimeout: leaseTimeout,
-	}, nodeID)
+	}, nodeID, nil)
 	if err != nil {
 		h.t.Fatalf("failed to create object store: %v", err)
 	}
