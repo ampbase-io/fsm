@@ -536,31 +536,22 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 
 	var (
 		resolved = make([]*lockEntry, len(lockKeys))
+		errs     = make([]error, len(lockKeys))
 		sem      = make(chan struct{}, scanFanout)
 		wg       sync.WaitGroup
-		mu       sync.Mutex
-		scanErr  error
 	)
 	for i, lockKey := range lockKeys {
+		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
-
-			entry, err := s.resolveLock(ctx, lockKey)
-			if err != nil {
-				mu.Lock()
-				scanErr = errors.Join(scanErr, err)
-				mu.Unlock()
-				return
-			}
-			resolved[i] = entry
+			resolved[i], errs[i] = s.resolveLock(ctx, lockKey)
 		}()
 	}
 	wg.Wait()
-	if scanErr != nil {
-		return nil, scanErr
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
 	}
 
 	entries := make([]lockEntry, 0, len(resolved))

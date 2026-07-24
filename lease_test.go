@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -452,6 +453,40 @@ func TestCompletedRunLockCleanedAtStart(t *testing.T) {
 	owner, err := a.lockOwner(ctx, lockKey)
 	if err != nil || owner != next.StartVersion {
 		t.Fatalf("expected the lock held by the new run %s, got %s (err=%v)", next.StartVersion, owner, err)
+	}
+}
+
+// TestScanLocksBeyondFanout guards the fan-out shape itself: a scan of more locks than
+// scanFanout must complete and return every resolvable entry. Both a mis-ordered
+// waiter-closer and an undersized channel deadlock exactly here, and no other test scans
+// past the bound.
+func TestScanLocksBeyondFanout(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 10*time.Second)
+
+	const runs = 2*scanFanout + 1
+	for i := range runs {
+		startRun(t, a, fmt.Sprintf("fan-%02d", i))
+	}
+
+	done := make(chan struct{})
+	var entries []lockEntry
+	go func() {
+		defer close(done)
+		var err error
+		entries, err = a.scanLocks(ctx, a.lockPrefix("orderReq"))
+		if err != nil {
+			t.Errorf("scanLocks failed: %v", err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("scanLocks hung scanning more locks than scanFanout")
+	}
+	if len(entries) != runs {
+		t.Fatalf("expected %d entries, got %d", runs, len(entries))
 	}
 }
 
