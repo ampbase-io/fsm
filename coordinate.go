@@ -25,6 +25,12 @@ type leaseCoordinator interface {
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
 }
 
+// claimWakeDelay is the small, jittered pause before an idle worker scans on a pending-event
+// wakeup. It spreads the woken herd across a short window; it is deliberately absolute rather
+// than a fraction of the claim interval, since it exists to stagger a single broadcast, not to
+// track the periodic cadence — and the claim CAS makes any residual overlap safe.
+const claimWakeDelay = 50 * time.Millisecond
+
 // claimedRun pairs a claimed resource with the FSM that will resume it.
 type claimedRun struct {
 	f *fsm
@@ -54,7 +60,9 @@ func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, err
 // coordinate is the lease-coordinated backend's background loop: it heartbeats owned leases,
 // cancels local runs whose lease was lost, and periodically claims eligible runs for every
 // registered FSM — the claim pass is the object backend's primary work-distribution
-// mechanism, not merely failover. It exits when the manager shuts down.
+// mechanism, not merely failover. A fsm.run.pending event pulls a claim pass forward so an
+// idle worker claims immediately instead of on the next periodic tick, which remains the
+// correctness floor. It exits when the manager shuts down.
 func (m *Manager) coordinate(lc leaseCoordinator) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,6 +77,28 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 	claim := time.NewTimer(withJitter(claimEvery))
 	defer claim.Stop()
 
+	// wake pulls a claim pass forward on a pending event; it stays stopped until then. The
+	// jittered claimWakeDelay spreads the woken herd — the claim CAS makes a stampede safe,
+	// just wasteful — while the periodic claim stays the floor a dropped event falls back to.
+	wake := stoppedTimer()
+	defer wake.Stop()
+	wakeArmed := false
+
+	pending, unsubscribe := subscribeSignal(m.bus, subjectPending, m.logger)
+	defer unsubscribe()
+
+	// runClaim scans for claimable runs unless the manager is shutting down, in which case it
+	// reports false so the loop returns without starting a pass it won't wait out.
+	runClaim := func() bool {
+		select {
+		case <-m.done:
+			return false
+		default:
+		}
+		m.claimPass(ctx, lc)
+		return true
+	}
+
 	for {
 		select {
 		case <-m.done:
@@ -77,16 +107,33 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 			lc.extendLeases(ctx)
 			m.cancelUnleased(lc)
 		case <-claim.C:
-			// A tick can race shutdown; don't start a claim pass the manager won't wait out.
-			select {
-			case <-m.done:
+			if !runClaim() {
 				return
-			default:
 			}
-			m.claimPass(ctx, lc)
 			claim.Reset(withJitter(claimEvery))
+		case <-wake.C:
+			wakeArmed = false
+			if !runClaim() {
+				return
+			}
+		case <-pending:
+			// Pull the next scan forward, unless one is already armed. The periodic claim timer
+			// is left untouched; a redundant scan shortly after is harmless.
+			if !wakeArmed {
+				wakeArmed = true
+				wake.Reset(withJitter(claimWakeDelay))
+			}
 		}
 	}
+}
+
+// stoppedTimer returns a timer that will not fire until Reset, with its channel drained.
+func stoppedTimer() *time.Timer {
+	t := time.NewTimer(0)
+	if !t.Stop() {
+		<-t.C
+	}
+	return t
 }
 
 // cancelUnleased enforces the invariant that an executing run holds its lease: any locally

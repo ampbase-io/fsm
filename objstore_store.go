@@ -166,7 +166,52 @@ func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEve
 		return ulid.ULID{}, err
 	}
 
+	// Publish after the durable write, skipping construction entirely under the no-op bus — this
+	// runs on every transition. FINISH is the exception: fsm.run.done is emitted from inside the
+	// finish cleanup (after the lock is deleted and history written), never here at the manifest
+	// flip, or a released waiter could race the not-yet-deleted lock.
+	if busIsLive(s.bus) {
+		switch event.GetType() {
+		case fsmv1.EventType_EVENT_TYPE_START:
+			s.publishSignal(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
+		case fsmv1.EventType_EVENT_TYPE_COMPLETE,
+			fsmv1.EventType_EVENT_TYPE_ERROR,
+			fsmv1.EventType_EVENT_TYPE_CANCEL:
+			s.publishTransition(run, event, eventVersion)
+		}
+	}
+
 	return eventVersion, nil
+}
+
+// publishSignal emits a control signal — pending, done, or cancel — carrying only the run
+// identity (and, for a cancel, its cause). Its meaning is the kind and the subject it rides on.
+// Best-effort per the EventBus contract; the durable log and sentinels are the source of truth.
+func (s *objectStore) publishSignal(subject string, kind fsmv1.RunEventKind, version ulid.ULID, cause string) {
+	runVersion, _ := version.MarshalText() // a valid ULID never fails to marshal
+	s.bus.Publish(subject, &fsmv1.RunEvent{
+		Kind:       kind,
+		RunVersion: runVersion,
+		Error:      cause,
+	})
+}
+
+// publishTransition emits a durable transition on the run's event stream, reusing the
+// StateEvent's EventType so the live stream and the durable log speak one schema. Best-effort.
+func (s *objectStore) publishTransition(run Run, event *fsmv1.StateEvent, eventVersion ulid.ULID) {
+	runVersion, _ := run.StartVersion.MarshalText()
+	eventBytes, _ := eventVersion.MarshalText()
+	s.bus.Publish(eventSubject(run.StartVersion), &fsmv1.RunEvent{
+		Kind:         fsmv1.RunEventKind_RUN_EVENT_KIND_TRANSITION,
+		RunVersion:   runVersion,
+		EventVersion: eventBytes,
+		Type:         event.GetType(),
+		ResourceType: event.GetResourceType(),
+		ResourceId:   event.GetId(),
+		Action:       event.GetAction(),
+		State:        event.GetState(),
+		Error:        event.GetError(),
+	})
 }
 
 // lockOwner reads the run version a resource lock records as its holder.
@@ -439,6 +484,12 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	}
 
 	s.completeFinish(run.StartVersion, run.fsmErr)
+
+	// The finish cleanup is complete — lock deleted, history written, outcome recorded — so a
+	// waiter released now observes everything fsm.run.done implies.
+	if busIsLive(s.bus) {
+		s.publishSignal(doneSubject(run.StartVersion), fsmv1.RunEventKind_RUN_EVENT_KIND_DONE, run.StartVersion, "")
+	}
 
 	return nil
 }
@@ -713,31 +764,37 @@ func (s *objectStore) ResolveRun(ctx context.Context, resourceType, resourceID s
 	return runs[len(runs)-1], nil
 }
 
-var errRunInFlight = errors.New("run still in flight")
-
-// WaitRun polls the run's manifest under exponential backoff until it records a terminal
-// state. Outcomes of runs this process completed are answered from the in-process finished
-// map, which preserves typed run errors; a missing manifest is answered from history. A
-// terminal manifest whose finish is still being cleaned up by this process keeps the waiter
+// WaitRun blocks until the run records a terminal state, polling its manifest under exponential
+// backoff with the bus as a fast path: a fsm.run.done event wakes the wait immediately instead
+// of on the next poll tick, and a live bus relaxes the poll floor to a rare insurance interval
+// (waitBackoff). Outcomes of runs this process completed are answered from the in-process
+// finished map, which preserves typed run errors; a missing manifest is answered from history.
+// A terminal manifest whose finish is still being cleaned up by this process keeps the waiter
 // polling until the outcome is recorded.
 func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
+	// Subscribe before the first manifest read: a completion landing between the read and the
+	// wait still wakes us, and one that landed before Subscribe returned is caught by that
+	// first read.
+	signal, unsubscribe := subscribeSignal(s.bus, doneSubject(runVersion), s.logger)
+	defer unsubscribe()
+
 	var outcome error
-	op := func() error {
+	terminal := func() (bool, error) {
 		if runErr, state := s.localFinish(runVersion); state == finishDone {
 			outcome = runErr.Err
-			return nil
+			return true, nil
 		}
 
 		manifest, _, err := s.getManifest(ctx, runVersion)
 		switch {
 		case errors.Is(err, ErrFsmNotFound):
 			outcome = historyOutcome(ctx, s, runVersion)
-			return nil
+			return true, nil
 		case err != nil:
-			return backoff.Permanent(err)
+			return false, err
 		}
 		if !manifestTerminal(manifest) {
-			return errRunInFlight
+			return false, nil
 		}
 
 		// The terminal manifest is durable truth; localFinish decides atomically whether this
@@ -746,19 +803,43 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		switch runErr, state := s.localFinish(runVersion); state {
 		case finishDone:
 			outcome = runErr.Err
-			return nil
+			return true, nil
 		case finishInFlight:
-			return errRunInFlight
+			return false, nil
 		}
 		if manifest.GetError() != "" {
 			outcome = &haltError{err: errors.New(manifest.GetError())}
 		}
-		return nil
+		return true, nil
 	}
-	if err := backoff.Retry(op, s.waitBackoff(ctx)); err != nil {
-		return err
+
+	b := s.waitBackoff(ctx)
+	timer := stoppedTimer()
+	defer timer.Stop()
+	for {
+		switch done, err := terminal(); {
+		case err != nil:
+			return err
+		case done:
+			return outcome
+		}
+
+		d := b.NextBackOff()
+		if d == backoff.Stop { // the ctx-bound backoff stops only when ctx ends
+			return ctx.Err()
+		}
+		timer.Reset(d)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		case <-signal:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			b.Reset() // the bus is delivering; tighten the next poll back to the floor
+		}
 	}
-	return outcome
 }
 
 func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {

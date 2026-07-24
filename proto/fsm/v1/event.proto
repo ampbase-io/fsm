@@ -66,3 +66,42 @@ message HistoryEvent {
 
   StateEvent last_event = 2;
 }
+
+// RunEventKind is the bus-level category of a RunEvent. It classifies what the event is at the
+// bus layer — a control signal or a durable transition — and does not duplicate EventType: a
+// TRANSITION event's specific durable type is carried in RunEvent.type (the reused EventType).
+enum RunEventKind {
+  RUN_EVENT_KIND_UNSPECIFIED = 0;
+  RUN_EVENT_KIND_PENDING = 1; // a run became claimable (broadcast wakeup)
+  RUN_EVENT_KIND_TRANSITION = 2; // a durable transition; see RunEvent.type
+  RUN_EVENT_KIND_DONE = 3; // a run's finish cleanup completed; waiters may resolve
+  RUN_EVENT_KIND_CANCEL = 4; // a cancel was requested (broadcast)
+}
+
+// RunEvent is the payload published on the event bus for a run-lifecycle event. It is a
+// best-effort accelerator over the durable event log, which remains the source of truth; a
+// dropped RunEvent costs latency, never correctness.
+//
+// A TRANSITION event, published on a run's event stream, mirrors the durable StateEvent that
+// triggered it: `type` carries that StateEvent's EventType, and the resource/state/error fields
+// are populated. A control signal (PENDING, DONE, CANCEL) carries only run_version — its meaning
+// is the kind and the subject it is published on — plus the cause in `error` for a cancel.
+message RunEvent {
+  RunEventKind kind = 1;
+
+  bytes run_version = 2;
+
+  bytes event_version = 3;
+
+  EventType type = 4;
+
+  string resource_type = 5;
+
+  string resource_id = 6;
+
+  string action = 7;
+
+  string state = 8;
+
+  string error = 9;
+}
