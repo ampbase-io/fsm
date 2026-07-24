@@ -47,6 +47,14 @@ func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration)
 	return time.Hour, time.Hour
 }
 
+func (s *stubCoordinator) requestCancel(context.Context, ulid.ULID, error) error { return nil }
+
+func (s *stubCoordinator) pendingCancellations(context.Context) (map[ulid.ULID]error, error) {
+	return nil, nil
+}
+
+func (s *stubCoordinator) cancelOwnedRun(context.Context, ulid.ULID, error) error { return nil }
+
 // wakeCoordinator counts claim passes. It embeds stubCoordinator — whose intervals are an hour,
 // so the periodic scan never fires and only the pending wakeup drives a pass — and inherits any
 // methods the interface later grows, overriding only claimRuns to count.
