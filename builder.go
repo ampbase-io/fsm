@@ -220,11 +220,16 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 }
 
 // End sets the final state of the FSM and applies any options as a global option for the FSM.
+// The registry lock covers the whole registration so concurrent End calls cannot both pass the
+// duplicate check; the claim loop reads the registry concurrently.
 func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[R, W] {
 	fk := fsmKey{
 		name:   s.f.typeName,
 		action: s.f.action,
 	}
+
+	s.m.mu.Lock()
+	defer s.m.mu.Unlock()
 
 	if _, ok := s.m.fsms[fk]; ok {
 		s.m.logger.WithField("fsm", s.f.typeName).Error("fsm already registered")
@@ -257,9 +262,10 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		finalizers = append(finalizers, newFinalizer(f))
 	}
 
-	s.f.registeredTransitions[tk] = newTransition(name, finisher[R, W](s.m, finalizers), cfg)
+	s.f.registeredTransitions[tk] = newTransition(name, s.m.finisher[R, W](finalizers), cfg)
 	s.f.transitions = s.f.transitions.Append(name)
 	s.f.endState = name
+	s.f.resumeOne = s.m.resumeOne[R, W](s.f)
 
 	s.m.fsms[fk] = s.f
 
@@ -278,13 +284,13 @@ func (s *fsmEnd[R, W]) Build(ctx context.Context) (Start[R, W], Resume, error) {
 	}
 
 	wrappedResume := func(ctx context.Context) error {
-		if err := resume[R, W](s.m, s.f)(ctx); err != nil {
+		if err := s.m.resume(ctx, s.f); err != nil {
 			return fmt.Errorf("failed to resume active FSMs: %w", err)
 		}
 		return nil
 	}
 
-	return start[R, W](s.m, s.f), wrappedResume, nil
+	return s.m.start[R, W](s.f), wrappedResume, nil
 }
 
 func determineCodec(logger logrus.FieldLogger, req any) (Codec, error) {

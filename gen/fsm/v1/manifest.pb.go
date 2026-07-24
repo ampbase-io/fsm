@@ -52,12 +52,15 @@ type RunManifest struct {
 	RetryCount     uint64            `protobuf:"varint,19,opt,name=retry_count,json=retryCount,proto3" json:"retry_count,omitempty"`
 	Error          string            `protobuf:"bytes,20,opt,name=error,proto3" json:"error,omitempty"`
 	ErrorState     string            `protobuf:"bytes,21,opt,name=error_state,json=errorState,proto3" json:"error_state,omitempty"`
-	// Cluster coordination (used from Phase 4 onward).
-	OwnerNode     string `protobuf:"bytes,22,opt,name=owner_node,json=ownerNode,proto3" json:"owner_node,omitempty"`
-	LeaseExpiry   int64  `protobuf:"varint,23,opt,name=lease_expiry,json=leaseExpiry,proto3" json:"lease_expiry,omitempty"`
-	LeaseEpoch    int64  `protobuf:"varint,24,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
-	CreatedAt     int64  `protobuf:"varint,25,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	UpdatedAt     int64  `protobuf:"varint,26,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// Cluster coordination (used from Phase 4 onward). owner_node is a node identity, never a
+	// network address.
+	OwnerNode string `protobuf:"bytes,22,opt,name=owner_node,json=ownerNode,proto3" json:"owner_node,omitempty"`
+	// lease_expiry is Unix milliseconds: lease timeouts are fractions of a minute, where
+	// second granularity would cost up to a second of takeover latency per comparison.
+	LeaseExpiry   int64 `protobuf:"varint,23,opt,name=lease_expiry,json=leaseExpiry,proto3" json:"lease_expiry,omitempty"`
+	LeaseEpoch    int64 `protobuf:"varint,24,opt,name=lease_epoch,json=leaseEpoch,proto3" json:"lease_epoch,omitempty"`
+	CreatedAt     int64 `protobuf:"varint,25,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt     int64 `protobuf:"varint,26,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

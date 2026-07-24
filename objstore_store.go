@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
@@ -66,8 +67,10 @@ func (s *objectStore) getManifest(ctx context.Context, runVersion ulid.ULID) (*f
 }
 
 // casManifest applies mutate to the manifest under an If-Match compare-and-swap, re-reading and
-// retrying on concurrent modification. It returns the manifest as written.
-func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest)) (*fsmv1.RunManifest, error) {
+// retrying on concurrent modification, so mutate always observes fresh state. A mutate error
+// (a tripped fence, a lost claim race) aborts the CAS and is returned as-is. It returns the
+// manifest as written.
+func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest) error) (*fsmv1.RunManifest, error) {
 	key := s.manifestKey(runVersion)
 	var updated *fsmv1.RunManifest
 	op := func() error {
@@ -76,7 +79,9 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			return backoff.Permanent(err)
 		}
 
-		mutate(manifest)
+		if err := mutate(manifest); err != nil {
+			return backoff.Permanent(err)
+		}
 		manifest.UpdatedAt = time.Now().Unix()
 
 		body, err := proto.Marshal(manifest)
@@ -151,12 +156,70 @@ func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEve
 	default:
 		err = fmt.Errorf("%T: %w", event.Type, errInvalidEventType)
 	}
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrLeaseLost):
+		// Expected control flow after a takeover, not a storage failure.
+		s.logger.WithError(err).Warn("append fenced, run no longer owned")
+		return ulid.ULID{}, err
+	case err != nil:
 		s.logger.WithError(err).Error("failed to append event")
 		return ulid.ULID{}, err
 	}
 
 	return eventVersion, nil
+}
+
+// lockOwner reads the run version a resource lock records as its holder.
+func (s *objectStore) lockOwner(ctx context.Context, lockKey string) (ulid.ULID, error) {
+	owner, _, err := s.getObject(ctx, lockKey)
+	if err != nil {
+		return ulid.ULID{}, fmt.Errorf("resource lock %s is held but unreadable: %w", lockKey, err)
+	}
+	var ownerVersion ulid.ULID
+	if err := ownerVersion.UnmarshalText(owner); err != nil {
+		return ulid.ULID{}, fmt.Errorf("resource lock %s has invalid owner: %w", lockKey, err)
+	}
+	return ownerVersion, nil
+}
+
+// acquireRunLock takes the resource lock. A lock held by a run whose manifest is already
+// terminal is a crash (or in-flight cleanup) window between manifest completion and lock
+// deletion: the cleanup is finished here and the acquire retried once, so a caller that
+// restarts a resource right after waiting on its completion doesn't see a spurious
+// AlreadyRunning.
+func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVersionBytes []byte) error {
+	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	case err == nil:
+		return nil
+	case !errors.Is(err, errPreconditionFailed):
+		return err
+	}
+
+	ownerVersion, err := s.lockOwner(ctx, lockKey)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := s.getManifest(ctx, ownerVersion)
+	if err != nil || !manifestTerminal(manifest) {
+		return &AlreadyRunningError{Version: ownerVersion}
+	}
+
+	if err := s.reapTerminalLock(ctx, lockKey); err != nil {
+		return fmt.Errorf("failed to delete orphaned lock %s: %w", lockKey, err)
+	}
+	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	case err == nil:
+		return nil
+	case !errors.Is(err, errPreconditionFailed):
+		return err
+	}
+
+	// Lost the re-acquire race to another starter.
+	ownerVersion, err = s.lockOwner(ctx, lockKey)
+	if err != nil {
+		return err
+	}
+	return &AlreadyRunningError{Version: ownerVersion}
 }
 
 func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, eventBytes []byte) error {
@@ -167,19 +230,8 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 
 	// 1. Acquire the resource lock. A 412 means another run holds it.
 	lockKey := s.lockKey(event.GetResourceType(), event.GetId(), event.GetAction(), queue, run.StartVersion)
-	if err := s.putIfAbsent(ctx, lockKey, runVersionBytes); err != nil {
-		if !errors.Is(err, errPreconditionFailed) {
-			return err
-		}
-		owner, _, gerr := s.getObject(ctx, lockKey)
-		if gerr != nil {
-			return fmt.Errorf("resource lock %s is held but unreadable: %w", lockKey, gerr)
-		}
-		var ownerVersion ulid.ULID
-		if err := ownerVersion.UnmarshalText(owner); err != nil {
-			return fmt.Errorf("resource lock %s has invalid owner: %w", lockKey, err)
-		}
-		return &AlreadyRunningError{Version: ownerVersion}
+	if err := s.acquireRunLock(ctx, lockKey, runVersionBytes); err != nil {
+		return err
 	}
 
 	// 2. Write the START event.
@@ -187,15 +239,29 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		return err
 	}
 
-	// 2b. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
+	// 3. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
 	// events (deleted at archival), index markers persist, so past runs stay enumerable.
 	indexKey := s.runIndexKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.StartVersion)
 	if err := s.putIdempotent(ctx, indexKey, nil); err != nil {
 		return err
 	}
 
-	// 3. Create the manifest. A 412 means a crashed earlier attempt of this same run already
-	// created it; the existing manifest is authoritative.
+	// 4. Create the manifest, leased to this node.
+	manifestBytes, err := s.startManifest(ctx, run, event, queue, ao, eventKey, runVersionBytes)
+	if err != nil {
+		return err
+	}
+	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes); err != nil {
+		return err
+	}
+
+	// 5. Record the parent-child relationship.
+	return s.linkParent(ctx, ao.parent, run.StartVersion)
+}
+
+// startManifest materializes a new run's initial manifest, leased to this node from the
+// start: the starting worker executes the run immediately and heartbeats from the first tick.
+func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
 	manifest := &fsmv1.RunManifest{
 		Status:         fsmv1.RunState_RUN_STATE_PENDING,
 		ResourceType:   event.GetResourceType(),
@@ -211,40 +277,86 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		Parent:         ao.parent,
 		DelayUntil:     ao.delayUntil,
 		RunAfter:       ao.runAfter,
+		OwnerNode:      s.nodeID,
+		LeaseExpiry:    time.Now().Add(s.cfg.leaseTimeout()).UnixMilli(),
+		LeaseEpoch:     1,
 		TraceContext:   map[string]string{},
 		CreatedAt:      time.Now().Unix(),
 		UpdatedAt:      time.Now().Unix(),
 	}
 	(propagation.TraceContext{}).Inject(ctx, propagation.MapCarrier(manifest.TraceContext))
 
-	manifestBytes, err := proto.Marshal(manifest)
+	return proto.Marshal(manifest)
+}
+
+// createRunManifest writes the run's initial manifest and tracks its lease. A manifest that
+// already exists belongs to a crashed earlier attempt of this same run and is adopted instead.
+func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifestBytes []byte) error {
+	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
+	case err == nil:
+		s.trackLease(run.StartVersion, 1)
+		return nil
+	case errors.Is(err, errPreconditionFailed):
+		return s.adoptRunManifest(ctx, run, lockKey)
+	default:
+		return err
+	}
+}
+
+// adoptRunManifest resumes a START whose earlier attempt already created the manifest; the
+// existing manifest is authoritative. Its lease is adopted if this node still owns it — but
+// never from a terminal manifest: a START retry arriving after the run finished must not
+// re-execute it, and the lock the retry re-acquired is undone so the duplicate leaves no
+// trace.
+func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey string) error {
+	existing, _, err := s.getManifest(ctx, run.StartVersion)
 	if err != nil {
 		return err
 	}
-	if err := s.putIdempotent(ctx, s.manifestKey(run.StartVersion), manifestBytes); err != nil {
-		return err
+
+	if manifestTerminal(existing) {
+		if err := s.deleteObject(ctx, lockKey); err != nil {
+			s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete lock of completed run")
+		}
+		return &AlreadyRunningError{Version: run.StartVersion}
+	}
+	if existing.GetOwnerNode() != s.nodeID {
+		return ErrLeaseLost
 	}
 
-	// 4. Record the parent-child relationship.
-	if ao.parent != nil {
-		var parent ulid.ULID
-		if err := parent.UnmarshalText(ao.parent); err != nil {
-			return fmt.Errorf("invalid parent version: %w", err)
-		}
-		if err := s.writeChild(ctx, parent, run.StartVersion); err != nil {
-			return err
-		}
-	}
-
+	s.trackLease(run.StartVersion, existing.GetLeaseEpoch())
 	return nil
 }
 
+// linkParent records the parent-child relationship for runs started with a parent.
+func (s *objectStore) linkParent(ctx context.Context, parent []byte, child ulid.ULID) error {
+	if parent == nil {
+		return nil
+	}
+
+	var parentVersion ulid.ULID
+	if err := parentVersion.UnmarshalText(parent); err != nil {
+		return fmt.Errorf("invalid parent version: %w", err)
+	}
+	return s.writeChild(ctx, parentVersion, child)
+}
+
 func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
+	// The local ownership guard keeps a fenced writer from creating orphan event objects in
+	// the common case; the fence check inside the CAS is authoritative for the true race.
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
+
 	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
-	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
+	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
 		if m.Status == fsmv1.RunState_RUN_STATE_PENDING {
@@ -264,21 +376,31 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		case fsmv1.EventType_EVENT_TYPE_ERROR:
 			m.RetryCount = event.GetRetryCount()
 		}
+		return nil
 	})
+	if errors.Is(err, ErrLeaseLost) {
+		s.dropLease(run.StartVersion)
+	}
 	return err
 }
 
 func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, eventKey string, eventBytes []byte) error {
-	// Marked before the manifest turns terminal, so a waiter that observes completion holds
-	// until the cleanup below lands and the typed outcome is recorded.
-	s.markFinishing(run.StartVersion)
-	defer s.unmarkFinishing(run.StartVersion)
+	s.beginFinish(run.StartVersion)
+	defer s.settleFinish(run.StartVersion)
+
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
 
 	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
 		return err
 	}
 
-	manifest, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) {
+	manifest, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
 		m.Status = fsmv1.RunState_RUN_STATE_COMPLETE
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
@@ -287,14 +409,20 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 			m.Error = run.fsmErr.Err.Error()
 			m.ErrorState = run.fsmErr.State
 		}
+		return nil
 	})
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
 		s.logger.WithField("run_version", run.StartVersion.String()).Warn("manifest not found for finish event")
 		return nil
+	case errors.Is(err, ErrLeaseLost):
+		s.dropLease(run.StartVersion)
+		return err
 	case err != nil:
 		return err
 	}
+
+	s.dropLease(run.StartVersion)
 
 	// The lock is deleted after the manifest records completion; a crash in between leaves an
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
@@ -310,7 +438,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		return err
 	}
 
-	s.rememberFinished(run.StartVersion, run.fsmErr)
+	s.completeFinish(run.StartVersion, run.fsmErr)
 
 	return nil
 }
@@ -384,81 +512,115 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 
 // lockEntry pairs an active resource lock with the manifest of the run holding it.
 type lockEntry struct {
-	resourceType, resourceID, action string
+	action string
 
 	version ulid.ULID
 
 	manifest *fsmv1.RunManifest
 }
 
+// scanFanout bounds the concurrent object storage operations of a lock scan or a lease pass;
+// a serial pass over many runs could outrun the interval that scheduled it.
+const scanFanout = 8
+
 // scanLocks lists resource locks under prefix and resolves each to its owning run's manifest
-// (keys-only listing plus one lock GET and one manifest GET per active run — event bodies are
-// never read, per the RFC's resumability contract). Crash windows are handled inline: a lock
-// without a manifest is skipped, and a lock whose manifest is terminal is deleted.
+// (keys-only listing plus one lock GET and one manifest GET per active run, scanFanout at a
+// time — event bodies are never read, per the RFC's resumability contract). Crash windows are
+// handled inline: a lock without a manifest is skipped, and a lock whose manifest is terminal
+// is deleted.
 func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry, error) {
 	lockKeys, err := s.listKeys(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	var entries []lockEntry
-	for _, lockKey := range lockKeys {
-		logger := s.logger.WithField("key", lockKey)
+	var (
+		resolved = make([]*lockEntry, len(lockKeys))
+		errs     = make([]error, len(lockKeys))
+		sem      = make(chan struct{}, scanFanout)
+		wg       sync.WaitGroup
+	)
+	for i, lockKey := range lockKeys {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			resolved[i], errs[i] = s.resolveLock(ctx, lockKey)
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
 
-		// locks/<type>/<id>/<action>[/<run_version>]
-		segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
-		if len(segments) < 3 {
-			logger.Warn("malformed lock key")
+	entries := make([]lockEntry, 0, len(resolved))
+	for _, entry := range resolved {
+		if entry == nil {
 			continue
 		}
-		resourceType, typeErr := unescapeSegment(segments[0])
-		resourceID, idErr := unescapeSegment(segments[1])
-		action, actionErr := unescapeSegment(segments[2])
-		if err := errors.Join(typeErr, idErr, actionErr); err != nil {
-			logger.WithError(err).Warn("malformed lock key")
-			continue
-		}
-
-		owner, _, err := s.getObject(ctx, lockKey)
-		if err != nil {
-			logger.WithError(err).Error("failed to read resource lock")
-			continue
-		}
-		var version ulid.ULID
-		if err := version.UnmarshalText(owner); err != nil {
-			logger.WithError(err).Error("failed to unmarshal lock owner version")
-			continue
-		}
-
-		manifest, _, err := s.getManifest(ctx, version)
-		switch {
-		case errors.Is(err, ErrFsmNotFound):
-			// Crash window between lock acquisition and manifest creation. Leave the lock for
-			// the periodic recovery scan (Phase 4) rather than racing an in-flight START.
-			logger.Warn("lock held but manifest missing, skipping")
-			continue
-		case err != nil:
-			return nil, err
-		}
-
-		if manifestTerminal(manifest) {
-			// Crash window between manifest completion and lock deletion: finish the cleanup.
-			logger.Info("completed run still holds its lock, removing")
-			if err := s.deleteObject(ctx, lockKey); err != nil {
-				logger.WithError(err).Error("failed to delete orphaned lock")
-			}
-			continue
-		}
-
-		entries = append(entries, lockEntry{
-			resourceType: resourceType,
-			resourceID:   resourceID,
-			action:       action,
-			version:      version,
-			manifest:     manifest,
-		})
+		entries = append(entries, *entry)
 	}
 	return entries, nil
+}
+
+// resolveLock resolves a single lock key to its owning run's manifest. Skips — malformed keys,
+// crash windows, terminal-manifest cleanup — return (nil, nil).
+func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEntry, error) {
+	logger := s.logger.WithField("key", lockKey)
+
+	// locks/<type>/<id>/<action>[/<run_version>]
+	segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
+	if len(segments) < 3 {
+		logger.Warn("malformed lock key")
+		return nil, nil
+	}
+	action, err := unescapeSegment(segments[2])
+	if err != nil {
+		logger.WithError(err).Warn("malformed lock key")
+		return nil, nil
+	}
+
+	version, err := s.lockOwner(ctx, lockKey)
+	if err != nil {
+		logger.WithError(err).Error("failed to resolve lock owner")
+		return nil, nil
+	}
+
+	manifest, _, err := s.getManifest(ctx, version)
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		// Crash window between lock acquisition and manifest creation. A recent lock may
+		// belong to an in-flight START and is left alone; one old enough that no START can
+		// still be writing it (the run version carries its creation time) is reaped.
+		if time.Since(ulid.Time(version.Time())) > 2*s.cfg.leaseTimeout() {
+			logger.Warn("stale lock with no manifest, removing")
+			if err := s.deleteObject(ctx, lockKey); err != nil {
+				logger.WithError(err).Error("failed to delete stale lock")
+			}
+			return nil, nil
+		}
+		logger.Warn("lock held but manifest missing, skipping")
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+
+	if manifestTerminal(manifest) {
+		if err := s.reapTerminalLock(ctx, lockKey); err != nil {
+			logger.WithError(err).Error("failed to delete orphaned lock")
+		}
+		return nil, nil
+	}
+
+	return &lockEntry{action: action, version: version, manifest: manifest}, nil
+}
+
+// reapTerminalLock finishes the cleanup of a completed run's lock — the crash window between
+// manifest completion and lock deletion.
+func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) error {
+	s.logger.WithField("key", lockKey).Info("completed run still holds its lock, removing")
+	return s.deleteObject(ctx, lockKey)
 }
 
 // Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
@@ -473,16 +635,21 @@ func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, er
 		if e.action != f.action {
 			continue
 		}
-		active = append(active, &activeResource{
-			version:              e.version,
-			active:               activeEventFromManifest(e.manifest),
-			completedTransitions: e.manifest.GetCompletedStates(),
-			response:             e.manifest.GetLatestResponse(),
-			retryCount:           e.manifest.GetRetryCount(),
-			fsmError:             manifestRunErr(e.manifest),
-		})
+		active = append(active, manifestResource(e.version, e.manifest))
 	}
 	return active, nil
+}
+
+// manifestResource rebuilds the resume-path DTO from the manifest's materialized fields.
+func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
+	return &activeResource{
+		version:              version,
+		active:               activeEventFromManifest(m),
+		completedTransitions: m.GetCompletedStates(),
+		response:             m.GetLatestResponse(),
+		retryCount:           m.GetRetryCount(),
+		fsmError:             manifestRunErr(m),
+	}
 }
 
 func (s *objectStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
@@ -556,7 +723,7 @@ var errRunInFlight = errors.New("run still in flight")
 func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	var outcome error
 	op := func() error {
-		if runErr, ok := s.finishedOutcome(runVersion); ok {
+		if runErr, state := s.localFinish(runVersion); state == finishDone {
 			outcome = runErr.Err
 			return nil
 		}
@@ -569,16 +736,19 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		case err != nil:
 			return backoff.Permanent(err)
 		}
-
-		if !manifestTerminal(manifest) || s.isFinishing(runVersion) {
+		if !manifestTerminal(manifest) {
 			return errRunInFlight
 		}
-		// A finish on this process may have fully landed between the map check above and the
-		// manifest read; the outcome is recorded before the finishing mark clears, so check
-		// once more before falling back to the manifest's error string.
-		if runErr, ok := s.finishedOutcome(runVersion); ok {
+
+		// The terminal manifest is durable truth; localFinish decides atomically whether this
+		// process's finish cleanup supplies a typed outcome, is still landing, or never ran
+		// here (a run finished by another node).
+		switch runErr, state := s.localFinish(runVersion); state {
+		case finishDone:
 			outcome = runErr.Err
 			return nil
+		case finishInFlight:
+			return errRunInFlight
 		}
 		if manifest.GetError() != "" {
 			outcome = &haltError{err: errors.New(manifest.GetError())}
@@ -614,54 +784,93 @@ func (s *objectStore) SetRunning(run Run) error {
 	return nil
 }
 
-// ForgetRun is a no-op: the object backend holds no local run state, and the resource lock
-// stays visible until recovery succeeds.
+// ForgetRun releases this node's claim on the run after a failed resume so another node (or a
+// later claim pass) can adopt it; the resource lock stays visible until recovery succeeds.
 func (s *objectStore) ForgetRun(run Run) error {
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	s.releaseLease(ctx, run.StartVersion, epoch)
 	return nil
 }
 
-// maxFinishedOutcomes bounds the finished map; when full, arbitrary entries are evicted, and
-// their waiters fall back to the manifest's recorded error.
-const maxFinishedOutcomes = 4096
+// finishState is this process's knowledge of a run's finish.
+type finishState int
 
-func (s *objectStore) rememberFinished(version ulid.ULID, runErr RunErr) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
+const (
+	finishUnknown  finishState = iota // never finished here; the manifest is all there is
+	finishInFlight                    // appendFinish is mid-cleanup here; the outcome is coming
+	finishDone                        // finished here; the typed outcome is recorded
+)
 
-	for len(s.finished) >= maxFinishedOutcomes {
-		for evict := range s.finished {
-			delete(s.finished, evict)
-			break
-		}
+type runFinish struct {
+	state finishState
+
+	err RunErr
+}
+
+// maxFinishes bounds the finishes map; see evictSettledFinish for the eviction policy.
+const maxFinishes = 4096
+
+// beginFinish marks the run's finish as in flight before the manifest turns terminal, so a
+// waiter that observes completion holds until the cleanup lands.
+func (s *objectStore) beginFinish(version ulid.ULID) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+	s.finishes[version] = runFinish{state: finishInFlight}
+}
+
+// completeFinish records the run's typed outcome once the finish cleanup has landed.
+func (s *objectStore) completeFinish(version ulid.ULID, runErr RunErr) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+
+	if len(s.finishes) >= maxFinishes {
+		s.evictSettledFinish()
 	}
-	s.finished[version] = runErr
+	s.finishes[version] = runFinish{state: finishDone, err: runErr}
 }
 
-func (s *objectStore) finishedOutcome(version ulid.ULID) (RunErr, bool) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-
-	runErr, ok := s.finished[version]
-	return runErr, ok
+// evictSettledFinish drops one arbitrary settled finish to bound the map; its waiters fall
+// back to the manifest's recorded error. In-flight entries are never evicted — they gate
+// waiter release — and are bounded by concurrent finishes. Callers hold finishMu.
+func (s *objectStore) evictSettledFinish() {
+	for version, finish := range s.finishes {
+		if finish.state != finishDone {
+			continue
+		}
+		delete(s.finishes, version)
+		return
+	}
 }
 
-func (s *objectStore) markFinishing(version ulid.ULID) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	s.finishing[version] = struct{}{}
+// settleFinish clears a finish that failed mid-cleanup. A completed finish was already
+// overwritten to done, which this leaves in place — the deferred call cannot clobber a
+// recorded outcome.
+func (s *objectStore) settleFinish(version ulid.ULID) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
+	if finish, ok := s.finishes[version]; ok && finish.state == finishInFlight {
+		delete(s.finishes, version)
+	}
 }
 
-func (s *objectStore) unmarkFinishing(version ulid.ULID) {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	delete(s.finishing, version)
-}
+// localFinish reports the run's finish state and recorded outcome in one atomic lookup, so a
+// caller that observed a terminal manifest gets a definitive answer: use the typed outcome,
+// keep waiting for it, or fall back to the manifest.
+func (s *objectStore) localFinish(version ulid.ULID) (RunErr, finishState) {
+	s.finishMu.Lock()
+	defer s.finishMu.Unlock()
 
-func (s *objectStore) isFinishing(version ulid.ULID) bool {
-	s.finishedMu.Lock()
-	defer s.finishedMu.Unlock()
-	_, ok := s.finishing[version]
-	return ok
+	finish, ok := s.finishes[version]
+	if !ok {
+		return RunErr{}, finishUnknown
+	}
+	return finish.err, finish.state
 }
 
 // History returns the archived record for a completed run. History objects are written at
@@ -708,9 +917,13 @@ func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string)
 	return runs, nil
 }
 
-// Close shuts down the store. The object storage backend holds no local resources or background
-// loops in Phase 3; history is written at FINISH time rather than by an archive loop.
+// Close releases every lease this node still holds so peers can claim its runs immediately
+// instead of waiting out the lease timeout.
 func (s *objectStore) Close() error {
 	s.logger.Info("shutting down object store")
+
+	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	s.releaseLeases(ctx)
 	return nil
 }

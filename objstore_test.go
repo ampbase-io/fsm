@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +29,10 @@ type fakeS3 struct {
 
 	// conflicts is the number of conditional PUTs to reject with 409 before accepting.
 	conflicts int
+
+	// lostPuts is the number of conditional PUTs to apply but answer with 409, simulating a
+	// write that succeeds server-side while its response is lost.
+	lostPuts int
 
 	puts               int
 	consistentReads    int
@@ -77,6 +80,11 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 			body, _ := io.ReadAll(r.Body)
 			f.objects[key] = body
 			f.revs[key]++
+			if conditional && f.lostPuts > 0 {
+				f.lostPuts--
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			w.Header().Set("ETag", f.etag(key))
 			w.WriteHeader(http.StatusOK)
 
@@ -139,20 +147,12 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Helper()
 
-	const bucket = "test-bucket"
-	fake := newFakeS3()
-	server := httptest.NewServer(fake.handler(bucket))
-	t.Cleanup(server.Close)
-
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-
+	bucket, url, fake := startFakeS3(t)
 	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
 		Bucket:   bucket,
-		Endpoint: server.URL,
+		Endpoint: url,
 		Region:   "auto",
-	})
+	}, "node-test")
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
@@ -170,7 +170,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}); err == nil {
+	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}, "node-test"); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }
@@ -341,6 +341,34 @@ func TestHistoryRoundTrip(t *testing.T) {
 
 	if _, err := store.readHistory(ctx, testULID(t, 43)); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("expected ErrFsmNotFound for unknown run, got %v", err)
+	}
+}
+
+func TestLinkParent(t *testing.T) {
+	store, _ := newTestObjectStore(t)
+	ctx := context.Background()
+
+	if err := store.linkParent(ctx, nil, ulid.Make()); err != nil {
+		t.Fatalf("expected a nil parent to be a no-op, got %v", err)
+	}
+	if err := store.linkParent(ctx, []byte("not-a-ulid"), ulid.Make()); err == nil {
+		t.Fatal("expected an error for an invalid parent version")
+	}
+
+	parent, child := testULID(t, 1), testULID(t, 2)
+	parentBytes, err := parent.MarshalText()
+	if err != nil {
+		t.Fatalf("failed to marshal parent: %v", err)
+	}
+	if err := store.linkParent(ctx, parentBytes, child); err != nil {
+		t.Fatalf("failed to link parent: %v", err)
+	}
+	children, err := store.listChildren(ctx, parent)
+	if err != nil {
+		t.Fatalf("failed to list children: %v", err)
+	}
+	if len(children) != 1 || children[0] != child {
+		t.Fatalf("expected children [%s], got %v", child, children)
 	}
 }
 

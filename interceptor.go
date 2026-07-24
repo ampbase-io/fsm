@@ -37,7 +37,7 @@ var (
 	)
 )
 
-func finisher[R, W any](m *Manager, finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
+func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
 	return func(ctx context.Context, req *Request[R, W]) (*Response[W], error) {
 		logger := req.Log()
 		run := req.Run()
@@ -114,7 +114,13 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 				}
 			}
 
-			if _, appendErr := store.Append(ctx, run, event, run.Queue); appendErr != nil {
+			switch _, appendErr := store.Append(ctx, run, event, run.Queue); {
+			case errors.Is(appendErr, ErrLeaseLost):
+				// A fenced append means the run must halt here even though the transition
+				// itself succeeded; swallowing it would keep executing without a durable record.
+				logger.WithError(appendErr).Warn("append fenced, halting run")
+				return resp, appendErr
+			case appendErr != nil:
 				logger.WithError(appendErr).Error("failed to append complete event")
 			}
 
@@ -201,6 +207,13 @@ func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 						localTransitionDurationVec.WithLabelValues("fsm_handoff_error").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Error("reached fsm handoff error, canceling FSM")
 						return backoff.Permanent(halt(err))
+					case errors.Is(err, ErrLeaseLost):
+						// Retrying a fenced write can never succeed; the run halts and the new
+						// owner drives it to completion.
+						localTransitionCounterVec.WithLabelValues("lease_lost").Inc()
+						localTransitionDurationVec.WithLabelValues("lease_lost").Observe(time.Since(transitionStartTime).Seconds())
+						logger.WithError(err).Warn("run lease lost, halting")
+						return backoff.Permanent(err)
 					case errors.Is(err, context.Canceled):
 						localTransitionCounterVec.WithLabelValues("canceled").Inc()
 						localTransitionDurationVec.WithLabelValues("canceled").Observe(time.Since(transitionStartTime).Seconds())

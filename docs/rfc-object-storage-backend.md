@@ -210,6 +210,10 @@ Each active run manifest contains an `owner_node`, `lease_expiry`, and `lease_ep
 
 **Fencing:** The `lease_epoch` is a monotonically increasing integer that acts as a fencing token. It prevents a stale owner (whose lease expired but whose goroutine hasn't noticed yet) from making progress. Every manifest CAS update verifies the epoch matches the value the node claimed with. If it doesn't, the node knows it's been fenced and must stop.
 
+**Deployment guardrail — enforce conditional writes by policy.** Every manifest mutation must go through the If-Match CAS path; a single writer issuing an unconditioned `PutObject` on a `runs/` key bypasses the fencing protocol entirely. Where the provider supports it (S3 `s3:if-match` / `s3:if-none-match` condition keys), deny non-conditional `PutObject` on the manifest prefix with a bucket policy, so the invariant is enforced by the bucket rather than by convention.
+
+**Takeover has no grace period (accepted trade-off).** A claimant takes an expired lease immediately; there is no Chubby-style lock-delay. This is deliberate: the fencing epoch already prevents a stale owner from mutating fsm state, so a delay would only add takeover latency. The cost is that side effects a stale owner's in-flight transition performs against *external* systems can overlap with the new owner's until cancellation lands. External systems needing protection should reject stale operations using the lease epoch as a fencing token; surfacing `(run_version, lease_epoch)` to handlers as a Chubby-style sequencer is planned follow-up work.
+
 #### Distributed Cancel
 
 Cancelling a run from a node that doesn't own it:

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,9 @@ type ObjectStorageConfig struct {
 	LeaseTimeout    time.Duration // Default 30s
 	HeartbeatPeriod time.Duration // Default 10s
 
+	// ClaimInterval is how often the claim loop scans for runs this node can take over.
+	ClaimInterval time.Duration // Default LeaseTimeout / 2
+
 	// WaitPollInterval and WaitPollMaxInterval bound the exponential backoff of WaitRun's
 	// manifest poll floor.
 	WaitPollInterval    time.Duration // Default 100ms
@@ -47,32 +51,32 @@ func (c *ObjectStorageConfig) prefix() string {
 	return "fsm/"
 }
 
-func (c *ObjectStorageConfig) leaseTimeout() time.Duration {
-	if c.LeaseTimeout > 0 {
-		return c.LeaseTimeout
+// orDefault returns d when set (positive), def otherwise.
+func orDefault(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
 	}
-	return 30 * time.Second
+	return def
+}
+
+func (c *ObjectStorageConfig) leaseTimeout() time.Duration {
+	return orDefault(c.LeaseTimeout, 30*time.Second)
 }
 
 func (c *ObjectStorageConfig) heartbeatPeriod() time.Duration {
-	if c.HeartbeatPeriod > 0 {
-		return c.HeartbeatPeriod
-	}
-	return 10 * time.Second
+	return orDefault(c.HeartbeatPeriod, 10*time.Second)
+}
+
+func (c *ObjectStorageConfig) claimInterval() time.Duration {
+	return orDefault(c.ClaimInterval, c.leaseTimeout()/2)
 }
 
 func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
-	if c.WaitPollInterval > 0 {
-		return c.WaitPollInterval
-	}
-	return 100 * time.Millisecond
+	return orDefault(c.WaitPollInterval, 100*time.Millisecond)
 }
 
 func (c *ObjectStorageConfig) waitPollMaxInterval() time.Duration {
-	if c.WaitPollMaxInterval > 0 {
-		return c.WaitPollMaxInterval
-	}
-	return 2 * time.Second
+	return orDefault(c.WaitPollMaxInterval, 2*time.Second)
 }
 
 // objectStore implements the Store interface over S3-compatible object storage.
@@ -81,20 +85,35 @@ type objectStore struct {
 	client *s3.Client
 	cfg    *ObjectStorageConfig
 
-	// finished records terminal outcomes of runs this process completed, preserving typed run
-	// errors for same-process waiters. It is a bounded convenience, not state: absence just
-	// means WaitRun consults the manifest, whose recorded error string is the durable outcome.
-	// finishing tracks runs mid-appendFinish here so WaitRun releases waiters only after the
-	// finish cleanup (lock delete, history write) lands, matching the pre-terminal-manifest
-	// visibility BoltDB waiters get.
-	finishedMu sync.Mutex
-	finished   map[ulid.ULID]RunErr
-	finishing  map[ulid.ULID]struct{}
+	// nodeID identifies this node in run manifests for lease ownership. It must be unique per
+	// process: a zombie sharing a NodeID is still fenced by the lease epoch.
+	nodeID string
+
+	// leases tracks this node's claim on each run: mid-claim (reserved, so concurrent
+	// same-store claimers cannot both win) or held at the epoch that every run-mutating
+	// manifest CAS re-verifies. Any loss — a fence tripped in Append, a steal discovered at
+	// heartbeat, a release — just drops the entry; the coordinate loop cancels local runs by
+	// sweeping for executing runs that no longer hold a lease.
+	leaseMu sync.Mutex
+	leases  map[ulid.ULID]lease
+
+	// finishes records this process's knowledge of run finishes, preserving typed run errors
+	// for same-process waiters and holding their release until the finish cleanup (lock
+	// delete, history write) lands — the visibility BoltDB waiters get. An entry is created
+	// when appendFinish begins, overwritten with the outcome when it completes, and removed if
+	// the finish fails; absence means the manifest is all there is. It is a bounded
+	// convenience, not state: evicted waiters fall back to the manifest's recorded error.
+	finishMu sync.Mutex
+	finishes map[ulid.ULID]runFinish
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
+	}
+	if nodeID == "" {
+		host, _ := os.Hostname()
+		nodeID = host + "-" + ulid.Make().String()
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -112,11 +131,12 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	})
 
 	return &objectStore{
-		logger:    logger,
-		client:    client,
-		cfg:       cfg,
-		finished:  map[ulid.ULID]RunErr{},
-		finishing: map[ulid.ULID]struct{}{},
+		logger:   logger.WithField("node_id", nodeID),
+		client:   client,
+		cfg:      cfg,
+		nodeID:   nodeID,
+		leases:   map[ulid.ULID]lease{},
+		finishes: map[ulid.ULID]runFinish{},
 	}, nil
 }
 
@@ -220,24 +240,26 @@ const maxConditionalRetries = 5
 
 var errEtagMismatch = errors.New("precondition failed: etag mismatch")
 
+// expBackoff builds the exponential backoff shared by the store's retry loops: bounded by the
+// caller's wrapper (max retries) or context, never wall-clock.
+func expBackoff(initial, max time.Duration) *backoff.ExponentialBackOff {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = initial
+	b.MaxInterval = max
+	b.MaxElapsedTime = 0
+	return b
+}
+
 // retryBackoff returns a context-bound exponential backoff capped at maxRetries, used for the
 // transient 409 conflicts and manifest CAS contention that conditional writes hit.
 func retryBackoff(ctx context.Context, maxRetries uint64) backoff.BackOff {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = 50 * time.Millisecond
-	b.MaxInterval = 2 * time.Second
-	b.MaxElapsedTime = 0 // bounded by maxRetries (and ctx), not wall-clock
-	return backoff.WithContext(backoff.WithMaxRetries(b, maxRetries), ctx)
+	return backoff.WithContext(backoff.WithMaxRetries(expBackoff(50*time.Millisecond, 2*time.Second), maxRetries), ctx)
 }
 
 // waitBackoff returns the backoff pacing WaitRun's manifest polls: bounded only by ctx, so a
 // wait outlives any fixed retry budget.
 func (s *objectStore) waitBackoff(ctx context.Context) backoff.BackOff {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = s.cfg.waitPollInterval()
-	b.MaxInterval = s.cfg.waitPollMaxInterval()
-	b.MaxElapsedTime = 0
-	return backoff.WithContext(b, ctx)
+	return backoff.WithContext(expBackoff(s.cfg.waitPollInterval(), s.cfg.waitPollMaxInterval()), ctx)
 }
 
 // putConditional issues a conditional PutObject — set applies the condition header — and retries

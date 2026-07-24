@@ -36,6 +36,9 @@ type Manager struct {
 
 	store Store
 
+	// lc is non-nil when store coordinates run ownership via leases.
+	lc leaseCoordinator
+
 	fsms map[fsmKey]*fsm
 
 	queues map[string]*queuedRunner
@@ -72,13 +75,11 @@ type Config struct {
 	// value is the maximum number of FSMs that can run concurrently.
 	Queues map[string]int
 
-	// NodeID is a unique identifier for this node. Used by the object storage backend's cluster
-	// coordination (Phase 4 of the object storage RFC); ignored for BoltDB.
+	// NodeID uniquely identifies this node in the object storage backend's run leases, for
+	// fencing and observability. It is an identity, never a network address; no component
+	// needs a routable address for any other. Defaults to "<hostname>-<ulid>". Ignored for
+	// BoltDB.
 	NodeID string
-
-	// NodeAddr is the address reachable by other nodes for cancel RPC. Used by the object
-	// storage backend's cluster coordination (Phase 4); ignored for BoltDB.
-	NodeAddr string
 }
 
 // New creates a new FSM manager to register and run FSMs.
@@ -131,12 +132,23 @@ func New(cfg Config) (*Manager, error) {
 	if socket == "" && cfg.DBPath != "" {
 		socket = filepath.Join(cfg.DBPath, "fsm.sock")
 	}
-	if socket == "" {
+	switch {
+	case socket == "":
 		man.logger.Info("no admin socket path configured, admin service disabled")
-		return man, nil
+	default:
+		if err := man.serveAdmin(socket); err != nil {
+			return nil, err
+		}
 	}
-	if err := man.serveAdmin(socket); err != nil {
-		return nil, err
+
+	// Started after the last fallible step, so a failed New leaks no coordination goroutine.
+	if lc, ok := store.(leaseCoordinator); ok {
+		man.lc = lc
+		man.wg.Add(1)
+		go func() {
+			defer man.wg.Done()
+			man.coordinate(lc)
+		}()
 	}
 
 	return man, nil
@@ -146,7 +158,7 @@ func New(cfg Config) (*Manager, error) {
 // ObjectStorage is set; the caller validates that.
 func newBackend(cfg Config, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
 	if cfg.ObjectStorage != nil {
-		return newObjectStore(context.Background(), logger, cfg.ObjectStorage)
+		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID)
 	}
 	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)
@@ -237,17 +249,30 @@ func (m *Manager) Active(ctx context.Context, id string) (ActiveSet, error) {
 	return active, nil
 }
 
+// registeredFSMs returns a snapshot of the registered FSMs; the claim loop and queries read
+// the registry concurrently with registration.
+func (m *Manager) registeredFSMs() []*fsm {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	fsms := make([]*fsm, 0, len(m.fsms))
+	for _, f := range m.fsms {
+		fsms = append(fsms, f)
+	}
+	return fsms
+}
+
 // registeredTypes returns the distinct resource type names registered with this manager. A
 // type's runs are the same regardless of which action registered it.
 func (m *Manager) registeredTypes() []string {
 	seen := map[string]struct{}{}
-	types := make([]string, 0, len(m.fsms))
-	for fk := range m.fsms {
-		if _, ok := seen[fk.name]; ok {
+	var types []string
+	for _, f := range m.registeredFSMs() {
+		if _, ok := seen[f.typeName]; ok {
 			continue
 		}
-		seen[fk.name] = struct{}{}
-		types = append(types, fk.name)
+		seen[f.typeName] = struct{}{}
+		types = append(types, f.typeName)
 	}
 	return types
 }
@@ -295,6 +320,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 
 	// Manifests don't record the resource alias, so the object backend returns runs without
 	// one; restore it from the registered FSM.
+	m.mu.RLock()
 	for i, child := range children {
 		f, ok := m.fsms[fsmKey{name: child.TypeName, action: child.Action}]
 		if !ok {
@@ -302,6 +328,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 		}
 		children[i].ResourceName = f.alias
 	}
+	m.mu.RUnlock()
 
 	return children, nil
 }
@@ -309,15 +336,23 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 // Cancel sends a cancel signal to the FSM should it exist. It does not block until the FSM has
 // completed so callers should use Wait to ensure the FSM has stopped, if needed.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
-	m.mu.RLock()
-	f, ok := m.running[version]
-	m.mu.RUnlock()
-	if !ok {
+	if !m.cancelRunning(version, errors.New(cause)) {
 		return ErrFsmNotFound
 	}
-
-	f(errors.New(cause))
 	return nil
+}
+
+// cancelRunning cancels the run's local context with the given cause, reporting whether a
+// running context was found.
+func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
+	m.mu.RLock()
+	cancel, ok := m.running[version]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	cancel(cause)
+	return true
 }
 
 // Wait blocks until the run with the given version completes.
