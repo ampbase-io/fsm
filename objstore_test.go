@@ -30,6 +30,10 @@ type fakeS3 struct {
 	// conflicts is the number of conditional PUTs to reject with 409 before accepting.
 	conflicts int
 
+	// lostPuts is the number of conditional PUTs to apply but answer with 409, simulating a
+	// write that succeeds server-side while its response is lost.
+	lostPuts int
+
 	puts               int
 	consistentReads    int
 	nonConsistentReads int
@@ -76,6 +80,11 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 			body, _ := io.ReadAll(r.Body)
 			f.objects[key] = body
 			f.revs[key]++
+			if conditional && f.lostPuts > 0 {
+				f.lostPuts--
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			w.Header().Set("ETag", f.etag(key))
 			w.WriteHeader(http.StatusOK)
 

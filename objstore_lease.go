@@ -138,7 +138,8 @@ func (s *objectStore) extendLeases(ctx context.Context) {
 // claimable reports the manifest-side claim conditions: the run is non-terminal and either
 // unowned, left over from a previous incarnation of this node (the epoch bump fences the
 // zombie), or past its lease expiry. Expiry uses the local clock as a liveness heuristic
-// only; correctness rests on the epoch CAS.
+// only; correctness rests on the epoch CAS. Takeover is immediate at expiry — no grace
+// period; the epoch fences the stale owner (see the RFC's no-grace-period trade-off note).
 func (s *objectStore) claimable(m *fsmv1.RunManifest, now time.Time) bool {
 	if manifestTerminal(m) {
 		return false

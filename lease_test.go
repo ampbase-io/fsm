@@ -19,13 +19,14 @@ type leaseHarness struct {
 	t      *testing.T
 	bucket string
 	url    string
+	fake   *fakeS3
 }
 
 func newLeaseHarness(t *testing.T) *leaseHarness {
 	t.Helper()
 
-	bucket, url, _ := startFakeS3(t)
-	return &leaseHarness{t: t, bucket: bucket, url: url}
+	bucket, url, fake := startFakeS3(t)
+	return &leaseHarness{t: t, bucket: bucket, url: url, fake: fake}
 }
 
 func mustManifest(t *testing.T, s *objectStore, version ulid.ULID) *fsmv1.RunManifest {
@@ -348,6 +349,38 @@ func TestClaimRaceSameStore(t *testing.T) {
 	}
 	if epoch := mustManifest(t, b, run.StartVersion).GetLeaseEpoch(); epoch != 2 {
 		t.Fatalf("expected a single epoch bump to 2, got %d", epoch)
+	}
+}
+
+// TestClaimSurvivesLostResponse covers the lost-200 replay on the claim path: the claim's
+// manifest CAS succeeds server-side but its response is lost, so the retry re-reads its own
+// half-acknowledged claim (owner == self, which claimable accepts) and bumps the epoch again.
+// The double bump is harmless only if nothing retains the older epoch — the tracked lease
+// must match the manifest as written, and the claimer must not fence itself.
+func TestClaimSurvivesLostResponse(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 50*time.Millisecond)
+	run := startRun(t, a, "lost-1")
+	time.Sleep(120 * time.Millisecond)
+
+	b := h.store("node-b", 10*time.Second)
+	h.fake.lostPuts = 1 // the next conditional PUT is b's claim CAS
+	claimed, err := b.claimRuns(ctx, []*fsm{deployFSM})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("expected the claim to survive a lost response, got %v (err=%v)", claimed, err)
+	}
+
+	manifest := mustManifest(t, b, run.StartVersion)
+	if got := manifest.GetLeaseEpoch(); got != 3 {
+		t.Fatalf("expected the lost response to double-bump the epoch to 3, got %d", got)
+	}
+	if epoch, ok := b.ownedEpoch(run.StartVersion); !ok || epoch != manifest.GetLeaseEpoch() {
+		t.Fatalf("expected the tracked epoch to match the manifest's %d, got %d (tracked=%v)", manifest.GetLeaseEpoch(), epoch, ok)
+	}
+	// The claimer's next write must pass its own fence.
+	if err := appendComplete(b, run); err != nil {
+		t.Fatalf("claimer fenced itself after a lost claim response: %v", err)
 	}
 }
 
