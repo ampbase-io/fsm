@@ -10,15 +10,6 @@ permissions:
   contents: read
   security-events: write
   packages: read
-env:
-  # Default setup fails on this repo: its runner pins GOTOOLCHAIN=local with a
-  # stable Go, and go.mod requires 1.27rc1 — autobuild dies with "go.mod
-  # requires go >= 1.27rc1 (running go 1.26.x; GOTOOLCHAIN=local)". This
-  # advanced setup installs a stable Go and lets GOTOOLCHAIN=auto fetch the
-  # exact toolchain go.mod names before CodeQL's autobuild runs. Repo default
-  # setup must be disabled in Settings → Code security for these uploads to be
-  # accepted.
-  GOTOOLCHAIN: auto
 jobs:
   analyze:
     name: Analyze (go)
@@ -28,6 +19,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+      - name: Allow go.mod's RC toolchain
+        # Default setup fails on this repo: its runner pins GOTOOLCHAIN=local
+        # with a stable Go, and go.mod requires 1.27rc1 — autobuild dies with
+        # "go.mod requires go >= 1.27rc1". This advanced setup lets the go
+        # command fetch the exact toolchain go.mod names before CodeQL's
+        # autobuild runs. setup-go exports GOTOOLCHAIN=local, so auto must be
+        # re-exported after it. Repo default setup must be disabled in
+        # Settings → Code security for these uploads to be accepted.
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
       - uses: github/codeql-action/init@v4
         with:
           languages: go
