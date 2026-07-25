@@ -465,14 +465,9 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
-		// The FINISH event carries the run's final response (for a successful run), marshaled
-		// after finalizers ran, so the terminal manifest supplies the same post-finalizer result
-		// the history record does — race-free the moment WaitRun observes completion, cross-node
-		// included. Guarded like appendMidRun: a run driven terminal before it executed
-		// (cancelOwnedRun) carries no response and must not clear a prior transition's result.
-		if event.GetResponse() != nil {
-			m.LatestResponse = event.GetResponse()
-		}
+		// LatestResponse is not set here: the last transition's COMPLETE already materialized it
+		// (appendMidRun), so RunResult reads it from the terminal manifest, race-free and
+		// cross-node. The FINISH event still carries that same response for the history record.
 		if run.fsmErr.Err != nil {
 			m.Error = run.fsmErr.Err.Error()
 			m.ErrorState = run.fsmErr.State
@@ -994,15 +989,15 @@ func (s *objectStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1
 // LatestResponse the last completed transition materialized — durable and cross-node the moment
 // WaitRun returns. A manifest already archived away falls back to the history record.
 func (s *objectStore) RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error) {
-	manifest, _, err := s.getManifest(ctx, runVersion)
-	if errors.Is(err, ErrFsmNotFound) {
+	switch manifest, _, err := s.getManifest(ctx, runVersion); {
+	case errors.Is(err, ErrFsmNotFound):
 		// Manifest archived away: the history record holds the same finish response.
 		return responseFromHistory(s.History(ctx, runVersion))
-	}
-	if err != nil {
+	case err != nil:
 		return nil, err
+	default:
+		return manifest.GetLatestResponse(), nil
 	}
-	return manifest.GetLatestResponse(), nil
 }
 
 // Children is implemented by the children/ prefix listing.

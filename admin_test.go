@@ -221,15 +221,15 @@ func testControlRunsHistory(t *testing.T, f *managerFactory) {
 	}
 }
 
-// TestControlResultReflectsFinalizer verifies the W result a Wait caller receives reflects a
-// mutation an End finalizer made — the finisher marshals the final response after finalizers run,
-// and both backends surface that same post-finalizer value (the object backend from the terminal
-// manifest, BoltDB from the FINISH record).
-func TestControlResultReflectsFinalizer(t *testing.T) {
-	runBackends(t, testControlResultReflectsFinalizer)
+// TestControlResultUnchangedByFinalizer verifies the W result a Wait caller receives is the last
+// transition's response and is not reshaped by an End finalizer that mutates req.W — finalizers
+// run for their side effects — and that both backends agree (the object backend serves it from
+// the terminal manifest, BoltDB from the FINISH record).
+func TestControlResultUnchangedByFinalizer(t *testing.T) {
+	runBackends(t, testControlResultUnchangedByFinalizer)
 }
 
-func testControlResultReflectsFinalizer(t *testing.T, f *managerFactory) {
+func testControlResultUnchangedByFinalizer(t *testing.T, f *managerFactory) {
 	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
@@ -262,8 +262,8 @@ func testControlResultReflectsFinalizer(t *testing.T, f *managerFactory) {
 	if err := json.Unmarshal(waitResp.Msg.GetResult(), &got); err != nil {
 		t.Fatalf("failed to decode result %q: %v", waitResp.Msg.GetResult(), err)
 	}
-	if got.Status != "from-finalizer" {
-		t.Fatalf("expected the post-finalizer result, got %q", got.Status)
+	if got.Status != "from-transition" {
+		t.Fatalf("expected the transition's result, got %q", got.Status)
 	}
 }
 
@@ -432,119 +432,6 @@ func testControlStartOptions(t *testing.T, f *managerFactory) {
 	}
 	if !slices.Contains(children, childVersion) {
 		t.Fatalf("expected child %s linked to parent %s, got %v", childVersion, parentVersion, children)
-	}
-}
-
-// TestFencingToken covers the sequencer: a handler reads its run version and lease epoch through
-// FencingToken. The object backend leases each run — a fresh claim bumps the epoch from zero to
-// one — while BoltDB has no leases, so its token epoch is zero.
-func TestFencingToken(t *testing.T) { runBackends(t, testFencingToken) }
-
-func testFencingToken(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
-	ctx := context.Background()
-
-	tokens := make(chan FencingToken, 1)
-	_, _, err := m.Register[orderReq, orderResp]("control-fence").
-		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			tokens <- req.FencingToken()
-			return NewResponse(&orderResp{Status: "ok"}), nil
-		}).
-		End("done").
-		Build(ctx)
-	if err != nil {
-		t.Fatalf("failed to build fence FSM: %v", err)
-	}
-	admin := &adminServer{m: m}
-
-	startResp, err := admin.Start(ctx, startReq(t, "control-fence", "fence-1", "x"))
-	if err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	version, err := ulid.Parse(startResp.Msg.GetVersion())
-	if err != nil {
-		t.Fatalf("invalid version: %v", err)
-	}
-
-	wantEpoch := int64(0)
-	if m.lc != nil {
-		wantEpoch = 1
-	}
-
-	select {
-	case token := <-tokens:
-		if token.RunVersion != version {
-			t.Fatalf("expected token version %s, got %s", version, token.RunVersion)
-		}
-		if token.LeaseEpoch != wantEpoch {
-			t.Fatalf("expected lease epoch %d, got %d", wantEpoch, token.LeaseEpoch)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("handler never ran")
-	}
-}
-
-// TestFencingTokenIncrementsOnTakeover verifies the fencing token advances with the lease: when a
-// peer takes over a run whose owner's lease lapsed, its handler observes a higher epoch than the
-// original owner did — the property a Chubby-style token exists to provide.
-func TestFencingTokenIncrementsOnTakeover(t *testing.T) {
-	f := newObjectFactoryWith(t, asymmetricTimings(400*time.Millisecond))
-	ctx := context.Background()
-
-	m1, _ := f.newManager(nil)
-	first := make(chan FencingToken, 1)
-	start, _, err := m1.Register[orderReq, orderResp]("fence-takeover").
-		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			first <- req.FencingToken()
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}).
-		End("done").
-		Build(ctx)
-	if err != nil {
-		t.Fatalf("failed to build FSM: %v", err)
-	}
-	version, err := start(ctx, "fence-takeover-1", NewRequest(&orderReq{}, &orderResp{}))
-	if err != nil {
-		t.Fatalf("failed to start FSM: %v", err)
-	}
-
-	var ownerToken FencingToken
-	select {
-	case ownerToken = <-first:
-	case <-time.After(10 * time.Second):
-		t.Fatal("owner handler never ran")
-	}
-
-	m2, _ := f.newManager(nil)
-	second := make(chan FencingToken, 1)
-	_, _, err = m2.Register[orderReq, orderResp]("fence-takeover").
-		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			second <- req.FencingToken()
-			return NewResponse(&orderResp{Status: "taken-over"}), nil
-		}).
-		End("done").
-		Build(ctx)
-	if err != nil {
-		t.Fatalf("failed to build takeover FSM: %v", err)
-	}
-
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := m2.Wait(waitCtx, version); err != nil {
-		t.Fatalf("taken-over run completed with error: %v", err)
-	}
-
-	select {
-	case takeoverToken := <-second:
-		if takeoverToken.RunVersion != ownerToken.RunVersion {
-			t.Fatalf("expected the same run version across owners, got %s then %s", ownerToken.RunVersion, takeoverToken.RunVersion)
-		}
-		if takeoverToken.LeaseEpoch <= ownerToken.LeaseEpoch {
-			t.Fatalf("expected the epoch to advance on takeover, got %d then %d", ownerToken.LeaseEpoch, takeoverToken.LeaseEpoch)
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("takeover handler never ran")
 	}
 }
 

@@ -51,6 +51,11 @@ type Request[R, W any] struct {
 	// leaseEpoch is the epoch this node holds the run's lease at, surfaced to handlers through
 	// FencingToken. Zero under a single-process backend, which has no leases.
 	leaseEpoch int64
+
+	// response is the last transition's marshaled W, stashed by the canceller (which already
+	// holds the codec) so the finisher can record it in the terminal record without a codec of
+	// its own.
+	response []byte
 }
 
 func (r *Request[_, _]) Any() any {
@@ -104,6 +109,10 @@ func (r *Request[_, _]) withLeaseEpoch(epoch int64) {
 	r.leaseEpoch = epoch
 }
 
+func (r *Request[_, _]) setResponse(b []byte) {
+	r.response = b
+}
+
 // NewRequest creates a new request to be used for starting a FSM.
 func NewRequest[R, W any](msg *R, w *W) *Request[R, W] {
 	return &Request[R, W]{
@@ -126,6 +135,8 @@ type AnyRequest interface {
 	withError(RunErr)
 
 	withLeaseEpoch(int64)
+
+	setResponse([]byte)
 }
 
 // MockRequest takes an fsm request and customizes it with logger and run

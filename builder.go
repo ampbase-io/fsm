@@ -262,7 +262,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		finalizers = append(finalizers, newFinalizer(f))
 	}
 
-	s.f.registeredTransitions[tk] = newTransition(name, s.m.finisher[R, W](s.f.wCodec, finalizers), cfg)
+	s.f.registeredTransitions[tk] = newTransition(name, s.m.finisher[R, W](finalizers), cfg)
 	s.f.transitions = s.f.transitions.Append(name)
 	s.f.endState = name
 	s.f.resumeOne = s.m.resumeOne[R, W](s.f)

@@ -37,7 +37,7 @@ var (
 	)
 )
 
-func (m *Manager) finisher[R, W any](codec Codec, finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
+func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
 	return func(ctx context.Context, req *Request[R, W]) (*Response[W], error) {
 		logger := req.Log()
 		run := req.Run()
@@ -47,19 +47,14 @@ func (m *Manager) finisher[R, W any](codec Codec, finalizers []FinalizerFunc) fu
 			f(ctx, req, run.fsmErr)
 		}
 
-		// Carry the run's final response into the terminal record so History and the RPC Wait
-		// reply return the W result without re-reading transition events. Only a successful run
-		// has a meaningful result — a halted run's W is not one (the caller reads the error), and
-		// recording it would overwrite a partial result with a zero value. The marshal runs after
-		// finalizers, so it captures a finalizer's mutation of req.W; a marshal failure is not
-		// fatal — the run already completed, the caller simply gets no result payload.
+		// Carry the run's final response — the last transition's, marshaled once by the canceller —
+		// into the terminal record so History and the RPC Wait reply return the W result without a
+		// codec here or a re-read of transition events. Only a successful run has a meaningful
+		// result; a halted run's is its error. Finalizers run for their side effects and do not
+		// reshape the result.
 		event := finishEvent(run, run.CurrentState)
 		if run.fsmErr.Err == nil {
-			result, err := codec.Marshal(req.W.Any())
-			if err != nil {
-				logger.WithError(err).Warn("failed to marshal run result")
-			}
-			event.Response = result
+			event.Response = req.response
 		}
 
 		if _, err := m.store.Append(ctx, run, event, run.Queue); err != nil {
@@ -128,6 +123,9 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 						return nil, err
 					}
 					event.Response = b
+					// Stash the marshaled response so the finisher can record the run's final
+					// result in the terminal record without holding a codec of its own.
+					req.setResponse(b)
 				}
 			}
 
