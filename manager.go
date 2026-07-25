@@ -137,15 +137,21 @@ func New(cfg Config) (*Manager, error) {
 		running:    map[ulid.ULID]context.CancelCauseFunc{},
 	}
 
-	for name, size := range cfg.Queues {
-		q := &queuedRunner{
-			name:   name,
-			size:   size,
-			queue:  make(chan queueItem),
-			queued: make([]func(), 0, size),
+	// The in-process queuedRunner enforces a queue's limit per process — correct for BoltDB, where
+	// one process is the whole cluster. The object backend enforces queues cluster-wide through the
+	// claim loop's admission (objstore_queue.go) and never routes through these runners, so it
+	// starts none (they would otherwise be idle goroutines).
+	if _, distributed := store.(leaseCoordinator); !distributed {
+		for name, size := range cfg.Queues {
+			q := &queuedRunner{
+				name:   name,
+				size:   size,
+				queue:  make(chan queueItem),
+				queued: make([]func(), 0, size),
+			}
+			man.queues[name] = q
+			go q.run(done, cfg.Logger.WithField("queue", name))
 		}
-		man.queues[name] = q
-		go q.run(done, cfg.Logger.WithField("queue", name))
 	}
 
 	socket := cfg.AdminSocketPath
@@ -178,7 +184,7 @@ func New(cfg Config) (*Manager, error) {
 // ObjectStorage is set; the caller validates that.
 func newBackend(cfg Config, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
 	if cfg.ObjectStorage != nil {
-		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus)
+		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus, cfg.Queues)
 	}
 	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)

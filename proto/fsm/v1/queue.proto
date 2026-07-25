@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package fsm.v1;
+
+// QueueFile is the per-queue coordination object for the object storage backend's cluster-wide
+// concurrency-limited queues (key `queues/<queue_name>`). It is the shared, CAS-serialized view
+// of a queue's admitted (in-flight) runs: a node admits a queued run by CAS-appending a QueueJob
+// iff the roster is below capacity, and removes it on FINISH. Pending queued runs are NOT recorded
+// here — they live under the `locks/` prefix and are admitted by the claim loop when a slot frees.
+message QueueFile {
+  // capacity is the maximum number of concurrently executing runs for this queue, cluster-wide.
+  // Seeded from configuration by the node that first creates the object; authoritative thereafter.
+  int32 capacity = 1;
+
+  // jobs is the roster of currently admitted runs — one entry per in-flight run. len(jobs) is the
+  // queue's in-flight count; admission requires len(jobs) < capacity.
+  repeated QueueJob jobs = 2;
+}
+
+// QueueJob is a single admitted run's slot in a queue roster.
+message QueueJob {
+  bytes run_version = 1;
+
+  // owner_node is the node identity that admitted and owns this slot. It mirrors the run
+  // manifest's lease owner; it is a node identity, never a network address.
+  string owner_node = 2;
+
+  // heartbeat is Unix milliseconds, refreshed by the owner's lease heartbeat. A job whose
+  // heartbeat is older than the lease timeout is stale and its slot is reclaimed.
+  int64 heartbeat = 3;
+}

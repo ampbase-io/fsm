@@ -519,6 +519,20 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 		runVersion := ulid.Make()
 
+		// On the object backend a queued run is admission-controlled cluster-wide, so it is
+		// persisted unowned and the claim loop admits and executes it — exactly the RPC ingress
+		// path. Executing it locally here would bypass the shared capacity limit (this node would
+		// admit up to `size` of its own). Delayed/run-after runs are not admission-controlled and
+		// keep executing locally (matching runnerFromOpts precedence).
+		if m.lc != nil && admissionControlled(&startOpt) {
+			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+				logger.WithError(err).Error("failed to append start event")
+				return ulid.ULID{}, err
+			}
+			m.nudgeClaim()
+			return runVersion, nil
+		}
+
 		ctx = withRestart(ctx, false)
 
 		r := runnerFromOpts(&startOpt, m)
@@ -812,6 +826,13 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	go func() {
 		defer m.wg.Done()
 		r.Run(ctx, logger, ack, runFn)
+		// A finished queued run on the object backend frees a roster slot; wake the local claim
+		// loop so the next pending run is admitted at once instead of on the periodic pass. This
+		// is the no-bus path — a live bus additionally gets the subjectPending publish from the
+		// store's finish cleanup.
+		if m.lc != nil && run.Queue != "" {
+			m.nudgeClaim()
+		}
 	}()
 
 	<-ack

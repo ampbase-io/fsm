@@ -20,6 +20,20 @@ func (r runnerFn) Run(ctx context.Context, logger logrus.FieldLogger, ack chan s
 	r(ctx, logger, fn)
 }
 
+// queueGated reports whether a run passes through a queue's shared, cluster-wide capacity limit: a
+// queue is set and neither a delay nor a run-after dependency takes precedence over it. It is the
+// single home for the precedence runnerFromOpts encodes as switch order; admissionControlled and
+// admissionQueue (objstore_store.go) classify their own representation of a run through it.
+func queueGated(queue string, delayed, hasRunAfter bool) bool {
+	return queue != "" && !delayed && !hasRunAfter
+}
+
+// admissionControlled reports whether a run to be started would execute through a queue's shared
+// capacity limit, from its start options.
+func admissionControlled(opts *startOptions) bool {
+	return queueGated(opts.queue, !opts.until.IsZero(), opts.runAfter.Compare(ulid.ULID{}) != 0)
+}
+
 func runnerFromOpts(opts *startOptions, m *Manager) runner {
 	switch {
 	case !opts.until.IsZero():
@@ -27,6 +41,12 @@ func runnerFromOpts(opts *startOptions, m *Manager) runner {
 	case opts.runAfter.Compare(ulid.ULID{}) != 0:
 		return runAfter(m, opts.runAfter)
 	case opts.queue != "":
+		if m.lc != nil {
+			// Object backend: the queue's cluster-wide capacity was already enforced when the claim
+			// loop admitted this run, so it executes directly. The in-process queuedRunner would
+			// re-limit per node (the N×size bug) — it is bolt-only.
+			return defaultRunner()
+		}
 		q, ok := m.queues[opts.queue]
 		if !ok {
 			m.logger.WithField("queue", opts.queue).Warn("queue not found, using default runner")
