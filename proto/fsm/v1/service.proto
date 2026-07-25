@@ -5,10 +5,24 @@ package fsm.v1;
 import "fsm/v1/fsm.proto";
 import "fsm/v1/event.proto";
 
+// FSMService is the worker-hosted control API. Requesting clients hold only these generated
+// definitions — not the Go R/W request/response types, nor the fsm library — and reach a worker
+// that embeds the Manager and owns object-storage credentials (the worker-owns-all topology).
 service FSMService {
   rpc ListRegistered(ListRegisteredRequest) returns (ListRegisteredResponse) {}
   rpc ListActive(ListActiveRequest) returns (ListActiveResponse) {}
-  rpc GetHistoryEvent(GetHistoryEventRequest) returns (HistoryEvent) {}
+
+  // Start durably submits a run and returns its version once persisted (persist-then-ack). The
+  // resource is opaque bytes the worker decodes with the FSM's registered request codec.
+  rpc Start(StartRequest) returns (StartResponse) {}
+  // Wait blocks until the run reaches a terminal state, returning its outcome and W result.
+  rpc Wait(WaitRequest) returns (WaitResponse) {}
+  // Cancel records a durable cancel for the run; the owning worker reacts.
+  rpc Cancel(CancelRequest) returns (CancelResponse) {}
+  // Runs lists the versions of every run recorded for a resource id, oldest first.
+  rpc Runs(RunsRequest) returns (RunsResponse) {}
+  // History returns the archived terminal record for a completed run.
+  rpc History(HistoryRequest) returns (HistoryEvent) {}
 }
 
 message ListRegisteredRequest {}
@@ -23,6 +37,55 @@ message ListActiveResponse {
   repeated fsm.v1.ActiveFSM active = 1;
 }
 
-message GetHistoryEventRequest {
+// StartOptions carries the optional start modifiers a client may set. Zero values mean "unset".
+message StartOptions {
+  int64 delay_until = 1;  // unix milliseconds; 0 = start as soon as claimed
+  string run_after = 2;   // run version to wait for; empty = none
+  string queue = 3;       // queue name; empty = default runner
+  string parent = 4;      // parent run version; empty = none
+}
+
+message StartRequest {
+  // type_name is the FSM's registered resource type. It may be omitted when action is
+  // unambiguous across the registered FSMs.
+  string type_name = 1;
+  string action = 2;
+  string id = 3;
+  bytes resource = 4;
+  StartOptions options = 5;
+}
+
+message StartResponse {
+  string version = 1;
+}
+
+message WaitRequest {
+  string version = 1;
+}
+
+message WaitResponse {
+  // Wait returns only once the run is terminal, so terminality is implicit; the outcome is the
+  // error (empty on success) and the result. There is no separate run-state field: it would be a
+  // constant.
+  string error = 1;   // run error, empty on success
+  bytes result = 2;   // marshaled W response; opaque, decoded by the client
+}
+
+message CancelRequest {
+  string version = 1;
+  string cause = 2;
+}
+
+message CancelResponse {}
+
+message RunsRequest {
+  string id = 1;
+}
+
+message RunsResponse {
+  repeated string versions = 1;
+}
+
+message HistoryRequest {
   string run_version = 1;
 }

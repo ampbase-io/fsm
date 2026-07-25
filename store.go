@@ -66,6 +66,10 @@ type Store interface {
 	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
 	// recorded error (nil on success, and nil for runs no longer known to the backend).
 	WaitRun(ctx context.Context, runVersion ulid.ULID) error
+	// RunResult returns the marshaled W response of a completed run, or nil when it recorded
+	// none. Safe to read the moment WaitRun returns: the object backend answers from the
+	// terminal manifest, the BoltDB backend from the record written at FINISH.
+	RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error)
 	// ListActive returns every incomplete run the backend knows about.
 	ListActive(ctx context.Context) ([]runState, error)
 
@@ -690,6 +694,11 @@ type appendOption struct {
 	parent []byte
 
 	start *startOption
+
+	// unowned records a START that must be persisted without a lease, so the claim loop
+	// distributes it across the worker pool rather than the accepting node executing it. Only
+	// the lease-coordinated object backend reads it; BoltDB has no leases and ignores it.
+	unowned bool
 }
 
 type startOption struct {
@@ -715,6 +724,16 @@ func withStartOption(resource []byte, transitions []string) appendOptionFunc {
 			resource:    resource,
 			transitions: transitions,
 		}
+		return nil
+	}
+}
+
+// withUnowned persists a START without leasing the run to this node, so any worker can claim it.
+// It is the ingress/execution split: the RPC Start persists the submission, the claim loop
+// executes it. Ignored by the BoltDB backend, which has no leases.
+func withUnowned() appendOptionFunc {
+	return func(opt *appendOption) error {
+		opt.unowned = true
 		return nil
 	}
 }
@@ -1014,6 +1033,27 @@ func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.H
 
 	})
 	return &historyEvent, err
+}
+
+// RunResult returns the run's marshaled response from the FINISH record, written into the
+// archive at completion so it is available as soon as WaitRun returns. A run with no recorded
+// history yields nil.
+func (s *boltStore) RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error) {
+	return responseFromHistory(s.History(ctx, runVersion))
+}
+
+// responseFromHistory extracts a run's marshaled response from its history record, mapping a
+// missing record to nil. It takes History's return pair directly so callers pipe straight
+// through.
+func responseFromHistory(he *fsmv1.HistoryEvent, err error) ([]byte, error) {
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	default:
+		return he.GetLastEvent().GetResponse(), nil
+	}
 }
 
 // Runs returns the versions of runs recorded for the resource by scanning the events bucket,

@@ -50,6 +50,12 @@ type Manager struct {
 
 	done chan struct{}
 
+	// claimNudge pulls a claim pass forward after an opaque Start persists an unowned run, so the
+	// accepting node participates in claiming it promptly even with no bus injected — the
+	// same-process counterpart of the bus pending event. Buffered and coalescing; nil-safe to
+	// signal because only the lease-coordinated coordinate loop drains it.
+	claimNudge chan struct{}
+
 	mu      sync.RWMutex
 	running map[ulid.ULID]context.CancelCauseFunc
 }
@@ -120,14 +126,15 @@ func New(cfg Config) (*Manager, error) {
 	done := make(chan struct{})
 
 	man := &Manager{
-		logger:  cfg.Logger.WithField("sys", "fsm"),
-		tracer:  tracer,
-		store:   store,
-		bus:     busOrNoop(cfg.EventBus),
-		fsms:    map[fsmKey]*fsm{},
-		queues:  make(map[string]*queuedRunner, len(cfg.Queues)),
-		done:    done,
-		running: map[ulid.ULID]context.CancelCauseFunc{},
+		logger:     cfg.Logger.WithField("sys", "fsm"),
+		tracer:     tracer,
+		store:      store,
+		bus:        busOrNoop(cfg.EventBus),
+		fsms:       map[fsmKey]*fsm{},
+		queues:     make(map[string]*queuedRunner, len(cfg.Queues)),
+		done:       done,
+		claimNudge: make(chan struct{}, 1),
+		running:    map[ulid.ULID]context.CancelCauseFunc{},
 	}
 
 	for name, size := range cfg.Queues {
@@ -423,4 +430,90 @@ func (m *Manager) resolveRun(ctx context.Context, id string) (ulid.ULID, error) 
 		}
 	}
 	return ulid.ULID{}, nil
+}
+
+// History returns the archived terminal record for a completed run.
+func (m *Manager) History(ctx context.Context, version ulid.ULID) (*fsmv1.HistoryEvent, error) {
+	return m.store.History(ctx, version)
+}
+
+// RunResult returns the marshaled W response of a completed run, or nil when the run recorded
+// none (an error before any transition produced a result). The bytes are opaque — a client
+// decodes them with the same response codec the FSM was registered with.
+func (m *Manager) RunResult(ctx context.Context, version ulid.ULID) ([]byte, error) {
+	return m.store.RunResult(ctx, version)
+}
+
+// startOpaque durably submits a run from an already-serialized request payload and returns its
+// version once persisted (persist-then-ack). The client holds only the proto contract, not the
+// Go R/W types, so this path never touches the typed request. On a lease-coordinated backend the
+// run is persisted unowned and the claim loop executes it — the ingress/execution split; on a
+// single-process backend, which has no claim loop, the accepting node runs it directly.
+func (m *Manager) startOpaque(ctx context.Context, typeName, action, id string, resource []byte, opts ...StartOptionsFn) (ulid.ULID, error) {
+	f, err := m.lookupFSM(typeName, action)
+	if err != nil {
+		return ulid.ULID{}, err
+	}
+
+	if m.lc == nil {
+		return f.startFromBytes(ctx, id, resource, opts...)
+	}
+
+	// Validate the payload against the request codec so a malformed submission fails here rather
+	// than persisting a run every claim pass will choke on.
+	if err := f.decodeResource(resource); err != nil {
+		return ulid.ULID{}, err
+	}
+
+	var startOpt startOptions
+	for _, opt := range opts {
+		opt(&startOpt)
+	}
+
+	runVersion := ulid.Make()
+	if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+		return ulid.ULID{}, err
+	}
+
+	m.nudgeClaim()
+	return runVersion, nil
+}
+
+// lookupFSM resolves the FSM an opaque Start names. A type disambiguates when the same action is
+// registered under more than one; omitting it is allowed only when the action is unique.
+func (m *Manager) lookupFSM(typeName, action string) (*fsm, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if typeName != "" {
+		f, ok := m.fsms[fsmKey{name: typeName, action: action}]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s/%s", errFSMNotRegistered, typeName, action)
+		}
+		return f, nil
+	}
+
+	var found *fsm
+	for key, f := range m.fsms {
+		if key.action != action {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("%w: %q", errAmbiguousAction, action)
+		}
+		found = f
+	}
+	if found == nil {
+		return nil, fmt.Errorf("%w: action %q", errFSMNotRegistered, action)
+	}
+	return found, nil
+}
+
+// nudgeClaim pulls a claim pass forward on the coordinate loop without waiting for the periodic
+// tick or a bus wakeup. Non-blocking and coalescing, matching the pending-event wakeup.
+func (m *Manager) nudgeClaim() {
+	select {
+	case m.claimNudge <- struct{}{}:
+	default:
+	}
 }

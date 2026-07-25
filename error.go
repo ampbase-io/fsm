@@ -13,6 +13,17 @@ var (
 	// ErrLeaseLost signals that this node no longer owns a run's lease. The run halts locally
 	// without recording FINISH; the new owner drives it to completion.
 	ErrLeaseLost = errors.New("run lease lost")
+
+	// errFSMNotRegistered reports that no FSM matches the (type, action) an opaque Start named.
+	errFSMNotRegistered = errors.New("no FSM registered")
+
+	// errAmbiguousAction reports that an opaque Start named an action without a type and more
+	// than one registered FSM shares that action.
+	errAmbiguousAction = errors.New("ambiguous action: specify a type")
+
+	// errInvalidResource reports that an opaque Start payload did not decode against the FSM's
+	// request codec.
+	errInvalidResource = errors.New("invalid resource payload")
 )
 
 type AlreadyRunningError struct {

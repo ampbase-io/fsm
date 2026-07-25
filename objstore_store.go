@@ -296,7 +296,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	if err != nil {
 		return err
 	}
-	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes); err != nil {
+	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, ao.unowned); err != nil {
 		return err
 	}
 
@@ -304,9 +304,21 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	return s.linkParent(ctx, ao.parent, run.StartVersion)
 }
 
-// startManifest materializes a new run's initial manifest, leased to this node from the
-// start: the starting worker executes the run immediately and heartbeats from the first tick.
+// startManifest materializes a new run's initial manifest. By default it is leased to this node
+// from the start — the embedded start executes the run immediately and heartbeats from the first
+// tick. An unowned START (the RPC ingress' persist-then-ack) leaves the lease empty so the claim
+// loop distributes the run across the worker pool; its epoch is bumped from zero on the first
+// claim.
 func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
+	ownerNode := s.nodeID
+	leaseExpiry := time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
+	leaseEpoch := int64(1)
+	if ao.unowned {
+		ownerNode = ""
+		leaseExpiry = 0
+		leaseEpoch = 0
+	}
+
 	manifest := &fsmv1.RunManifest{
 		Status:         fsmv1.RunState_RUN_STATE_PENDING,
 		ResourceType:   event.GetResourceType(),
@@ -322,9 +334,9 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 		Parent:         ao.parent,
 		DelayUntil:     ao.delayUntil,
 		RunAfter:       ao.runAfter,
-		OwnerNode:      s.nodeID,
-		LeaseExpiry:    time.Now().Add(s.cfg.leaseTimeout()).UnixMilli(),
-		LeaseEpoch:     1,
+		OwnerNode:      ownerNode,
+		LeaseExpiry:    leaseExpiry,
+		LeaseEpoch:     leaseEpoch,
 		TraceContext:   map[string]string{},
 		CreatedAt:      time.Now().Unix(),
 		UpdatedAt:      time.Now().Unix(),
@@ -334,12 +346,15 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 	return proto.Marshal(manifest)
 }
 
-// createRunManifest writes the run's initial manifest and tracks its lease. A manifest that
+// createRunManifest writes the run's initial manifest and tracks its lease. An unowned START
+// carries no lease, so nothing is tracked — the claim loop leases it on pickup. A manifest that
 // already exists belongs to a crashed earlier attempt of this same run and is adopted instead.
-func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifestBytes []byte) error {
+func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifestBytes []byte, unowned bool) error {
 	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
 	case err == nil:
-		s.trackLease(run.StartVersion, 1)
+		if !unowned {
+			s.trackLease(run.StartVersion, 1)
+		}
 		return nil
 	case errors.Is(err, errPreconditionFailed):
 		return s.adoptRunManifest(ctx, run, lockKey)
@@ -450,6 +465,10 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
+		// The FINISH event carries the run's final response, marshaled after finalizers ran, so
+		// the terminal manifest supplies the same post-finalizer result the history record does —
+		// race-free the moment WaitRun observes completion, cross-node included.
+		m.LatestResponse = event.GetResponse()
 		if run.fsmErr.Err != nil {
 			m.Error = run.fsmErr.Err.Error()
 			m.ErrorState = run.fsmErr.State
@@ -965,6 +984,21 @@ func (s *objectStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1
 		return nil, err
 	}
 	return history, nil
+}
+
+// RunResult returns the run's marshaled response. It reads the terminal manifest, whose
+// LatestResponse the last completed transition materialized — durable and cross-node the moment
+// WaitRun returns. A manifest already archived away falls back to the history record.
+func (s *objectStore) RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error) {
+	manifest, _, err := s.getManifest(ctx, runVersion)
+	if errors.Is(err, ErrFsmNotFound) {
+		// Manifest archived away: the history record holds the same finish response.
+		return responseFromHistory(s.History(ctx, runVersion))
+	}
+	if err != nil {
+		return nil, err
+	}
+	return manifest.GetLatestResponse(), nil
 }
 
 // Children is implemented by the children/ prefix listing.
