@@ -47,8 +47,17 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 			f(ctx, req, run.fsmErr)
 		}
 
-		_, err := m.store.Append(ctx, run, finishEvent(run, run.CurrentState), run.Queue)
-		if err != nil {
+		// Carry the run's final response — the last transition's, marshaled once by the canceller —
+		// into the terminal record so History and the RPC Wait reply return the W result without a
+		// codec here or a re-read of transition events. Only a successful run has a meaningful
+		// result; a halted run's is its error. Finalizers run for their side effects and do not
+		// reshape the result.
+		event := finishEvent(run, run.CurrentState)
+		if run.fsmErr.Err == nil {
+			event.Response = req.response
+		}
+
+		if _, err := m.store.Append(ctx, run, event, run.Queue); err != nil {
 			logger.WithError(err).Error("failed to append complete event")
 			return nil, err
 		}
@@ -114,6 +123,9 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 						return nil, err
 					}
 					event.Response = b
+					// Stash the marshaled response so the finisher can record the run's final
+					// result in the terminal record without holding a codec of its own.
+					req.setResponse(b)
 				}
 			}
 

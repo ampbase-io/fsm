@@ -266,6 +266,8 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	s.f.transitions = s.f.transitions.Append(name)
 	s.f.endState = name
 	s.f.resumeOne = s.m.resumeOne[R, W](s.f)
+	s.f.decodeResource = decodeResourceFn[R](s.f)
+	s.f.startFromBytes = s.m.startFromBytes[R, W](s.f)
 
 	s.m.fsms[fk] = s.f
 

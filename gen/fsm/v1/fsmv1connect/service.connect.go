@@ -38,16 +38,33 @@ const (
 	FSMServiceListRegisteredProcedure = "/fsm.v1.FSMService/ListRegistered"
 	// FSMServiceListActiveProcedure is the fully-qualified name of the FSMService's ListActive RPC.
 	FSMServiceListActiveProcedure = "/fsm.v1.FSMService/ListActive"
-	// FSMServiceGetHistoryEventProcedure is the fully-qualified name of the FSMService's
-	// GetHistoryEvent RPC.
-	FSMServiceGetHistoryEventProcedure = "/fsm.v1.FSMService/GetHistoryEvent"
+	// FSMServiceStartProcedure is the fully-qualified name of the FSMService's Start RPC.
+	FSMServiceStartProcedure = "/fsm.v1.FSMService/Start"
+	// FSMServiceWaitProcedure is the fully-qualified name of the FSMService's Wait RPC.
+	FSMServiceWaitProcedure = "/fsm.v1.FSMService/Wait"
+	// FSMServiceCancelProcedure is the fully-qualified name of the FSMService's Cancel RPC.
+	FSMServiceCancelProcedure = "/fsm.v1.FSMService/Cancel"
+	// FSMServiceRunsProcedure is the fully-qualified name of the FSMService's Runs RPC.
+	FSMServiceRunsProcedure = "/fsm.v1.FSMService/Runs"
+	// FSMServiceHistoryProcedure is the fully-qualified name of the FSMService's History RPC.
+	FSMServiceHistoryProcedure = "/fsm.v1.FSMService/History"
 )
 
 // FSMServiceClient is a client for the fsm.v1.FSMService service.
 type FSMServiceClient interface {
 	ListRegistered(context.Context, *connect.Request[v1.ListRegisteredRequest]) (*connect.Response[v1.ListRegisteredResponse], error)
 	ListActive(context.Context, *connect.Request[v1.ListActiveRequest]) (*connect.Response[v1.ListActiveResponse], error)
-	GetHistoryEvent(context.Context, *connect.Request[v1.GetHistoryEventRequest]) (*connect.Response[v1.HistoryEvent], error)
+	// Start durably submits a run and returns its version once persisted (persist-then-ack). The
+	// resource is opaque bytes the worker decodes with the FSM's registered request codec.
+	Start(context.Context, *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error)
+	// Wait blocks until the run reaches a terminal state, returning its outcome and W result.
+	Wait(context.Context, *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error)
+	// Cancel records a durable cancel for the run; the owning worker reacts.
+	Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error)
+	// Runs lists the versions of every run recorded for a resource id, oldest first.
+	Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error)
+	// History returns the archived terminal record for a completed run.
+	History(context.Context, *connect.Request[v1.HistoryRequest]) (*connect.Response[v1.HistoryEvent], error)
 }
 
 // NewFSMServiceClient constructs a client for the fsm.v1.FSMService service. By default, it uses
@@ -73,10 +90,34 @@ func NewFSMServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...
 			connect.WithSchema(fSMServiceMethods.ByName("ListActive")),
 			connect.WithClientOptions(opts...),
 		),
-		getHistoryEvent: connect.NewClient[v1.GetHistoryEventRequest, v1.HistoryEvent](
+		start: connect.NewClient[v1.StartRequest, v1.StartResponse](
 			httpClient,
-			baseURL+FSMServiceGetHistoryEventProcedure,
-			connect.WithSchema(fSMServiceMethods.ByName("GetHistoryEvent")),
+			baseURL+FSMServiceStartProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("Start")),
+			connect.WithClientOptions(opts...),
+		),
+		wait: connect.NewClient[v1.WaitRequest, v1.WaitResponse](
+			httpClient,
+			baseURL+FSMServiceWaitProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("Wait")),
+			connect.WithClientOptions(opts...),
+		),
+		cancel: connect.NewClient[v1.CancelRequest, v1.CancelResponse](
+			httpClient,
+			baseURL+FSMServiceCancelProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("Cancel")),
+			connect.WithClientOptions(opts...),
+		),
+		runs: connect.NewClient[v1.RunsRequest, v1.RunsResponse](
+			httpClient,
+			baseURL+FSMServiceRunsProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("Runs")),
+			connect.WithClientOptions(opts...),
+		),
+		history: connect.NewClient[v1.HistoryRequest, v1.HistoryEvent](
+			httpClient,
+			baseURL+FSMServiceHistoryProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("History")),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -84,9 +125,13 @@ func NewFSMServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...
 
 // fSMServiceClient implements FSMServiceClient.
 type fSMServiceClient struct {
-	listRegistered  *connect.Client[v1.ListRegisteredRequest, v1.ListRegisteredResponse]
-	listActive      *connect.Client[v1.ListActiveRequest, v1.ListActiveResponse]
-	getHistoryEvent *connect.Client[v1.GetHistoryEventRequest, v1.HistoryEvent]
+	listRegistered *connect.Client[v1.ListRegisteredRequest, v1.ListRegisteredResponse]
+	listActive     *connect.Client[v1.ListActiveRequest, v1.ListActiveResponse]
+	start          *connect.Client[v1.StartRequest, v1.StartResponse]
+	wait           *connect.Client[v1.WaitRequest, v1.WaitResponse]
+	cancel         *connect.Client[v1.CancelRequest, v1.CancelResponse]
+	runs           *connect.Client[v1.RunsRequest, v1.RunsResponse]
+	history        *connect.Client[v1.HistoryRequest, v1.HistoryEvent]
 }
 
 // ListRegistered calls fsm.v1.FSMService.ListRegistered.
@@ -99,16 +144,46 @@ func (c *fSMServiceClient) ListActive(ctx context.Context, req *connect.Request[
 	return c.listActive.CallUnary(ctx, req)
 }
 
-// GetHistoryEvent calls fsm.v1.FSMService.GetHistoryEvent.
-func (c *fSMServiceClient) GetHistoryEvent(ctx context.Context, req *connect.Request[v1.GetHistoryEventRequest]) (*connect.Response[v1.HistoryEvent], error) {
-	return c.getHistoryEvent.CallUnary(ctx, req)
+// Start calls fsm.v1.FSMService.Start.
+func (c *fSMServiceClient) Start(ctx context.Context, req *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error) {
+	return c.start.CallUnary(ctx, req)
+}
+
+// Wait calls fsm.v1.FSMService.Wait.
+func (c *fSMServiceClient) Wait(ctx context.Context, req *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error) {
+	return c.wait.CallUnary(ctx, req)
+}
+
+// Cancel calls fsm.v1.FSMService.Cancel.
+func (c *fSMServiceClient) Cancel(ctx context.Context, req *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error) {
+	return c.cancel.CallUnary(ctx, req)
+}
+
+// Runs calls fsm.v1.FSMService.Runs.
+func (c *fSMServiceClient) Runs(ctx context.Context, req *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error) {
+	return c.runs.CallUnary(ctx, req)
+}
+
+// History calls fsm.v1.FSMService.History.
+func (c *fSMServiceClient) History(ctx context.Context, req *connect.Request[v1.HistoryRequest]) (*connect.Response[v1.HistoryEvent], error) {
+	return c.history.CallUnary(ctx, req)
 }
 
 // FSMServiceHandler is an implementation of the fsm.v1.FSMService service.
 type FSMServiceHandler interface {
 	ListRegistered(context.Context, *connect.Request[v1.ListRegisteredRequest]) (*connect.Response[v1.ListRegisteredResponse], error)
 	ListActive(context.Context, *connect.Request[v1.ListActiveRequest]) (*connect.Response[v1.ListActiveResponse], error)
-	GetHistoryEvent(context.Context, *connect.Request[v1.GetHistoryEventRequest]) (*connect.Response[v1.HistoryEvent], error)
+	// Start durably submits a run and returns its version once persisted (persist-then-ack). The
+	// resource is opaque bytes the worker decodes with the FSM's registered request codec.
+	Start(context.Context, *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error)
+	// Wait blocks until the run reaches a terminal state, returning its outcome and W result.
+	Wait(context.Context, *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error)
+	// Cancel records a durable cancel for the run; the owning worker reacts.
+	Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error)
+	// Runs lists the versions of every run recorded for a resource id, oldest first.
+	Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error)
+	// History returns the archived terminal record for a completed run.
+	History(context.Context, *connect.Request[v1.HistoryRequest]) (*connect.Response[v1.HistoryEvent], error)
 }
 
 // NewFSMServiceHandler builds an HTTP handler from the service implementation. It returns the path
@@ -130,10 +205,34 @@ func NewFSMServiceHandler(svc FSMServiceHandler, opts ...connect.HandlerOption) 
 		connect.WithSchema(fSMServiceMethods.ByName("ListActive")),
 		connect.WithHandlerOptions(opts...),
 	)
-	fSMServiceGetHistoryEventHandler := connect.NewUnaryHandler(
-		FSMServiceGetHistoryEventProcedure,
-		svc.GetHistoryEvent,
-		connect.WithSchema(fSMServiceMethods.ByName("GetHistoryEvent")),
+	fSMServiceStartHandler := connect.NewUnaryHandler(
+		FSMServiceStartProcedure,
+		svc.Start,
+		connect.WithSchema(fSMServiceMethods.ByName("Start")),
+		connect.WithHandlerOptions(opts...),
+	)
+	fSMServiceWaitHandler := connect.NewUnaryHandler(
+		FSMServiceWaitProcedure,
+		svc.Wait,
+		connect.WithSchema(fSMServiceMethods.ByName("Wait")),
+		connect.WithHandlerOptions(opts...),
+	)
+	fSMServiceCancelHandler := connect.NewUnaryHandler(
+		FSMServiceCancelProcedure,
+		svc.Cancel,
+		connect.WithSchema(fSMServiceMethods.ByName("Cancel")),
+		connect.WithHandlerOptions(opts...),
+	)
+	fSMServiceRunsHandler := connect.NewUnaryHandler(
+		FSMServiceRunsProcedure,
+		svc.Runs,
+		connect.WithSchema(fSMServiceMethods.ByName("Runs")),
+		connect.WithHandlerOptions(opts...),
+	)
+	fSMServiceHistoryHandler := connect.NewUnaryHandler(
+		FSMServiceHistoryProcedure,
+		svc.History,
+		connect.WithSchema(fSMServiceMethods.ByName("History")),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/fsm.v1.FSMService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,8 +241,16 @@ func NewFSMServiceHandler(svc FSMServiceHandler, opts ...connect.HandlerOption) 
 			fSMServiceListRegisteredHandler.ServeHTTP(w, r)
 		case FSMServiceListActiveProcedure:
 			fSMServiceListActiveHandler.ServeHTTP(w, r)
-		case FSMServiceGetHistoryEventProcedure:
-			fSMServiceGetHistoryEventHandler.ServeHTTP(w, r)
+		case FSMServiceStartProcedure:
+			fSMServiceStartHandler.ServeHTTP(w, r)
+		case FSMServiceWaitProcedure:
+			fSMServiceWaitHandler.ServeHTTP(w, r)
+		case FSMServiceCancelProcedure:
+			fSMServiceCancelHandler.ServeHTTP(w, r)
+		case FSMServiceRunsProcedure:
+			fSMServiceRunsHandler.ServeHTTP(w, r)
+		case FSMServiceHistoryProcedure:
+			fSMServiceHistoryHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -161,6 +268,22 @@ func (UnimplementedFSMServiceHandler) ListActive(context.Context, *connect.Reque
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.ListActive is not implemented"))
 }
 
-func (UnimplementedFSMServiceHandler) GetHistoryEvent(context.Context, *connect.Request[v1.GetHistoryEventRequest]) (*connect.Response[v1.HistoryEvent], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.GetHistoryEvent is not implemented"))
+func (UnimplementedFSMServiceHandler) Start(context.Context, *connect.Request[v1.StartRequest]) (*connect.Response[v1.StartResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Start is not implemented"))
+}
+
+func (UnimplementedFSMServiceHandler) Wait(context.Context, *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Wait is not implemented"))
+}
+
+func (UnimplementedFSMServiceHandler) Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Cancel is not implemented"))
+}
+
+func (UnimplementedFSMServiceHandler) Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Runs is not implemented"))
+}
+
+func (UnimplementedFSMServiceHandler) History(context.Context, *connect.Request[v1.HistoryRequest]) (*connect.Response[v1.HistoryEvent], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.History is not implemented"))
 }

@@ -47,6 +47,15 @@ type Request[R, W any] struct {
 
 	logger logrus.FieldLogger
 	run    Run
+
+	// leaseEpoch is the epoch this node holds the run's lease at, surfaced to handlers through
+	// FencingToken. Zero under a single-process backend, which has no leases.
+	leaseEpoch int64
+
+	// response is the last transition's marshaled W, stashed by the canceller (which already
+	// holds the codec) so the finisher can record it in the terminal record without a codec of
+	// its own.
+	response []byte
 }
 
 func (r *Request[_, _]) Any() any {
@@ -64,6 +73,21 @@ func (r *Request[_, _]) Run() Run {
 	return r.run
 }
 
+// FencingToken is a run identity paired with the lease epoch its executing node holds. The epoch
+// increments on every lease takeover, so successive owners of the same run are strictly ordered.
+type FencingToken struct {
+	RunVersion ulid.ULID
+
+	LeaseEpoch int64
+}
+
+// FencingToken returns the run's version and current lease epoch as a Chubby-style fencing
+// token: a handler hands it to an external system so writes from a superseded owner are rejected
+// after a takeover. The epoch is zero under a single-process backend — there is no lease to fence.
+func (r *Request[_, _]) FencingToken() FencingToken {
+	return FencingToken{RunVersion: r.run.StartVersion, LeaseEpoch: r.leaseEpoch}
+}
+
 func (r *Request[_, _]) withLogger(logger logrus.FieldLogger) {
 	r.logger = logger
 }
@@ -79,6 +103,14 @@ func (r *Request[_, _]) withTransition(name string, version ulid.ULID) {
 
 func (r *Request[_, _]) withError(err RunErr) {
 	r.run.fsmErr = err
+}
+
+func (r *Request[_, _]) withLeaseEpoch(epoch int64) {
+	r.leaseEpoch = epoch
+}
+
+func (r *Request[_, _]) setResponse(b []byte) {
+	r.response = b
 }
 
 // NewRequest creates a new request to be used for starting a FSM.
@@ -101,6 +133,10 @@ type AnyRequest interface {
 	withTransition(string, ulid.ULID)
 
 	withError(RunErr)
+
+	withLeaseEpoch(int64)
+
+	setResponse([]byte)
 }
 
 // MockRequest takes an fsm request and customizes it with logger and run
@@ -191,6 +227,27 @@ type fsm struct {
 	// registered at End() so the claim loop can resume runs of this FSM without knowing its
 	// R/W types.
 	resumeOne func(context.Context, *activeResource) error
+
+	// decodeResource validates opaque request bytes against the R codec. The RPC ingress runs it
+	// so a malformed submission fails at Start instead of persisting a run the claim loop can
+	// never resume. Registered at End().
+	decodeResource func([]byte) error
+
+	// startFromBytes decodes opaque request bytes and runs the typed embedded start. The
+	// single-process backend uses it, where no claim loop exists to execute a persisted run.
+	// Registered at End().
+	startFromBytes func(context.Context, string, []byte, ...StartOptionsFn) (ulid.ULID, error)
+}
+
+// startEvent builds the START event for a run of f with the given id.
+func (f *fsm) startEvent(id string) *fsmv1.StateEvent {
+	return &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           id,
+		ResourceType: f.typeName,
+		Action:       f.action,
+		State:        f.startState,
+	}
 }
 
 func (f *fsm) transitionSlice() []string {
@@ -466,16 +523,6 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 		r := runnerFromOpts(&startOpt, m)
 
-		request.run = Run{
-			ID:           id,
-			StartVersion: runVersion,
-			Action:       f.action,
-			ResourceName: f.alias,
-			TypeName:     f.typeName,
-			Queue:        startOpt.queue,
-			Parent:       startOpt.parent,
-		}
-
 		transitions := immutable.NewList[*transition]()
 		iter := f.transitions.Iterator()
 		for !iter.Done() {
@@ -486,30 +533,77 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 				name:     value,
 			}])
 		}
-		_, err = m.store.Append(ctx,
-			request.run,
-			&fsmv1.StateEvent{
-				Type:         fsmv1.EventType_EVENT_TYPE_START,
-				Id:           id,
-				ResourceType: f.typeName,
-				Action:       f.action,
-				State:        f.startState,
-			},
-			startOpt.queue,
-			withStartOption(resource, f.transitionSlice()),
-			withDelayUntil(startOpt.until),
-			withRunAfter(startOpt.runAfter),
-			withParent(startOpt.parent),
-		)
+
+		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt)
 		if err != nil {
 			m.logger.WithError(err).Error("failed to append start event")
 			return ulid.ULID{}, err
 		}
+		request.run = startedRun
 
 		run(ctx, request, m, r, &runInstance{initializers: f.initializers, transitions: transitions})
 
 		return runVersion, nil
 	}
+}
+
+// persistStart writes a run's START event through the store and returns the Run it recorded. It
+// is the single home for the START persistence contract: the embedded start (leased to this node)
+// and the opaque ingress start (unowned, for the claim loop) share it, differing only in the
+// extra append options they pass. Non-generic — persistence never touches R/W.
+func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, extra ...appendOptionFunc) (Run, error) {
+	run := Run{
+		ID:           id,
+		StartVersion: runVersion,
+		Action:       f.action,
+		ResourceName: f.alias,
+		TypeName:     f.typeName,
+		Queue:        startOpt.queue,
+		Parent:       startOpt.parent,
+	}
+	opts := append([]appendOptionFunc{
+		withStartOption(resource, f.transitionSlice()),
+		withDelayUntil(startOpt.until),
+		withRunAfter(startOpt.runAfter),
+		withParent(startOpt.parent),
+	}, extra...)
+	if _, err := m.store.Append(ctx, run, f.startEvent(id), startOpt.queue, opts...); err != nil {
+		return Run{}, err
+	}
+	return run, nil
+}
+
+// startFromBytes decodes an opaque request payload into the FSM's R type and runs the typed
+// embedded start. It is the single-process backend's opaque entry point: with no claim loop to
+// execute a persisted run, the accepting node runs it directly. Registered at End() so the RPC
+// ingress can start a run without knowing R/W.
+func (m *Manager) startFromBytes[R, W any](f *fsm) func(context.Context, string, []byte, ...StartOptionsFn) (ulid.ULID, error) {
+	return func(ctx context.Context, id string, resource []byte, opts ...StartOptionsFn) (ulid.ULID, error) {
+		var r R
+		if err := f.rCodec.Unmarshal(resource, &r); err != nil {
+			return ulid.ULID{}, invalidResource(f, err)
+		}
+		var w W
+		return m.start[R, W](f)(ctx, id, NewRequest(&r, &w), opts...)
+	}
+}
+
+// decodeResourceFn returns a validator that decodes opaque request bytes into R, reporting a
+// codec error as errInvalidResource, without executing the run.
+func decodeResourceFn[R any](f *fsm) func([]byte) error {
+	return func(b []byte) error {
+		var r R
+		if err := f.rCodec.Unmarshal(b, &r); err != nil {
+			return invalidResource(f, err)
+		}
+		return nil
+	}
+}
+
+// invalidResource wraps a request-codec decode failure as errInvalidResource, naming the FSM the
+// payload was rejected for.
+func invalidResource(f *fsm, err error) error {
+	return fmt.Errorf("%w for %s/%s: %w", errInvalidResource, f.typeName, f.action, err)
 }
 
 type runInstance struct {
@@ -576,9 +670,14 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 		// A lease-coordinated run may have lost ownership before reaching execution — a
 		// delayed or queued dispatch can trail its claim by arbitrarily long. Cancel before
-		// any side effects run rather than waiting to be fenced on the first write.
-		if m.lc != nil && !m.lc.owns(runVersion) {
-			cancel(ErrLeaseLost)
+		// any side effects run rather than waiting to be fenced on the first write. The same
+		// lookup yields the lease epoch handlers read as their fencing token.
+		if m.lc != nil {
+			epoch, ok := m.lc.ownedEpoch(runVersion)
+			if !ok {
+				cancel(ErrLeaseLost)
+			}
+			request.withLeaseEpoch(epoch)
 		}
 
 		defer func() {

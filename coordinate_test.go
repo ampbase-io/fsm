@@ -43,6 +43,13 @@ func (s *stubCoordinator) claimRuns(context.Context, []*fsm) ([]claimedRun, erro
 
 func (s *stubCoordinator) owns(version ulid.ULID) bool { return s.held[version] }
 
+func (s *stubCoordinator) ownedEpoch(version ulid.ULID) (int64, bool) {
+	if !s.held[version] {
+		return 0, false
+	}
+	return 1, true
+}
+
 func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration) {
 	return time.Hour, time.Hour
 }

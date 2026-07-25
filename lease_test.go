@@ -273,6 +273,49 @@ func TestClaimEligibility(t *testing.T) {
 	}
 }
 
+// TestUnownedStartClaimableByPeer covers the RPC ingress' persist-then-ack split: a START
+// persisted unowned carries no lease, so the persisting node never executes it and a peer claims
+// it immediately — no lease-expiry wait. Without the unowned persist the accepting node would own
+// the run and a peer could not take it until the lease lapsed, pinning execution to the ingress.
+func TestUnownedStartClaimableByPeer(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+
+	ingress := h.store("node-ingress", 10*time.Second)
+	run := Run{ID: "unowned-1", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+	_, err := ingress.Append(ctx, run, &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        "created",
+	}, "", withStartOption([]byte("{}"), []string{"created", "done"}), withUnowned())
+	if err != nil {
+		t.Fatalf("failed to append unowned start: %v", err)
+	}
+
+	if ingress.owns(run.StartVersion) {
+		t.Fatal("an unowned start must not be leased to the persisting node")
+	}
+	manifest := mustManifest(t, ingress, run.StartVersion)
+	if manifest.GetOwnerNode() != "" || manifest.GetLeaseEpoch() != 0 {
+		t.Fatalf("expected an unleased manifest, got owner %q at epoch %d", manifest.GetOwnerNode(), manifest.GetLeaseEpoch())
+	}
+
+	worker := h.store("node-worker", 10*time.Second)
+	claimed, err := worker.claimRuns(ctx, []*fsm{deployFSM})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("expected the peer to claim the unowned run immediately, got %v (err=%v)", claimed, err)
+	}
+	if claimed[0].resource.version != run.StartVersion {
+		t.Fatalf("unexpected claimed version %s", claimed[0].resource.version)
+	}
+	claimedManifest := mustManifest(t, worker, run.StartVersion)
+	if claimedManifest.GetOwnerNode() != "node-worker" || claimedManifest.GetLeaseEpoch() != 1 {
+		t.Fatalf("expected owner node-worker at epoch 1, got %q/%d", claimedManifest.GetOwnerNode(), claimedManifest.GetLeaseEpoch())
+	}
+}
+
 func TestClaimCarriesResumeState(t *testing.T) {
 	h := newLeaseHarness(t)
 	ctx := context.Background()

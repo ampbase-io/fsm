@@ -20,7 +20,12 @@ type leaseCoordinator interface {
 	// resume each.
 	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
 	// owns reports whether this node currently holds the run's lease.
+	// TODO(follow-up): owns is derivable from ownedEpoch (`_, ok := ownedEpoch(v)`); collapse the
+	// two once the remaining owns caller (cancelUnleased) is updated.
 	owns(version ulid.ULID) bool
+	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
+	// the fencing token surfaced to handlers.
+	ownedEpoch(version ulid.ULID) (int64, bool)
 	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
 
@@ -116,6 +121,17 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 		return true
 	}
 
+	// armWake pulls the next scan forward, unless one is already armed. The periodic claim timer
+	// is left untouched; a redundant scan shortly after is harmless. Both the bus pending event
+	// and the local opaque-Start nudge route through it.
+	armWake := func() {
+		if wakeArmed {
+			return
+		}
+		wakeArmed = true
+		wake.Reset(withJitter(claimWakeDelay))
+	}
+
 	for {
 		select {
 		case <-m.done:
@@ -135,12 +151,11 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 				return
 			}
 		case <-pending:
-			// Pull the next scan forward, unless one is already armed. The periodic claim timer
-			// is left untouched; a redundant scan shortly after is harmless.
-			if !wakeArmed {
-				wakeArmed = true
-				wake.Reset(withJitter(claimWakeDelay))
-			}
+			armWake()
+		case <-m.claimNudge:
+			// A local opaque Start persisted an unowned run; claim it without waiting for the
+			// periodic tick or a bus round trip.
+			armWake()
 		case <-canceled:
 			m.sweepCancellations(ctx, lc)
 		}
