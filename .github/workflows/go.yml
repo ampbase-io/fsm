@@ -5,6 +5,7 @@ on:
       - "**.go"
       - "go.mod"
       - "go.sum"
+      - "eventbus/nats/**"
       - ".github/workflows/go.yml"
   push:
     branches: [main]
@@ -40,4 +41,35 @@ jobs:
       - name: Test
         # The race detector is load-bearing here — it has caught real
         # coordination bugs the plain suite missed.
+        run: go test -race ./...
+
+  # The NATS EventBus adapter (eventbus/nats) is a nested module so nats.go stays
+  # out of the core module's dependency graph — the root job's ./... never descends
+  # into it, hence this separate job rather than a matrix entry (a matrix would
+  # rename the root "go" status check and could break branch protection). It
+  # replaces the core module with ../.. and compiles it (generic methods), so it
+  # mirrors the root job's RC-toolchain bootstrap and checks.
+  eventbus-nats:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: eventbus/nats
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Allow go.mod's RC toolchain
+        # See the root job: GOTOOLCHAIN=auto must be re-exported after setup-go so
+        # the go command downloads the RC toolchain go.mod names.
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+      - name: Check go.mod tidiness
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Check formatting
+        run: |
+          unformatted="$($(go env GOROOT)/bin/gofmt -l .)"
+          test -z "$unformatted" || { echo "$unformatted"; exit 1; }
+      - name: Build
+        run: go build ./...
+      - name: Test
         run: go test -race ./...
