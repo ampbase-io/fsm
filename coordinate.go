@@ -20,6 +20,8 @@ type leaseCoordinator interface {
 	// resume each.
 	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
 	// owns reports whether this node currently holds the run's lease.
+	// TODO(follow-up): owns is derivable from ownedEpoch (`_, ok := ownedEpoch(v)`); collapse the
+	// two once the remaining owns caller (cancelUnleased) is updated.
 	owns(version ulid.ULID) bool
 	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
 	// the fencing token surfaced to handlers.

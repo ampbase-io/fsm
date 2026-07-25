@@ -93,11 +93,26 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
+	// TODO(follow-up): Wait on a never-existed version resolves as success — WaitRun maps an
+	// unknown run to nil — indistinguishable from a real success. Distinguish it with CodeNotFound.
 	waitErr := s.m.Wait(ctx, version)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, connect.NewError(connect.CodeCanceled, ctxErr)
+		code := connect.CodeCanceled
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			code = connect.CodeDeadlineExceeded
+		}
+		return nil, connect.NewError(code, ctxErr)
+	}
+	// A recorded run outcome is nil or a *haltError; any other error is a transient storage
+	// failure the wait's poll surfaced, not the run's result. Report it retryable and sanitized so
+	// a caller neither records the run as failed nor receives internal storage detail.
+	if !isRunOutcome(waitErr) {
+		s.m.logger.WithError(waitErr).WithField("run_version", version.String()).Warn("wait poll failed")
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("run status temporarily unavailable"))
 	}
 
+	// TODO(follow-up): RunResult re-reads the terminal manifest WaitRun's last poll already
+	// fetched; have WaitRun return the response bytes to drop this second GET.
 	result, err := s.m.RunResult(ctx, version)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -108,6 +123,17 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 		resp.Error = waitErr.Error()
 	}
 	return connect.NewResponse(resp), nil
+}
+
+// isRunOutcome reports whether a WaitRun error is the run's recorded outcome (nil or a halt)
+// rather than a transient poll failure. Recorded outcomes are always nil or *haltError; a storage
+// read that aborted the wait is neither.
+func isRunOutcome(err error) bool {
+	if err == nil {
+		return true
+	}
+	_, ok := errors.AsType[*haltError](err)
+	return ok
 }
 
 // Cancel records a durable cancel for the run; the owning worker reacts. Canceling a terminal or

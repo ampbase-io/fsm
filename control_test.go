@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -170,6 +171,9 @@ func testControlCancel(t *testing.T, f *managerFactory) {
 	}
 	if waitResp.Msg.GetError() != cause {
 		t.Fatalf("expected cancel cause %q, got %q", cause, waitResp.Msg.GetError())
+	}
+	if len(waitResp.Msg.GetResult()) != 0 {
+		t.Fatalf("expected no result for a canceled run, got %q", waitResp.Msg.GetResult())
 	}
 }
 
@@ -541,6 +545,57 @@ func TestFencingTokenIncrementsOnTakeover(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("takeover handler never ran")
+	}
+}
+
+// TestControlWaitDeadline covers Wait's transport-error mapping: a client deadline that elapses
+// while the run is still in flight surfaces as CodeDeadlineExceeded, not a run outcome.
+func TestControlWaitDeadline(t *testing.T) { runBackends(t, testControlWaitDeadline) }
+
+func testControlWaitDeadline(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	var (
+		entered = make(chan struct{}, 1)
+		block   = make(chan struct{})
+	)
+	blockingFSM(t, m, "control-deadline", entered, block)
+	defer close(block)
+	admin := &adminServer{m: m}
+
+	startResp, err := admin.Start(ctx, startReq(t, "control-deadline", "deadline-1", "x"))
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+	_, err = admin.Wait(waitCtx, connect.NewRequest(&fsmv1.WaitRequest{Version: startResp.Msg.GetVersion()}))
+	connErr, ok := errors.AsType[*connect.Error](err)
+	if !ok || connErr.Code() != connect.CodeDeadlineExceeded {
+		t.Fatalf("expected CodeDeadlineExceeded for an in-flight run, got %v", err)
+	}
+}
+
+// TestIsRunOutcome covers the classifier Wait uses to keep a transient poll failure out of the
+// run-outcome slot: only nil or a *haltError (including wrapped) is a recorded outcome.
+func TestIsRunOutcome(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil is success", nil, true},
+		{"halt is an outcome", halt(errors.New("boom")), true},
+		{"wrapped halt is an outcome", fmt.Errorf("append: %w", halt(errors.New("boom"))), true},
+		{"plain storage error is a poll failure", errors.New("get object runs/x: 503"), false},
+		{"ctx error is not an outcome", context.Canceled, false},
+	}
+	for _, tc := range cases {
+		if got := isRunOutcome(tc.err); got != tc.want {
+			t.Errorf("%s: isRunOutcome(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
 	}
 }
 

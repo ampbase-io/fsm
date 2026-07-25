@@ -48,14 +48,19 @@ func (m *Manager) finisher[R, W any](codec Codec, finalizers []FinalizerFunc) fu
 		}
 
 		// Carry the run's final response into the terminal record so History and the RPC Wait
-		// reply return the W result without re-reading transition events. A marshal failure is
-		// not fatal — the run already completed; the caller simply gets no result payload.
+		// reply return the W result without re-reading transition events. Only a successful run
+		// has a meaningful result — a halted run's W is not one (the caller reads the error), and
+		// recording it would overwrite a partial result with a zero value. The marshal runs after
+		// finalizers, so it captures a finalizer's mutation of req.W; a marshal failure is not
+		// fatal — the run already completed, the caller simply gets no result payload.
 		event := finishEvent(run, run.CurrentState)
-		result, err := codec.Marshal(req.W.Any())
-		if err != nil {
-			logger.WithError(err).Warn("failed to marshal run result")
+		if run.fsmErr.Err == nil {
+			result, err := codec.Marshal(req.W.Any())
+			if err != nil {
+				logger.WithError(err).Warn("failed to marshal run result")
+			}
+			event.Response = result
 		}
-		event.Response = result
 
 		if _, err := m.store.Append(ctx, run, event, run.Queue); err != nil {
 			logger.WithError(err).Error("failed to append complete event")

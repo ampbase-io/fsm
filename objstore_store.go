@@ -465,10 +465,14 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
-		// The FINISH event carries the run's final response, marshaled after finalizers ran, so
-		// the terminal manifest supplies the same post-finalizer result the history record does —
-		// race-free the moment WaitRun observes completion, cross-node included.
-		m.LatestResponse = event.GetResponse()
+		// The FINISH event carries the run's final response (for a successful run), marshaled
+		// after finalizers ran, so the terminal manifest supplies the same post-finalizer result
+		// the history record does — race-free the moment WaitRun observes completion, cross-node
+		// included. Guarded like appendMidRun: a run driven terminal before it executed
+		// (cancelOwnedRun) carries no response and must not clear a prior transition's result.
+		if event.GetResponse() != nil {
+			m.LatestResponse = event.GetResponse()
+		}
 		if run.fsmErr.Err != nil {
 			m.Error = run.fsmErr.Err.Error()
 			m.ErrorState = run.fsmErr.State
