@@ -633,6 +633,12 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		attribute.String("fsm.type", typeName),
 		attribute.String("fsm.version", runVersion.String()),
 		attribute.Int("fsm.sdk_version", 2),
+		attribute.String("fsm.storage_backend", storageBackend(m.lc)),
+	}
+	// Only a lease-coordinated backend has an owner node; the object backend attributes the run
+	// to the node executing it, bolt has neither a node identity nor leases.
+	if m.lc != nil {
+		startAttrs = append(startAttrs, attribute.String("fsm.owner_node", m.lc.nodeID()))
 	}
 	if attr, ok := request.Any().(Attributable); ok {
 		startAttrs = append(startAttrs, attr.Attributes()...)
@@ -678,6 +684,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				cancel(ErrLeaseLost)
 			}
 			request.withLeaseEpoch(epoch)
+			span.SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
 		}
 
 		defer func() {

@@ -54,6 +54,8 @@ func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration)
 	return time.Hour, time.Hour
 }
 
+func (s *stubCoordinator) nodeID() string { return "stub-node" }
+
 func (s *stubCoordinator) requestCancel(context.Context, ulid.ULID, error) error { return nil }
 
 func (s *stubCoordinator) pendingCancellations(context.Context) (map[ulid.ULID]error, error) {

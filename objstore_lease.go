@@ -36,7 +36,7 @@ type lease struct {
 // epoch it claimed with. The epoch is the fencing token: a stale owner whose lease was taken
 // over fails this check on every manifest CAS, no matter what its local clock believes.
 func (s *objectStore) checkFence(m *fsmv1.RunManifest, epoch int64) error {
-	if m.GetOwnerNode() != s.nodeID || m.GetLeaseEpoch() != epoch {
+	if m.GetOwnerNode() != s.node || m.GetLeaseEpoch() != epoch {
 		return ErrLeaseLost
 	}
 	return nil
@@ -125,7 +125,9 @@ func (s *objectStore) extendLeases(ctx context.Context) {
 		})
 		switch {
 		case err == nil:
+			leaseRenewalsVec.WithLabelValues("extended").Inc()
 		case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrFsmNotFound):
+			leaseRenewalsVec.WithLabelValues("lost").Inc()
 			s.dropLease(version)
 		case errors.Is(err, context.Canceled):
 			// Shutdown mid-pass; Close releases the leases.
@@ -147,7 +149,7 @@ func (s *objectStore) claimable(m *fsmv1.RunManifest, now time.Time) bool {
 	switch {
 	case m.GetOwnerNode() == "":
 		return true
-	case m.GetOwnerNode() == s.nodeID:
+	case m.GetOwnerNode() == s.node:
 		return true
 	default:
 		return now.UnixMilli() > m.GetLeaseExpiry()
@@ -180,15 +182,19 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 		if !s.claimable(m, time.Now()) {
 			return errClaimLost
 		}
-		m.OwnerNode = s.nodeID
+		m.OwnerNode = s.node
 		m.LeaseExpiry = time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
 		m.LeaseEpoch++
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errClaimLost) {
+			leaseRenewalsVec.WithLabelValues("claim_lost").Inc()
+		}
 		s.dropLease(version)
 		return nil, err
 	}
+	leaseRenewalsVec.WithLabelValues("claimed").Inc()
 	s.trackLease(version, manifest.GetLeaseEpoch())
 	return manifest, nil
 }
