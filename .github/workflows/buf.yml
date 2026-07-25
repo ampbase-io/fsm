@@ -1,6 +1,9 @@
 name: Buf CI
 on:
   pull_request:
+    # labeled/unlabeled so toggling the "buf skip breaking" label re-runs the
+    # breaking check (buf-action skips it when that label is present).
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     paths:
       - "proto/**"
       - "gen/**"
@@ -11,26 +14,42 @@ on:
     branches: [main]
 permissions:
   contents: read
+  pull-requests: write # buf-action posts a lint/breaking summary comment on the PR
 jobs:
   buf:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # Lint and breaking-change detection against the base branch, posting a
+      # summary comment on the PR. The proto is still pre-release, so an intentional
+      # break is allowed by adding the "buf skip breaking" label to the PR.
+      #
+      # Unpinned: buf-action requires buf >= 1.35, newer than the 1.28.1 the generate
+      # step uses. That is fine — lint rules track the buf.yaml config version (v1),
+      # not the CLI version, so lint stays stable; 1.28.1 remains the single pinned
+      # source for reproducible codegen below.
+      #
+      # format is off: the committed protos predate buf's formatter (imports are not
+      # sorted), so the format check would fail every PR. Enable it in a follow-up
+      # once the existing protos are reformatted.
+      - uses: bufbuild/buf-action@v1
+        with:
+          push: false
+          format: false
       - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: Allow go.mod's RC toolchain
-        # buf and its protoc plugins run via `go run` (pinned by go.mod), so
-        # this job needs the same toolchain treatment as Go CI: setup-go
-        # exports GOTOOLCHAIN=local, re-export auto after it so the go command
-        # downloads the toolchain go.mod names.
+        # buf's protoc plugins run via `go run` (pinned by go.mod), so the generate
+        # step needs the same toolchain treatment as Go CI: setup-go exports
+        # GOTOOLCHAIN=local, re-export auto after it so the go command downloads the
+        # toolchain go.mod names.
         run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
-      - name: Lint
-        run: go run github.com/bufbuild/buf/cmd/buf@v1.28.1 lint
       - name: Check generated code is current
         # Mirrors the go:generate directive in fsm.go: full regeneration from a
-        # clean gen/ catches stale and orphaned files alike; git status (not
-        # diff) also catches generated files that were never committed.
+        # clean gen/ catches stale and orphaned files alike; git status (not diff)
+        # also catches generated files that were never committed. buf-action does not
+        # cover this, so it stays a separate step.
         run: |
           rm -rf gen
           go run github.com/bufbuild/buf/cmd/buf@v1.28.1 generate
