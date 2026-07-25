@@ -983,10 +983,8 @@ func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string)
 
 	runs := make([]ulid.ULID, 0, len(keys))
 	for _, key := range keys {
-		segments := strings.Split(key, "/")
-
-		var version ulid.ULID
-		if err := version.UnmarshalText([]byte(segments[len(segments)-1])); err != nil {
+		version, err := versionFromKey(key)
+		if err != nil {
 			s.logger.WithError(err).WithField("key", key).Error("failed to parse run version from index key")
 			continue
 		}

@@ -318,7 +318,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		// this resource, not whatever the most recent Start call left on f.
 		var startOpt startOptions
 		if delayUntil := resource.active.GetOptions().GetDelayUntil(); delayUntil > 0 {
-			startOpt.until = time.Unix(delayUntil, 0)
+			startOpt.until = time.UnixMilli(delayUntil)
 		}
 
 		if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {

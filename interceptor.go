@@ -47,22 +47,25 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 			f(ctx, req, run.fsmErr)
 		}
 
-		_, err := m.store.Append(ctx,
-			run,
-			&fsmv1.StateEvent{
-				Type:         fsmv1.EventType_EVENT_TYPE_FINISH,
-				Id:           run.ID,
-				ResourceType: run.TypeName,
-				Action:       run.Action,
-				State:        run.CurrentState,
-			},
-			run.Queue,
-		)
+		_, err := m.store.Append(ctx, run, finishEvent(run, run.CurrentState), run.Queue)
 		if err != nil {
 			logger.WithError(err).Error("failed to append complete event")
 			return nil, err
 		}
 		return nil, nil
+	}
+}
+
+// finishEvent builds a run's terminal FINISH event, recorded in the given state. It is the one
+// shape completion is driven through: the run loop's finisher for a normal end, and a
+// pre-execution cancel (cancelOwnedRun) for a run terminated before it ran.
+func finishEvent(run Run, state string) *fsmv1.StateEvent {
+	return &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_FINISH,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        state,
 	}
 }
 

@@ -347,9 +347,24 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 }
 
 // Cancel sends a cancel signal to the FSM should it exist. It does not block until the FSM has
-// completed so callers should use Wait to ensure the FSM has stopped, if needed.
+// completed, so callers should use Wait to ensure the FSM has stopped, if needed.
+//
+// Under a lease-coordinated backend the cancel is subject-addressed: it is recorded durably and
+// broadcast, and whichever node owns the run reacts — the run need not be executing on this
+// node, or anywhere yet. The local context is canceled too for immediate effect when this node
+// is the owner. A single-process backend cancels the local run directly.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
-	if !m.cancelRunning(version, errors.New(cause)) {
+	cerr := errors.New(cause)
+	if m.lc != nil {
+		// Record durably first — while the run is still active — so the owner reacts even if it
+		// is another node; then cancel locally for immediacy if we hold it.
+		if err := m.lc.requestCancel(ctx, version, cerr); err != nil {
+			return err
+		}
+		m.cancelRunning(version, cerr)
+		return nil
+	}
+	if !m.cancelRunning(version, cerr) {
 		return ErrFsmNotFound
 	}
 	return nil

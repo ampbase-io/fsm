@@ -23,6 +23,16 @@ type leaseCoordinator interface {
 	owns(version ulid.ULID) bool
 	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
+
+	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
+	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
+	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
+	// pendingCancellations returns the cancel sentinels covering runs this node owns — keyed by
+	// run version, valued by cause — from one keys-only listing of the cancel prefix
+	// intersected with the owned set.
+	pendingCancellations(ctx context.Context) (map[ulid.ULID]error, error)
+	// cancelOwnedRun drives an owned-but-not-executing run to a terminal canceled state.
+	cancelOwnedRun(ctx context.Context, version ulid.ULID, cause error) error
 }
 
 // claimWakeDelay is the small, jittered pause before an idle worker scans on a pending-event
@@ -84,8 +94,15 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 	defer wake.Stop()
 	wakeArmed := false
 
-	pending, unsubscribe := subscribeSignal(m.bus, subjectPending, m.logger)
-	defer unsubscribe()
+	pending, unsubscribePending := subscribeSignal(m.bus, subjectPending, m.logger)
+	defer unsubscribePending()
+
+	// A cancel is a broadcast: every worker hears it and sweeps, and its owned-intersection —
+	// not the subject — decides which node reacts. The heartbeat sweep is the correctness floor;
+	// this event just pulls it forward. No jitter: the sweep touches only runs this node owns,
+	// so there is no CAS herd to stagger.
+	canceled, unsubscribeCancel := subscribeSignal(m.bus, subjectCancel, m.logger)
+	defer unsubscribeCancel()
 
 	// runClaim scans for claimable runs unless the manager is shutting down, in which case it
 	// reports false so the loop returns without starting a pass it won't wait out.
@@ -106,6 +123,7 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 		case <-heartbeat.C:
 			lc.extendLeases(ctx)
 			m.cancelUnleased(lc)
+			m.sweepCancellations(ctx, lc)
 		case <-claim.C:
 			if !runClaim() {
 				return
@@ -123,6 +141,31 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 				wakeArmed = true
 				wake.Reset(withJitter(claimWakeDelay))
 			}
+		case <-canceled:
+			m.sweepCancellations(ctx, lc)
+		}
+	}
+}
+
+// sweepCancellations reacts to the cancel sentinels covering this node's runs, driving each to
+// cancellation. It is the owner-side of subject-addressed cancel, run on every heartbeat as the
+// floor and pulled forward by a cancel broadcast. A run mid-execution is stopped by canceling
+// its local context — the run loop then records CANCEL and FINISH with the cause. A run this
+// node owns but has not begun executing (pending, delayed, queued) has no context to cancel, so
+// it is driven to a terminal canceled manifest directly, or its waiters would poll to their
+// deadline.
+func (m *Manager) sweepCancellations(ctx context.Context, lc leaseCoordinator) {
+	cancels, err := lc.pendingCancellations(ctx)
+	if err != nil {
+		m.logger.WithError(err).Error("cancel sweep failed")
+		return
+	}
+	for version, cause := range cancels {
+		if m.cancelRunning(version, cause) {
+			continue
+		}
+		if err := lc.cancelOwnedRun(ctx, version, cause); err != nil {
+			m.logger.WithError(err).WithField("run_version", version.String()).Error("failed to cancel owned run")
 		}
 	}
 }

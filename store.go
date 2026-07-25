@@ -701,7 +701,9 @@ type startOption struct {
 func withDelayUntil(delayUntil time.Time) appendOptionFunc {
 	return func(opt *appendOption) error {
 		if !delayUntil.IsZero() {
-			opt.delayUntil = delayUntil.Unix()
+			// Unix milliseconds, matching lease_expiry: whole-second truncation made a delayed
+			// run's dispatch time nondeterministic within the second it was scheduled for.
+			opt.delayUntil = delayUntil.UnixMilli()
 		}
 		return nil
 	}
