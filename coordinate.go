@@ -28,6 +28,8 @@ type leaseCoordinator interface {
 	ownedEpoch(version ulid.ULID) (int64, bool)
 	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
+	// nodeID returns this node's identity, recorded on run spans as fsm.owner_node.
+	nodeID() string
 
 	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
 	// caller. Reports ErrFsmNotFound for a terminal or unknown run.

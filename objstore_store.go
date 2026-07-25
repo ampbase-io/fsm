@@ -94,6 +94,7 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			updated = manifest
 			return nil
 		case errors.Is(err, errEtagMismatch):
+			casRetriesVec.WithLabelValues("manifest").Inc()
 			s.logger.WithField("key", key).Debug("manifest changed concurrently, retrying")
 			return err
 		default:
@@ -310,7 +311,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 // loop distributes the run across the worker pool; its epoch is bumped from zero on the first
 // claim.
 func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
-	ownerNode := s.nodeID
+	ownerNode := s.node
 	leaseExpiry := time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
 	leaseEpoch := int64(1)
 	if ao.unowned {
@@ -380,7 +381,7 @@ func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey str
 		}
 		return &AlreadyRunningError{Version: run.StartVersion}
 	}
-	if existing.GetOwnerNode() != s.nodeID {
+	if existing.GetOwnerNode() != s.node {
 		return ErrLeaseLost
 	}
 

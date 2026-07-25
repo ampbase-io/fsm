@@ -85,9 +85,11 @@ type objectStore struct {
 	client *s3.Client
 	cfg    *ObjectStorageConfig
 
-	// nodeID identifies this node in run manifests for lease ownership. It must be unique per
-	// process: a zombie sharing a NodeID is still fenced by the lease epoch.
-	nodeID string
+	// node identifies this node in run manifests for lease ownership and on run spans as
+	// fsm.owner_node. It must be unique per process: a zombie sharing a NodeID is still fenced
+	// by the lease epoch. Read through the nodeID() accessor, which the leaseCoordinator
+	// interface exposes.
+	node string
 
 	// bus publishes lifecycle events after their durable write and backs WaitRun's completion
 	// fast path. Its liveness (busIsLive) gates the publish subject construction and relaxes
@@ -139,11 +141,17 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		logger:   logger.WithField("node_id", nodeID),
 		client:   client,
 		cfg:      cfg,
-		nodeID:   nodeID,
+		node:     nodeID,
 		bus:      busOrNoop(bus),
 		leases:   map[ulid.ULID]lease{},
 		finishes: map[ulid.ULID]runFinish{},
 	}, nil
+}
+
+// nodeID returns this node's identity, recorded on run spans as fsm.owner_node. It satisfies the
+// leaseCoordinator interface so run() can attribute a span without reaching into the store.
+func (s *objectStore) nodeID() string {
+	return s.node
 }
 
 // consistentRead routes the request to the leader on Tigris so reads observe all prior
@@ -290,10 +298,14 @@ func (s *objectStore) putConditional(ctx context.Context, key string, body []byt
 	op := func() error {
 		in := &s3.PutObjectInput{Bucket: &s.cfg.Bucket, Key: &key, Body: bytes.NewReader(body)}
 		set(in)
-		switch _, err := s.client.PutObject(ctx, in); {
+		start := time.Now()
+		_, err := s.client.PutObject(ctx, in)
+		observeStorage("put", start, err)
+		switch {
 		case err == nil:
 			return nil
 		case isConditionalConflict(err):
+			casRetriesVec.WithLabelValues("conflict").Inc()
 			s.logger.WithField("key", key).Debug("conditional write conflict, retrying")
 			return err
 		default:
@@ -344,10 +356,13 @@ func (s *objectStore) putIdempotent(ctx context.Context, key string, body []byte
 
 // deleteObject removes an object. Deleting a missing key is not an error.
 func (s *objectStore) deleteObject(ctx context.Context, key string) error {
-	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	start := time.Now()
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &s.cfg.Bucket,
 		Key:    &key,
-	}); err != nil {
+	})
+	observeStorage("delete", start, err)
+	if err != nil {
 		return fmt.Errorf("delete object %s: %w", key, err)
 	}
 	return nil
@@ -355,10 +370,13 @@ func (s *objectStore) deleteObject(ctx context.Context, key string) error {
 
 // getObject reads an object and returns its body and ETag.
 func (s *objectStore) getObject(ctx context.Context, key string) ([]byte, string, error) {
+	start := time.Now()
 	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.cfg.Bucket,
 		Key:    &key,
 	}, consistentRead)
+	// Observe the raw error before the 404 wrap so not_found classifies correctly.
+	observeStorage("get", start, err)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, "", ErrFsmNotFound
@@ -385,7 +403,9 @@ func (s *objectStore) listKeys(ctx context.Context, prefix string) ([]string, er
 	})
 
 	for paginator.HasMorePages() {
+		start := time.Now()
 		page, err := paginator.NextPage(ctx, consistentRead)
+		observeStorage("list", start, err)
 		if err != nil {
 			return nil, fmt.Errorf("list objects with prefix %s: %w", prefix, err)
 		}
