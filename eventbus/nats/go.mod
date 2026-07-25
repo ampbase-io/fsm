@@ -1,14 +1,14 @@
-module github.com/superfly/fsm/eventbus/nats
+module github.com/ampbase-io/fsm/eventbus/nats
 
 go 1.27rc1
 
-replace github.com/superfly/fsm => ../../
+replace github.com/ampbase-io/fsm => ../../
 
 require (
+	github.com/ampbase-io/fsm v0.0.0-00010101000000-000000000000
 	github.com/nats-io/nats-server/v2 v2.14.3
 	github.com/nats-io/nats.go v1.52.0
 	github.com/sirupsen/logrus v1.9.4
-	github.com/superfly/fsm v0.0.0-00010101000000-000000000000
 	google.golang.org/protobuf v1.36.11
 )
 

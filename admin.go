@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
-	"github.com/superfly/fsm/gen/fsm/v1/fsmv1connect"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
+	"github.com/ampbase-io/fsm/gen/fsm/v1/fsmv1connect"
 
 	"connectrpc.com/connect"
 	"github.com/oklog/ulid/v2"

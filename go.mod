@@ -1,4 +1,4 @@
-module github.com/superfly/fsm
+module github.com/ampbase-io/fsm
 
 go 1.27rc1
 

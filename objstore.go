@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"

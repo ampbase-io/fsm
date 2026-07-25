@@ -2,7 +2,7 @@ version: v1
 managed:
   enabled: true
   go_package_prefix:
-    default: github.com/superfly/fsm/gen
+    default: github.com/ampbase-io/fsm/gen
 plugins:
   - name: go
     out: gen
