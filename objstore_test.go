@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"

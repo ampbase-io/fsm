@@ -9,7 +9,7 @@ import (
 	"slices"
 	"time"
 
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"

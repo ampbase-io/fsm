@@ -19,8 +19,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 
-	fsm "github.com/superfly/fsm"
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
+	fsm "github.com/ampbase-io/fsm"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 )
 
 // Bus adapts a NATS connection to fsm.EventBus: RunEvents are protobuf-marshaled onto NATS

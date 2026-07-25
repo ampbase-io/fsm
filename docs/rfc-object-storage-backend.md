@@ -1,21 +1,21 @@
-# [RFC] Object Storage Backend for superfly/fsm
+# [RFC] Object Storage Backend for ampbase-io/fsm
 
-|           |               |
-|-----------|---------------|
-|**Created**|March 14, 2026 |
-|**Status** |WIP            |
-|**Owner**  |JP             |
-|**Target** |superfly/fsm v2|
+|           |                 |
+|-----------|-----------------|
+|**Created**|March 14, 2026   |
+|**Status** |WIP              |
+|**Owner**  |JP               |
+|**Target** |ampbase-io/fsm v2|
 
 ## Overview
 
-This RFC proposes adding an S3-compatible object storage backend (Tigris) to `superfly/fsm` as an alternative to the existing BoltDB persistence layer, enabling the FSM library to optionally run as a multi-node cluster with no local disk dependencies. The existing BoltDB backend remains the default and is unchanged in behavior. The design uses conditional writes (`If-None-Match` and `If-Match`) as the sole coordination primitive, a per-run manifest object as the linearization point for state transitions, and a brokered queue file (inspired by turbopuffer's object storage queue pattern) for distributed concurrency-limited execution. The result is a durable, crash-recoverable, horizontally scalable FSM runtime built entirely on object storage — available as an opt-in backend behind a `Store` interface that both implementations satisfy.
+This RFC proposes adding an S3-compatible object storage backend (Tigris) to `ampbase-io/fsm` as an alternative to the existing BoltDB persistence layer, enabling the FSM library to optionally run as a multi-node cluster with no local disk dependencies. The existing BoltDB backend remains the default and is unchanged in behavior. The design uses conditional writes (`If-None-Match` and `If-Match`) as the sole coordination primitive, a per-run manifest object as the linearization point for state transitions, and a brokered queue file (inspired by turbopuffer's object storage queue pattern) for distributed concurrency-limited execution. The result is a durable, crash-recoverable, horizontally scalable FSM runtime built entirely on object storage — available as an opt-in backend behind a `Store` interface that both implementations satisfy.
 
 ## Background
 
-### What superfly/fsm is
+### What ampbase-io/fsm is
 
-`superfly/fsm` is an internal Go library for defining and executing durable finite state machines. Users register an FSM as an ordered sequence of named transitions using a builder API (`Register[R,W]().Start(...).To(...).End(...).Build()`). Each FSM run is identified by a resource ID and versioned with a ULID. The library handles persistence, retry with exponential backoff, cancellation, parent-child relationships, delayed starts, run-after dependencies, and queued execution with concurrency limits.
+`ampbase-io/fsm` is an internal Go library for defining and executing durable finite state machines. Users register an FSM as an ordered sequence of named transitions using a builder API (`Register[R,W]().Start(...).To(...).End(...).Build()`). Each FSM run is identified by a resource ID and versioned with a ULID. The library handles persistence, retry with exponential backoff, cancellation, parent-child relationships, delayed starts, run-after dependencies, and queued execution with concurrency limits.
 
 ### Current storage architecture
 

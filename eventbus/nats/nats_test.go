@@ -8,7 +8,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto"
 
-	fsmv1 "github.com/superfly/fsm/gen/fsm/v1"
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 )
 
 // newTestBus boots an in-process NATS server and returns a connection to it alongside a Bus
