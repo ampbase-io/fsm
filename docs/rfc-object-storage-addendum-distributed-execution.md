@@ -5,7 +5,7 @@
 |**Created**|2026-07-22                                    |
 |**Status** |Draft                                         |
 |**Parent** |[Object Storage Backend](rfc-object-storage-backend.md)|
-|**Target** |superfly/fsm v2                               |
+|**Target** |ampbase-io/fsm v2                             |
 
 ## Overview
 
