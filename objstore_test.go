@@ -34,9 +34,21 @@ type fakeS3 struct {
 	// write that succeeds server-side while its response is lost.
 	lostPuts int
 
+	// failDelete, when non-empty, makes DELETE of exactly this key return 500, to exercise a reap
+	// that crashes partway through its deletes.
+	failDelete string
+
 	puts               int
 	consistentReads    int
 	nonConsistentReads int
+}
+
+// setFailDelete arms a DELETE failure for the given key under the harness lock, so a test goroutine
+// can set it race-free against the server goroutines that read it.
+func (f *fakeS3) setFailDelete(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failDelete = key
 }
 
 func newFakeS3() *fakeS3 {
@@ -89,6 +101,10 @@ func (f *fakeS3) handler(bucket string) http.Handler {
 			w.WriteHeader(http.StatusOK)
 
 		case r.Method == http.MethodDelete:
+			if f.failDelete != "" && key == f.failDelete {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			delete(f.objects, key)
 			delete(f.revs, key)
 			w.WriteHeader(http.StatusNoContent)
@@ -156,6 +172,7 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	return store, fake
 }
 
