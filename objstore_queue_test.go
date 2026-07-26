@@ -284,3 +284,119 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 		t.Fatalf("reclaimed run completed with error: %v", err)
 	}
 }
+
+// startQueuedRun persists a queued run unowned (the deferred/ingress shape), so the claim path can
+// admit and claim it. It returns the Run whose lock the claim scan will surface.
+func startQueuedRun(t *testing.T, s *objectStore, id, queue string) Run {
+	t.Helper()
+	run := Run{ID: id, StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq", Queue: queue}
+	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_START,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		State:        "created",
+	}, queue, withStartOption([]byte("{}"), []string{"created", "done"}), withUnowned())
+	if err != nil {
+		t.Fatalf("failed to start queued run: %v", err)
+	}
+	return run
+}
+
+// scanOne returns the single lock entry the queued run planted, failing if there isn't exactly one.
+func scanOne(t *testing.T, s *objectStore) lockEntry {
+	t.Helper()
+	entries, err := s.scanLocks(context.Background(), s.lockPrefix("orderReq"))
+	if err != nil {
+		t.Fatalf("scanLocks: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one lock entry, got %d", len(entries))
+	}
+	return entries[0]
+}
+
+// TestClaimQueuedSkipsHeldRun asserts the reservation-first gate: a run this store already holds is
+// skipped before the roster is touched, so a Resume racing the claim tick cannot double-admit it.
+func TestClaimQueuedSkipsHeldRun(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.queueStore("node-a", 10*time.Second, map[string]int{"deploys": 1})
+	ctx := context.Background()
+
+	startQueuedRun(t, a, "app-1", "deploys")
+	e := scanOne(t, a)
+
+	if _, won := a.claimEntry(ctx, deployFSM, e); !won {
+		t.Fatal("expected node-a to win the first queued claim")
+	}
+	// A second claim of the same run on the same store falls out at reserveClaim without re-admitting.
+	if _, won := a.claimEntry(ctx, deployFSM, e); won {
+		t.Fatal("expected the repeat claim of a held run to be skipped")
+	}
+
+	q, _, err := a.getQueue(ctx, "deploys")
+	if err != nil {
+		t.Fatalf("getQueue: %v", err)
+	}
+	if len(q.GetJobs()) != 1 {
+		t.Fatalf("expected exactly one roster slot after a repeat claim, got %+v", q.GetJobs())
+	}
+}
+
+// TestClaimQueuedReleasesSlotOnLostRace covers the RFC's "Interaction with run manifests"
+// compensation: when a node admits a queued run into the roster but then loses the manifest claim,
+// it must release the admitted slot rather than leak it.
+func TestClaimQueuedReleasesSlotOnLostRace(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.queueStore("node-a", 10*time.Second, map[string]int{"deploys": 1})
+	b := h.queueStore("node-b", 10*time.Second, map[string]int{"deploys": 1})
+	ctx := context.Background()
+
+	run := startQueuedRun(t, a, "app-1", "deploys")
+	e := scanOne(t, a) // a's claimable snapshot, captured before b takes the manifest
+
+	// b wins the manifest first, so a's later claimReserved loses the race.
+	if _, err := b.claimManifest(ctx, run.StartVersion); err != nil {
+		t.Fatalf("node-b claim: %v", err)
+	}
+
+	if _, won := a.claimEntry(ctx, deployFSM, e); won {
+		t.Fatal("expected node-a to lose the queued claim after b took the manifest")
+	}
+
+	q, _, err := a.getQueue(ctx, "deploys")
+	if err != nil {
+		t.Fatalf("getQueue: %v", err)
+	}
+	if findJob(q, run.StartVersion) != nil {
+		t.Fatalf("expected node-a's admitted slot released after losing the claim, got %+v", q.GetJobs())
+	}
+}
+
+// TestReleaseLeaseFreesQueueSlot asserts the graceful-release path (Close / ForgetRun): releasing a
+// queued run's lease also frees its roster slot, so a peer re-admits at once instead of waiting out
+// the heartbeat timeout.
+func TestReleaseLeaseFreesQueueSlot(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.queueStore("node-a", 10*time.Second, map[string]int{"deploys": 1})
+	ctx := context.Background()
+
+	run := startQueuedRun(t, a, "app-1", "deploys")
+	if _, won := a.claimEntry(ctx, deployFSM, scanOne(t, a)); !won {
+		t.Fatal("expected node-a to claim the queued run")
+	}
+
+	epoch, ok := a.ownedEpoch(run.StartVersion)
+	if !ok {
+		t.Fatal("expected node-a to hold the lease after claiming")
+	}
+	a.releaseLease(ctx, run.StartVersion, epoch)
+
+	q, _, err := a.getQueue(ctx, "deploys")
+	if err != nil {
+		t.Fatalf("getQueue: %v", err)
+	}
+	if findJob(q, run.StartVersion) != nil {
+		t.Fatalf("expected the roster slot freed on lease release, got %+v", q.GetJobs())
+	}
+}
