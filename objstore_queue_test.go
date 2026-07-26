@@ -130,18 +130,33 @@ func TestHeartbeatQueuesReAddsMissing(t *testing.T) {
 	}
 }
 
-// TestAdmitQueuedUnconfiguredUngated confirms the fallback: a queue this node has no capacity
-// configured for admits without a limit and creates no roster object, matching the in-process
-// runner's unknown-queue behavior.
-func TestAdmitQueuedUnconfiguredUngated(t *testing.T) {
+// TestAdmitQueuedUnconfiguredDefersToRoster confirms a node missing the queue from its own config
+// still honors the cluster limit: with no roster it defers (does not admit ungated, creates no
+// roster), and once a configured node seeds the roster it gates against that authoritative capacity.
+func TestAdmitQueuedUnconfiguredDefersToRoster(t *testing.T) {
 	h := newLeaseHarness(t)
-	s := h.queueStore("node-a", 30*time.Second, nil)
+	unconfigured := h.queueStore("node-x", 30*time.Second, nil)
+	configured := h.queueStore("node-a", 30*time.Second, map[string]int{"q": 1})
 	ctx := context.Background()
 
-	mustAdmit(t, s, "unknown", ulid.Make(), true)
-	if _, _, err := s.getQueue(ctx, "unknown"); !errors.Is(err, ErrFsmNotFound) {
-		t.Fatalf("expected no roster object for an ungated admit, got err=%v", err)
+	// No roster yet and no configured capacity to seed one: the unconfigured node does NOT admit
+	// (the run stays pending for a configured node) and creates no roster.
+	mustAdmit(t, unconfigured, "q", ulid.Make(), false)
+	if _, _, err := unconfigured.getQueue(ctx, "q"); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected no roster created by an unconfigured node, got err=%v", err)
 	}
+
+	// Once a configured node seeds the roster (capacity 1, one job), the unconfigured node gates
+	// against the roster's authoritative capacity instead of bypassing it.
+	v := ulid.Make()
+	mustAdmit(t, configured, "q", v, true)              // fills the single slot
+	mustAdmit(t, unconfigured, "q", ulid.Make(), false) // roster full → not admitted
+
+	// Freeing the slot lets the unconfigured node admit, still within the roster's capacity.
+	if err := configured.releaseQueued(ctx, "q", v); err != nil {
+		t.Fatalf("releaseQueued: %v", err)
+	}
+	mustAdmit(t, unconfigured, "q", ulid.Make(), true)
 }
 
 // TestQueueCapacityClusterWide is the multi-node contract test: several managers sharing one bucket

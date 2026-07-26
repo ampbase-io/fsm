@@ -64,7 +64,16 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 		creating := false
 		switch {
 		case errors.Is(err, ErrFsmNotFound):
-			queue = &fsmv1.QueueFile{Capacity: int32(s.queues[name])}
+			// The roster does not exist yet. Only a node that has the queue configured can seed its
+			// authoritative capacity, so an unconfigured node skips here (no write): admitQueued
+			// then leaves the run pending for a configured node — rather than admitting ungated and
+			// breaking the cluster limit — and release/heartbeat have nothing to do on an absent
+			// roster.
+			capacity, ok := s.queueCapacity(name)
+			if !ok {
+				return nil
+			}
+			queue = &fsmv1.QueueFile{Capacity: int32(capacity)}
 			creating = true
 		case err != nil:
 			return backoff.Permanent(err)
@@ -119,15 +128,12 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 // only after the run's manifest passed the claimable check, so this node is the run's legitimate
 // taker: a job already owned by this node is treated as admitted (idempotent); a fresh job held by
 // another node is left alone (a stale scan — that node is handling the run, resolved next pass); a
-// full roster returns (false, nil) so the run stays pending for a later pass. A queue with no
-// configured capacity on this node is admitted ungated, matching the in-process runner's
-// unknown-queue fallback.
+// full roster returns (false, nil) so the run stays pending for a later pass. Admission always gates
+// against the roster's stored capacity, so a node that lacks the queue in its own config still
+// honors the cluster limit once a configured node has seeded the roster; if no roster exists yet and
+// this node cannot seed one (no configured capacity), it returns (false, nil) — leaving the run
+// pending for a configured node rather than running it ungated (casQueue).
 func (s *objectStore) admitQueued(ctx context.Context, name string, version ulid.ULID) (bool, error) {
-	if _, ok := s.queueCapacity(name); !ok {
-		s.logger.WithField("queue", name).Warn("queued run references a queue not configured on this node; admitting without a capacity limit")
-		return true, nil
-	}
-
 	admitted := false
 	_, err := s.casQueue(ctx, name, func(q *fsmv1.QueueFile) error {
 		changed := s.reclaimStaleJobs(q)
@@ -193,6 +199,13 @@ func (s *objectStore) heartbeatQueues(ctx context.Context) {
 // reclaimStaleJobs drops roster entries whose heartbeat is older than the lease timeout — the slots
 // of nodes that died or lost the run — and reports whether any were removed. Staleness uses the
 // lease timeout so a job and its owner's manifest lease expire together on a crash.
+//
+// Staleness is a local-clock liveness heuristic, mirroring lease expiry (claimable): a roster slot
+// carries no fencing token, unlike the manifest's lease epoch. So a node whose clock runs far ahead
+// of a peer — or a peer paused longer than the lease timeout — can reclaim a still-live slot and
+// admit another run, briefly exceeding capacity. Capacity is therefore a soft limit under clock
+// skew, the same trade-off the RFC accepts for lease takeover (correctness of run *state* still
+// rests on the epoch CAS; only the concurrency count is heuristic).
 func (s *objectStore) reclaimStaleJobs(q *fsmv1.QueueFile) bool {
 	cutoff := time.Now().Add(-s.cfg.leaseTimeout()).UnixMilli()
 	kept := q.Jobs[:0]

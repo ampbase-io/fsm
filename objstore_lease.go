@@ -331,7 +331,12 @@ func (s *objectStore) claimQueued(ctx context.Context, f *fsm, e lockEntry, queu
 	// claimReserved drops the reservation on failure; releaseQueued gives the admitted slot back.
 	manifest, err := s.claimReserved(ctx, e.version, queue)
 	if err != nil {
-		s.releaseQueued(ctx, queue, e.version)
+		// Release on a fresh context: a claim canceled by shutdown leaves ctx canceled, and the
+		// compensating release must still land or the admitted slot leaks until its heartbeat goes
+		// stale (this run was never tracked as held, so Close's lease sweep won't free it).
+		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+		s.releaseQueued(releaseCtx, queue, e.version)
+		cancel()
 		if !errors.Is(err, errClaimLost) && !errors.Is(err, ErrFsmNotFound) {
 			s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim queued run")
 		}
