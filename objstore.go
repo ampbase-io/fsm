@@ -96,6 +96,12 @@ type objectStore struct {
 	// WaitRun's poll ceiling — with no bus injected it is the no-op and the poll floors stand.
 	bus EventBus
 
+	// queues maps a queue name to its configured capacity, seeding the queues/ roster object on
+	// first write and gating cluster-wide admission (objstore_queue.go). A queued run naming a
+	// queue absent here runs ungated on this node, matching the in-process runner's unknown-queue
+	// fallback. Nil when no queues are configured.
+	queues map[string]int
+
 	// leases tracks this node's claim on each run: mid-claim (reserved, so concurrent
 	// same-store claimers cannot both win) or held at the epoch that every run-mutating
 	// manifest CAS re-verifies. Any loss — a fence tripped in Append, a steal discovered at
@@ -114,7 +120,7 @@ type objectStore struct {
 	finishes map[ulid.ULID]runFinish
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string, bus EventBus) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -143,6 +149,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		cfg:      cfg,
 		node:     nodeID,
 		bus:      busOrNoop(bus),
+		queues:   queues,
 		leases:   map[ulid.ULID]lease{},
 		finishes: map[ulid.ULID]runFinish{},
 	}, nil

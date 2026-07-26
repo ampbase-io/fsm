@@ -354,7 +354,9 @@ func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey st
 	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
 	case err == nil:
 		if !unowned {
-			s.trackLease(run.StartVersion, 1)
+			// A leased START is never admission-controlled — queued runs are persisted unowned so
+			// the claim loop admits them (see Manager.start) — so it holds no queue-roster slot.
+			s.trackLease(run.StartVersion, 1, "")
 		}
 		return nil
 	case errors.Is(err, errPreconditionFailed):
@@ -385,7 +387,7 @@ func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey str
 		return ErrLeaseLost
 	}
 
-	s.trackLease(run.StartVersion, existing.GetLeaseEpoch())
+	s.trackLease(run.StartVersion, existing.GetLeaseEpoch(), admissionQueue(existing))
 	return nil
 }
 
@@ -504,6 +506,20 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 
 	s.completeFinish(run.StartVersion, run.fsmErr)
 
+	// Free the queue slot this run held, then wake peers so a run pending on this queue is admitted
+	// at once instead of on the next periodic pass. Gated on admission-controlled runs — a
+	// delayed/run-after run holds no roster slot, and gating the wakeup keeps an ordinary finish
+	// from stampeding every node's claim loop. The publish follows the release so a woken peer
+	// reads the already-freed slot.
+	if releaseQueue := admissionQueue(manifest); releaseQueue != "" {
+		if err := s.releaseQueued(ctx, releaseQueue, run.StartVersion); err != nil {
+			s.logger.WithError(err).WithField("run_version", run.StartVersion.String()).WithField("queue", releaseQueue).Error("failed to release queue slot")
+		}
+		if busIsLive(s.bus) {
+			s.publishSignal(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
+		}
+	}
+
 	// The finish cleanup is complete — lock deleted, history written, outcome recorded — so a
 	// waiter released now observes everything fsm.run.done implies.
 	if busIsLive(s.bus) {
@@ -547,6 +563,18 @@ func activeEventFromManifest(m *fsmv1.RunManifest) *fsmv1.ActiveEvent {
 // progress.
 func manifestTerminal(m *fsmv1.RunManifest) bool {
 	return m.GetStatus() == fsmv1.RunState_RUN_STATE_COMPLETE || m.GetStatus() == fsmv1.RunState_RUN_STATE_ARCHIVED
+}
+
+// admissionQueue returns the queue whose cluster-wide capacity gates this run, or "" when the run
+// does not pass through a queue's shared limit — the manifest-side counterpart of
+// admissionControlled, classifying through the same queueGated rule. A delay or run-after
+// dependency takes precedence over the queue, so such a run executes locally on its owner and holds
+// no queue-roster slot.
+func admissionQueue(m *fsmv1.RunManifest) string {
+	if !queueGated(m.GetQueue(), m.GetDelayUntil() != 0, len(m.GetRunAfter()) != 0) {
+		return ""
+	}
+	return m.GetQueue()
 }
 
 // manifestRunErr rebuilds the run error recorded in the manifest.

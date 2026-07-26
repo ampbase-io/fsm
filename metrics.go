@@ -36,6 +36,26 @@ var (
 		},
 		[]string{"result"},
 	)
+
+	// Distributed-queue instrumentation for the object backend's cluster-wide admission (Phase 5,
+	// objstore_queue.go). Depth is the admitted/in-flight count in a queue's roster object —
+	// pending queued runs live under locks/, not the roster; commits count the roster CAS flushes,
+	// the brokerless-CAS analogue of the base RFC's group-commit broker.
+	queueDepthVec = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "fsm_queue_depth",
+			Help: "Number of admitted (in-flight) runs in a queue's roster, by queue.",
+		},
+		[]string{"queue"},
+	)
+
+	queueCommitsVec = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fsm_queue_broker_commits_total",
+			Help: "A count of successful queue-roster CAS writes, by queue.",
+		},
+		[]string{"queue"},
+	)
 )
 
 // storageOutcome classifies a raw object storage error into the latency histogram's outcome
