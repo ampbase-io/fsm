@@ -61,20 +61,18 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 	var result *fsmv1.QueueFile
 	op := func() error {
 		queue, etag, err := s.getQueue(ctx, name)
-		creating := false
 		switch {
 		case errors.Is(err, ErrFsmNotFound):
 			// The roster does not exist yet. Only a node that has the queue configured can seed its
 			// authoritative capacity, so an unconfigured node skips here (no write): admitQueued
 			// then leaves the run pending for a configured node — rather than admitting ungated and
 			// breaking the cluster limit — and release/heartbeat have nothing to do on an absent
-			// roster.
+			// roster. The empty etag from the miss signals a create to putRoster below.
 			capacity, ok := s.queueCapacity(name)
 			if !ok {
 				return nil
 			}
 			queue = &fsmv1.QueueFile{Capacity: int32(capacity)}
-			creating = true
 		case err != nil:
 			return backoff.Permanent(err)
 		}
@@ -92,18 +90,7 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 			return backoff.Permanent(fmt.Errorf("marshal queue %s: %w", name, err))
 		}
 
-		// A create races other creators via If-None-Match; a lost create (412) becomes an
-		// etag mismatch so the retry re-reads and CASes against the winner's roster.
-		var werr error
-		if creating {
-			werr = s.putIfAbsent(ctx, key, body)
-			if errors.Is(werr, errPreconditionFailed) {
-				werr = errEtagMismatch
-			}
-		} else {
-			werr = s.putIfMatch(ctx, key, body, etag)
-		}
-		switch {
+		switch werr := s.putRoster(ctx, key, body, etag); {
 		case werr == nil:
 			queueCommitsVec.WithLabelValues(name).Inc()
 			queueDepthVec.WithLabelValues(name).Set(float64(len(queue.GetJobs())))
@@ -121,6 +108,21 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 		return nil, err
 	}
 	return result, nil
+}
+
+// putRoster persists the roster body under the right conditional and classifies the result for
+// casQueue's retry loop: a new roster (no prior etag) is created with If-None-Match, an existing one
+// updated with an If-Match compare-and-swap. A create that loses the race (412) is reported as an
+// etag mismatch, so casQueue re-reads and CASes against the winner's roster.
+func (s *objectStore) putRoster(ctx context.Context, key string, body []byte, etag string) error {
+	if etag != "" {
+		return s.putIfMatch(ctx, key, body, etag)
+	}
+	err := s.putIfAbsent(ctx, key, body)
+	if errors.Is(err, errPreconditionFailed) {
+		return errEtagMismatch
+	}
+	return err
 }
 
 // admitQueued CAS-admits version into the queue roster iff there is capacity, reclaiming jobs whose
