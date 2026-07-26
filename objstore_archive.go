@@ -141,12 +141,19 @@ func (s *objectStore) archivable(ctx context.Context, key string, cutoff int64) 
 	case errors.Is(err, ErrFsmNotFound), errors.Is(err, context.Canceled):
 		return nil
 	case err != nil:
+		// TODO(poison): a manifest that keeps failing to read/decode (corrupt object) is logged
+		// and skipped every pass forever — never reaped, recurring error noise. Fold into the
+		// carried poison-run backoff/dead-letter follow-up so a persistently bad object is quarantined.
 		s.logger.WithError(err).WithField("run_version", version.String()).Error("archive: failed to read manifest")
 		return nil
 	}
 	if !manifestTerminal(manifest) {
 		return nil
 	}
+	// TODO(migration): a terminal manifest with completed_at==0 predates the field and is never
+	// reaped by this loop (only operator S3 lifecycle bounds it). A backfill belongs with Phase 6
+	// migration tooling; the run version's ULID time is the START, not completion, so it is not a
+	// safe age proxy for a long-running run.
 	if completedAt := manifest.GetCompletedAt(); completedAt == 0 || completedAt > cutoff {
 		return nil
 	}
@@ -164,7 +171,11 @@ func (s *objectStore) reapRun(ctx context.Context, version ulid.ULID, manifest *
 	}
 
 	// Delete the transient objects: the events (audit trail), the children pointers this run owns
-	// as a parent, and the now-inert cancel sentinel (closing the cancel-sentinel GC gap).
+	// as a parent, and the now-inert cancel sentinel (closing the cancel-sentinel GC gap). Only the
+	// forward pointers (this run as parent) are reclaimed here; the pointer under this run's own
+	// parent (children/<parent>/<version>) is reclaimed when that parent is reaped, matching bolt.
+	// TODO(scale): deletePrefix deletes one key per round trip; a very event-heavy run could use an
+	// S3 batch delete (up to 1000 keys) or a bounded fan-out — the same scale lever noted on the scan.
 	if err := s.deletePrefix(ctx, s.eventPrefix(manifest.GetResourceId(), manifest.GetAction(), version)); err != nil {
 		return err
 	}

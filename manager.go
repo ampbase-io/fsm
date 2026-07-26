@@ -163,6 +163,9 @@ func New(cfg Config) (*Manager, error) {
 		man.logger.Info("no admin socket path configured, admin service disabled")
 	default:
 		if err := man.serveAdmin(socket); err != nil {
+			// The store was constructed above and has already started its background loop(s)
+			// (the object archive loop, bolt's archive loop); close it so a failed New leaks none.
+			store.Close()
 			return nil, err
 		}
 	}

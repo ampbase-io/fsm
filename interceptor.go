@@ -68,14 +68,23 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 // finishEvent builds a run's terminal FINISH event, recorded in the given state. It is the one
 // shape completion is driven through: the run loop's finisher for a normal end, and a
 // pre-execution cancel (cancelOwnedRun) for a run terminated before it ran.
+//
+// A halted run carries its error onto the FINISH event so the terminal record preserves it: once
+// the archive loop reaps the manifest, the history record is the only outcome source, and
+// historyOutcome reads the error off this event (the manifest's error is gone). Without it, a
+// failed run would report success after archival.
 func finishEvent(run Run, state string) *fsmv1.StateEvent {
-	return &fsmv1.StateEvent{
+	event := &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_FINISH,
 		Id:           run.ID,
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        state,
 	}
+	if run.fsmErr.Err != nil {
+		event.Error = run.fsmErr.Err.Error()
+	}
+	return event
 }
 
 // skipper will skip executing the next transition if the FSM has already errored.

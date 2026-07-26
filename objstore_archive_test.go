@@ -264,6 +264,37 @@ func TestArchiveSkipsUnreconstructableHistory(t *testing.T) {
 	}
 }
 
+func TestArchivedFailedRunPreservesError(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.store("node-a", 10*time.Second)
+	b := h.store("node-b", 10*time.Second)
+	ctx := context.Background()
+
+	// node-a starts and finishes a run with a halt error; the FINISH event and manifest both
+	// record the cause.
+	run := startRun(t, a, "arch-failed")
+	run.fsmErr = RunErr{Err: errors.New("boom"), State: "exploding"}
+	if _, err := a.Append(ctx, run, finishEvent(run, "exploding"), run.Queue); err != nil {
+		t.Fatalf("failed to finish run with error: %v", err)
+	}
+	ageRun(t, a, run.StartVersion, pastRetention)
+
+	a.runArchive(ctx)
+	if _, _, err := a.getManifest(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected the run reaped, got %v", err)
+	}
+
+	// A peer that never ran the finish (no local finish state, manifest gone) must still observe
+	// the run's error through the history fallback — otherwise archival turns a failure into a
+	// silent success.
+	switch err := b.WaitRun(ctx, run.StartVersion); {
+	case err == nil:
+		t.Fatal("archived failed run reported success; its error was lost when the manifest was reaped")
+	case err.Error() != "boom":
+		t.Fatalf("expected the run's error preserved through archival, got %v", err)
+	}
+}
+
 func TestArchiveConcurrentPassesAreSafe(t *testing.T) {
 	h := newLeaseHarness(t)
 	a := h.store("node-a", 10*time.Second)
