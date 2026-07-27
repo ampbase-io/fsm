@@ -68,4 +68,9 @@ message RunManifest {
   int64 created_at = 25;
 
   int64 updated_at = 26;
+
+  // completed_at is Unix seconds, set once when the run reaches a terminal status. The archive
+  // loop reads it to decide when a completed run has aged past retention. A dedicated field,
+  // rather than reusing updated_at, so a later manifest CAS cannot move the retention clock.
+  int64 completed_at = 27;
 }

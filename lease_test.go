@@ -68,6 +68,7 @@ func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectS
 	if err != nil {
 		h.t.Fatalf("failed to create object store: %v", err)
 	}
+	h.t.Cleanup(func() { store.Close() })
 	return store
 }
 

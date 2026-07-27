@@ -28,6 +28,11 @@ func (s *objectStore) manifestKey(runVersion ulid.ULID) string {
 	return s.key("runs", runVersion.String())
 }
 
+// runsPrefix lists every run manifest; the archive loop scans it for completed runs to reclaim.
+func (s *objectStore) runsPrefix() string {
+	return s.key("runs") + "/"
+}
+
 // lockKey returns the resource lock key enforcing one-active-run-per-resource. Queued runs are
 // allowed to stack, so their locks are further keyed by run version.
 func (s *objectStore) lockKey(resourceType, resourceID, action, queue string, runVersion ulid.ULID) string {
@@ -468,6 +473,11 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
 		m.EventCount++
+		// The retention clock the archive loop reads. Set once at the flip to terminal, never
+		// moved by a later CAS (see completed_at in manifest.proto).
+		if m.CompletedAt == 0 {
+			m.CompletedAt = time.Now().Unix()
+		}
 		// LatestResponse is not set here: the last transition's COMPLETE already materialized it
 		// (appendMidRun), so RunResult reads it from the terminal manifest, race-free and
 		// cross-node. The FINISH event still carries that same response for the history record.
@@ -497,10 +507,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete resource lock")
 	}
 
-	if err := s.writeHistory(ctx, run.StartVersion, &fsmv1.HistoryEvent{
-		ActiveEvent: activeEventFromManifest(manifest),
-		LastEvent:   event,
-	}); err != nil {
+	if err := s.writeHistory(ctx, run.StartVersion, historyFromManifest(manifest, event)); err != nil {
 		return err
 	}
 
@@ -556,6 +563,16 @@ func activeEventFromManifest(m *fsmv1.RunManifest) *fsmv1.ActiveEvent {
 			Parent:     m.GetParent(),
 		},
 		TraceContext: m.GetTraceContext(),
+	}
+}
+
+// historyFromManifest builds the durable history record for a completed run from its manifest and
+// its FINISH event. Both the finish path and the archive loop's crash-repair go through it, so the
+// record the two write cannot drift.
+func historyFromManifest(m *fsmv1.RunManifest, finishEvent *fsmv1.StateEvent) *fsmv1.HistoryEvent {
+	return &fsmv1.HistoryEvent{
+		ActiveEvent: activeEventFromManifest(m),
+		LastEvent:   finishEvent,
 	}
 }
 
@@ -1058,10 +1075,15 @@ func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string)
 	return runs, nil
 }
 
-// Close releases every lease this node still holds so peers can claim its runs immediately
-// instead of waiting out the lease timeout.
+// Close stops the archive loop and releases every lease this node still holds so peers can claim
+// its runs immediately instead of waiting out the lease timeout.
 func (s *objectStore) Close() error {
 	s.logger.Info("shutting down object store")
+
+	if s.archiveCancel != nil {
+		s.archiveCancel()
+		<-s.archiveDone
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 	defer cancel()

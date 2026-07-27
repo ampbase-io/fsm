@@ -42,6 +42,19 @@ type ObjectStorageConfig struct {
 	// manifest poll floor.
 	WaitPollInterval    time.Duration // Default 100ms
 	WaitPollMaxInterval time.Duration // Default 2s
+
+	// ArchiveRetention is how long a completed run's transient objects (manifest, events,
+	// children, cancel sentinel) are kept before the archive loop reclaims them; its durable
+	// record in history/ and index/ is untouched. Default-on at one week, so storage growth is
+	// bounded out of the box — leaving it unset enables deletion, it does not disable it.
+	ArchiveRetention time.Duration // Default 7 days
+
+	// ArchiveDisabled opts out of the archive loop entirely: no goroutine is started and nothing
+	// is reclaimed, for operators who bound growth with S3 lifecycle rules alone.
+	ArchiveDisabled bool
+
+	// ArchiveInterval is how often the archive pass runs, jittered per node. Default 10m.
+	ArchiveInterval time.Duration // Default 10m
 }
 
 func (c *ObjectStorageConfig) prefix() string {
@@ -77,6 +90,14 @@ func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
 
 func (c *ObjectStorageConfig) waitPollMaxInterval() time.Duration {
 	return orDefault(c.WaitPollMaxInterval, 2*time.Second)
+}
+
+func (c *ObjectStorageConfig) archiveRetention() time.Duration {
+	return orDefault(c.ArchiveRetention, 7*24*time.Hour)
+}
+
+func (c *ObjectStorageConfig) archiveInterval() time.Duration {
+	return orDefault(c.ArchiveInterval, 10*time.Minute)
 }
 
 // objectStore implements the Store interface over S3-compatible object storage.
@@ -118,6 +139,14 @@ type objectStore struct {
 	// convenience, not state: evicted waiters fall back to the manifest's recorded error.
 	finishMu sync.Mutex
 	finishes map[ulid.ULID]runFinish
+
+	// The archive loop's lifecycle. archiveCancel stops it (from Close); archiveDone closes when
+	// it has exited, so Close blocks until the in-flight pass returns; archiveCh is a test-only
+	// signal that wakes the loop between intervals. (boltStore overloads one archiveCh for both
+	// the signal and the done-close; here the two roles are split.) All nil when disabled.
+	archiveCancel context.CancelFunc
+	archiveDone   chan struct{}
+	archiveCh     chan struct{}
 }
 
 func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
@@ -143,7 +172,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		o.UsePathStyle = true
 	})
 
-	return &objectStore{
+	s := &objectStore{
 		logger:   logger.WithField("node_id", nodeID),
 		client:   client,
 		cfg:      cfg,
@@ -152,7 +181,19 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 		queues:   queues,
 		leases:   map[ulid.ULID]lease{},
 		finishes: map[ulid.ULID]runFinish{},
-	}, nil
+	}
+
+	// The archive loop reclaims completed runs past retention. It is store-scoped (it only
+	// touches store objects) with its own context so Close can stop it independently of any run.
+	if !cfg.ArchiveDisabled {
+		archiveCtx, cancel := context.WithCancel(context.Background())
+		s.archiveCancel = cancel
+		s.archiveDone = make(chan struct{})
+		s.archiveCh = make(chan struct{})
+		go s.archive(archiveCtx)
+	}
+
+	return s, nil
 }
 
 // nodeID returns this node's identity, recorded on run spans as fsm.owner_node. It satisfies the
@@ -371,6 +412,21 @@ func (s *objectStore) deleteObject(ctx context.Context, key string) error {
 	observeStorage("delete", start, err)
 	if err != nil {
 		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
+}
+
+// deletePrefix lists every key under prefix and deletes it. Deleting an already-gone key is a
+// no-op, so a caller that resumes after a partial previous pass completes idempotently.
+func (s *objectStore) deletePrefix(ctx context.Context, prefix string) error {
+	keys, err := s.listKeys(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := s.deleteObject(ctx, key); err != nil {
+			return err
+		}
 	}
 	return nil
 }

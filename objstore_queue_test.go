@@ -27,6 +27,7 @@ func (h *leaseHarness) queueStore(nodeID string, leaseTimeout time.Duration, que
 	if err != nil {
 		h.t.Fatalf("failed to create object store: %v", err)
 	}
+	h.t.Cleanup(func() { store.Close() })
 	return store
 }
 
