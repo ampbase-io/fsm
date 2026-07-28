@@ -10,33 +10,26 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// leaseCoordinator is the coordinate loop's view of a lease-owning backend: the full set of
-// lease/claim/cancel primitives one heartbeat-and-claim pass drives. The object backend
-// implements it; BoltDB does not, so the Manager starts no coordination loop for BoltDB. It is
-// asserted once in New — per-run call sites outside the loop depend instead on the narrow
-// capability views below, each naming just the primitive that site uses.
+// leaseCoordinator is the coordinate loop's view of a lease-owning backend: everything one
+// heartbeat-and-claim pass drives, composed of the narrow roles its helpers each use plus the two
+// heartbeat methods. The object backend implements it; BoltDB does not, so the Manager runs no
+// coordination loop for BoltDB. It is asserted once in New, and only the loop consumes it — every
+// per-run call site and every loop helper depends on the narrow view it actually uses, not this
+// union.
 type leaseCoordinator interface {
+	runClaimer    // claimPass
+	fencer        // cancelUnleased
+	cancelSweeper // sweepCancellations
 	// extendLeases performs one heartbeat pass over every held lease, dropping any found
 	// lost; the caller sweeps for executing runs left without a lease.
 	extendLeases(ctx context.Context)
-	runClaimer
-	fencer
-	cancelRecorder
-	nodeIdentified
 	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
-
-	// pendingCancellations returns the cancel sentinels covering runs this node owns — keyed by
-	// run version, valued by cause — from one keys-only listing of the cancel prefix
-	// intersected with the owned set.
-	pendingCancellations(ctx context.Context) (map[ulid.ULID]error, error)
-	// cancelOwnedRun drives an owned-but-not-executing run to a terminal canceled state.
-	cancelOwnedRun(ctx context.Context, version ulid.ULID, cause error) error
 }
 
-// The narrow capability views a store may satisfy. Each per-run call site asserts only the one it
-// uses, so the site depends on the exact primitive it needs and BoltDB — which implements none of
-// them — is excluded structurally, without a nil field or a fictional no-op implementation.
+// The narrow capability views a store may satisfy. Each consumer — a per-run call site or a
+// coordinate-loop helper — depends on just the view it uses, so BoltDB, which implements none of
+// them, is excluded structurally, without a nil field or a fictional no-op implementation.
 
 // runClaimer is a backend that distributes runs through the claim loop. Asserting it both drives
 // resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
@@ -64,6 +57,17 @@ type cancelRecorder interface {
 // nodeIdentified is a backend with a node identity, recorded on run spans as fsm.owner_node.
 type nodeIdentified interface {
 	nodeID() string
+}
+
+// cancelSweeper is the coordinate loop's cancel-sweep view: find the cancels covering runs this
+// node owns and drive each owned-but-idle run to a terminal canceled state.
+type cancelSweeper interface {
+	// pendingCancellations returns the cancel sentinels covering runs this node owns — keyed by
+	// run version, valued by cause — from one keys-only listing of the cancel prefix
+	// intersected with the owned set.
+	pendingCancellations(ctx context.Context) (map[ulid.ULID]error, error)
+	// cancelOwnedRun drives an owned-but-not-executing run to a terminal canceled state.
+	cancelOwnedRun(ctx context.Context, version ulid.ULID, cause error) error
 }
 
 // claimWakeDelay is the small, jittered pause before an idle worker scans on a pending-event
@@ -196,8 +200,8 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 // node owns but has not begun executing (pending, delayed, queued) has no context to cancel, so
 // it is driven to a terminal canceled manifest directly, or its waiters would poll to their
 // deadline.
-func (m *Manager) sweepCancellations(ctx context.Context, lc leaseCoordinator) {
-	cancels, err := lc.pendingCancellations(ctx)
+func (m *Manager) sweepCancellations(ctx context.Context, sweeper cancelSweeper) {
+	cancels, err := sweeper.pendingCancellations(ctx)
 	if err != nil {
 		m.logger.WithError(err).Error("cancel sweep failed")
 		return
@@ -206,7 +210,7 @@ func (m *Manager) sweepCancellations(ctx context.Context, lc leaseCoordinator) {
 		if m.cancelRunning(version, cause) {
 			continue
 		}
-		if err := lc.cancelOwnedRun(ctx, version, cause); err != nil {
+		if err := sweeper.cancelOwnedRun(ctx, version, cause); err != nil {
 			m.logger.WithError(err).WithField("run_version", version.String()).Error("failed to cancel owned run")
 		}
 	}
@@ -228,9 +232,9 @@ func stoppedTimer() *time.Timer {
 // latency courtesy. A run in its finish tail (lease already dropped, goroutine not yet
 // deregistered) may be swept benignly: its durable writes are done, and Append is
 // cancellation-immune regardless.
-func (m *Manager) cancelUnleased(lc leaseCoordinator) {
+func (m *Manager) cancelUnleased(f fencer) {
 	for _, version := range m.runningVersions() {
-		if _, owned := lc.ownedEpoch(version); owned {
+		if _, owned := f.ownedEpoch(version); owned {
 			continue
 		}
 		m.logger.WithField("run_version", version.String()).Warn("run lease lost")
@@ -245,8 +249,8 @@ func (m *Manager) runningVersions() []ulid.ULID {
 }
 
 // claimPass claims and dispatches eligible runs across every registered FSM.
-func (m *Manager) claimPass(ctx context.Context, lc leaseCoordinator) {
-	claimed, err := lc.claimRuns(ctx, m.registeredFSMs())
+func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
+	claimed, err := claimer.claimRuns(ctx, m.registeredFSMs())
 	if err != nil {
 		m.logger.WithError(err).Error("claim pass failed")
 		return
