@@ -36,9 +36,6 @@ type Manager struct {
 
 	store Store
 
-	// lc is non-nil when store coordinates run ownership via leases.
-	lc leaseCoordinator
-
 	// bus is the subscribe half of the event transport; the coordinate loop subscribes to it
 	// for claim wakeup. The manager only ever subscribes — the object store owns publishing.
 	// Defaults to a no-op bus when none is injected.
@@ -137,11 +134,16 @@ func New(cfg Config) (*Manager, error) {
 		running:    map[ulid.ULID]context.CancelCauseFunc{},
 	}
 
+	// A store that coordinates run ownership via leases runs the background coordinate loop and
+	// distributes work through it; one that does not is single-process. This is the only place the
+	// backend's nature is decided — per-run sites assert the narrow capability views instead.
+	lc, distributed := store.(leaseCoordinator)
+
 	// The in-process queuedRunner enforces a queue's limit per process — correct for BoltDB, where
 	// one process is the whole cluster. The object backend enforces queues cluster-wide through the
 	// claim loop's admission (objstore_queue.go) and never routes through these runners, so it
 	// starts none (they would otherwise be idle goroutines).
-	if _, distributed := store.(leaseCoordinator); !distributed {
+	if !distributed {
 		for name, size := range cfg.Queues {
 			q := &queuedRunner{
 				name:   name,
@@ -171,8 +173,7 @@ func New(cfg Config) (*Manager, error) {
 	}
 
 	// Started after the last fallible step, so a failed New leaks no coordination goroutine.
-	if lc, ok := store.(leaseCoordinator); ok {
-		man.lc = lc
+	if distributed {
 		man.wg.Add(1)
 		go func() {
 			defer man.wg.Done()
@@ -371,10 +372,10 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 // is the owner. A single-process backend cancels the local run directly.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
 	cerr := errors.New(cause)
-	if m.lc != nil {
+	if rec, ok := m.store.(cancelRecorder); ok {
 		// Record durably first — while the run is still active — so the owner reacts even if it
 		// is another node; then cancel locally for immediacy if we hold it.
-		if err := m.lc.requestCancel(ctx, version, cerr); err != nil {
+		if err := rec.requestCancel(ctx, version, cerr); err != nil {
 			return err
 		}
 		m.cancelRunning(version, cerr)
@@ -464,7 +465,7 @@ func (m *Manager) startOpaque(ctx context.Context, typeName, action, id string, 
 		return ulid.ULID{}, err
 	}
 
-	if m.lc == nil {
+	if _, ok := m.store.(runClaimer); !ok {
 		return f.startFromBytes(ctx, id, resource, opts...)
 	}
 

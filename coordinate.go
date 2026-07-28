@@ -10,36 +10,60 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// leaseCoordinator is implemented by backends whose runs are owned via leases. The BoltDB
-// backend does not implement it; the Manager starts no coordination loop without one.
+// leaseCoordinator is the coordinate loop's view of a lease-owning backend: the full set of
+// lease/claim/cancel primitives one heartbeat-and-claim pass drives. The object backend
+// implements it; BoltDB does not, so the Manager starts no coordination loop for BoltDB. It is
+// asserted once in New — per-run call sites outside the loop depend instead on the narrow
+// capability views below, each naming just the primitive that site uses.
 type leaseCoordinator interface {
 	// extendLeases performs one heartbeat pass over every held lease, dropping any found
 	// lost; the caller sweeps for executing runs left without a lease.
 	extendLeases(ctx context.Context)
-	// claimRuns claims every eligible run of the given FSMs, paired with the FSM that will
-	// resume each.
-	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
-	// owns reports whether this node currently holds the run's lease.
-	// TODO(follow-up): owns is derivable from ownedEpoch (`_, ok := ownedEpoch(v)`); collapse the
-	// two once the remaining owns caller (cancelUnleased) is updated.
-	owns(version ulid.ULID) bool
-	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
-	// the fencing token surfaced to handlers.
-	ownedEpoch(version ulid.ULID) (int64, bool)
+	runClaimer
+	fencer
+	cancelRecorder
+	nodeIdentified
 	// coordinationIntervals returns the heartbeat and claim cadence for the coordinate loop.
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
-	// nodeID returns this node's identity, recorded on run spans as fsm.owner_node.
-	nodeID() string
 
-	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
-	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
-	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
 	// pendingCancellations returns the cancel sentinels covering runs this node owns — keyed by
 	// run version, valued by cause — from one keys-only listing of the cancel prefix
 	// intersected with the owned set.
 	pendingCancellations(ctx context.Context) (map[ulid.ULID]error, error)
 	// cancelOwnedRun drives an owned-but-not-executing run to a terminal canceled state.
 	cancelOwnedRun(ctx context.Context, version ulid.ULID, cause error) error
+}
+
+// The narrow capability views a store may satisfy. Each per-run call site asserts only the one it
+// uses, so the site depends on the exact primitive it needs and BoltDB — which implements none of
+// them — is excluded structurally, without a nil field or a fictional no-op implementation.
+
+// runClaimer is a backend that distributes runs through the claim loop. Asserting it both drives
+// resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
+// execution-placement sites (an unowned Start the loop picks up, rather than local execution).
+type runClaimer interface {
+	// claimRuns claims every eligible run of the given FSMs, paired with the FSM that will
+	// resume each.
+	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
+}
+
+// fencer is a backend that fences runs by lease epoch.
+type fencer interface {
+	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
+	// the fencing token surfaced to handlers.
+	ownedEpoch(version ulid.ULID) (int64, bool)
+}
+
+// cancelRecorder is a backend that records a cancel durably for the owner to react to.
+type cancelRecorder interface {
+	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
+	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
+	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
+}
+
+// nodeIdentified is a backend with a node identity, recorded on run spans as fsm.owner_node.
+type nodeIdentified interface {
+	nodeID() string
 }
 
 // claimWakeDelay is the small, jittered pause before an idle worker scans on a pending-event
@@ -59,11 +83,12 @@ type claimedRun struct {
 // out only runs this node can claim, so a restarting node cannot hijack runs whose owner is
 // live; otherwise every active run is local by definition.
 func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	if m.lc == nil {
+	claimer, ok := m.store.(runClaimer)
+	if !ok {
 		return m.store.Active(ctx, f)
 	}
 
-	claimed, err := m.lc.claimRuns(ctx, []*fsm{f})
+	claimed, err := claimer.claimRuns(ctx, []*fsm{f})
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +230,7 @@ func stoppedTimer() *time.Timer {
 // cancellation-immune regardless.
 func (m *Manager) cancelUnleased(lc leaseCoordinator) {
 	for _, version := range m.runningVersions() {
-		if lc.owns(version) {
+		if _, owned := lc.ownedEpoch(version); owned {
 			continue
 		}
 		m.logger.WithField("run_version", version.String()).Warn("run lease lost")

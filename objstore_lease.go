@@ -106,12 +106,6 @@ func (s *objectStore) snapshotOwned() map[ulid.ULID]int64 {
 	return owned
 }
 
-// owns reports whether this node currently holds the run's lease.
-func (s *objectStore) owns(version ulid.ULID) bool {
-	_, ok := s.ownedEpoch(version)
-	return ok
-}
-
 func (s *objectStore) coordinationIntervals() (heartbeatEvery, claimEvery time.Duration) {
 	return s.cfg.heartbeatPeriod(), s.cfg.claimInterval()
 }

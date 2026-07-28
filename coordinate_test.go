@@ -41,8 +41,6 @@ func (s *stubCoordinator) claimRuns(context.Context, []*fsm) ([]claimedRun, erro
 	return nil, nil
 }
 
-func (s *stubCoordinator) owns(version ulid.ULID) bool { return s.held[version] }
-
 func (s *stubCoordinator) ownedEpoch(version ulid.ULID) (int64, bool) {
 	if !s.held[version] {
 		return 0, false

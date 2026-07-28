@@ -29,6 +29,13 @@ func newLeaseHarness(t *testing.T) *leaseHarness {
 	return &leaseHarness{t: t, bucket: bucket, url: url, fake: fake}
 }
 
+// owns reports whether the store currently holds the run's lease. The production owns method was
+// folded into ownedEpoch; tests keep this thin wrapper for readability.
+func owns(s *objectStore, version ulid.ULID) bool {
+	_, ok := s.ownedEpoch(version)
+	return ok
+}
+
 func mustManifest(t *testing.T, s *objectStore, version ulid.ULID) *fsmv1.RunManifest {
 	t.Helper()
 	manifest, _, err := s.getManifest(context.Background(), version)
@@ -203,7 +210,7 @@ func TestFencedAppendAfterSteal(t *testing.T) {
 
 	// The tripped fence dropped the lease, so the coordinate loop's sweep of executing runs
 	// without a lease cancels the local run.
-	if a.owns(run.StartVersion) {
+	if owns(a, run.StartVersion) {
 		t.Fatal("expected the fenced lease dropped")
 	}
 }
@@ -219,7 +226,7 @@ func TestExtendLeases(t *testing.T) {
 
 	time.Sleep(5 * time.Millisecond)
 	a.extendLeases(ctx)
-	if !a.owns(run.StartVersion) {
+	if !owns(a, run.StartVersion) {
 		t.Fatal("expected the heartbeat to keep a healthy lease")
 	}
 
@@ -234,7 +241,7 @@ func TestExtendLeases(t *testing.T) {
 		t.Fatalf("expected node-b to claim the expired run, got %v (err=%v)", claimed, err)
 	}
 	a.extendLeases(ctx)
-	if a.owns(run.StartVersion) {
+	if owns(a, run.StartVersion) {
 		t.Fatal("expected the stolen lease to be dropped")
 	}
 }
@@ -295,7 +302,7 @@ func TestUnownedStartClaimableByPeer(t *testing.T) {
 		t.Fatalf("failed to append unowned start: %v", err)
 	}
 
-	if ingress.owns(run.StartVersion) {
+	if owns(ingress, run.StartVersion) {
 		t.Fatal("an unowned start must not be leased to the persisting node")
 	}
 	manifest := mustManifest(t, ingress, run.StartVersion)
@@ -482,7 +489,7 @@ func TestAdoptRunManifest(t *testing.T) {
 	if err := b.adoptRunManifest(ctx, run, runLockKey(b, run)); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("expected a foreign adopter fenced with ErrLeaseLost, got %v", err)
 	}
-	if b.owns(run.StartVersion) {
+	if owns(b, run.StartVersion) {
 		t.Fatal("expected no lease tracked by the fenced adopter")
 	}
 }

@@ -41,7 +41,7 @@ func runnerFromOpts(opts *startOptions, m *Manager) runner {
 	case opts.runAfter.Compare(ulid.ULID{}) != 0:
 		return runAfter(m, opts.runAfter)
 	case opts.queue != "":
-		if m.lc != nil {
+		if _, ok := m.store.(runClaimer); ok {
 			// Object backend: the queue's cluster-wide capacity was already enforced when the claim
 			// loop admitted this run, so it executes directly. The in-process queuedRunner would
 			// re-limit per node (the N×size bug) — it is bolt-only.
