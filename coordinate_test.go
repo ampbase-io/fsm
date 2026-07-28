@@ -52,15 +52,22 @@ func (s *stubCoordinator) coordinationIntervals() (time.Duration, time.Duration)
 	return time.Hour, time.Hour
 }
 
-func (s *stubCoordinator) nodeID() string { return "stub-node" }
-
-func (s *stubCoordinator) requestCancel(context.Context, ulid.ULID, error) error { return nil }
-
 func (s *stubCoordinator) pendingCancellations(context.Context) (map[ulid.ULID]error, error) {
 	return nil, nil
 }
 
 func (s *stubCoordinator) cancelOwnedRun(context.Context, ulid.ULID, error) error { return nil }
+
+// heldLeases is a minimal fencer — the run versions this node is treated as owning — so
+// cancelUnleased can be driven with just the ownership seam it uses, not a whole coordinator.
+type heldLeases map[ulid.ULID]bool
+
+func (h heldLeases) ownedEpoch(version ulid.ULID) (int64, bool) {
+	if !h[version] {
+		return 0, false
+	}
+	return 1, true
+}
 
 // wakeCoordinator counts claim passes. It embeds stubCoordinator — whose intervals are an hour,
 // so the periodic scan never fires and only the pending wakeup drives a pass — and inherits any
@@ -166,7 +173,7 @@ func TestCancelUnleased(t *testing.T) {
 	m.running[leased] = leasedCancel
 	m.running[unleased] = unleasedCancel
 
-	m.cancelUnleased(&stubCoordinator{held: map[ulid.ULID]bool{leased: true}})
+	m.cancelUnleased(heldLeases{leased: true})
 
 	if err := leasedCtx.Err(); err != nil {
 		t.Fatalf("expected the leased run left running, got %v", err)
@@ -179,12 +186,12 @@ func TestCancelUnleased(t *testing.T) {
 	}
 }
 
-// cancelStub returns a fixed set of pending cancellations and records which runs were driven
-// through cancelOwnedRun, so the sweep's routing can be asserted without an object store.
+// cancelStub is a minimal cancelSweeper: a fixed set of pending cancellations, a record of every
+// run driven through cancelOwnedRun, and an optional set whose cancellation fails — enough to
+// assert the sweep's routing and its resilience without an object store.
 type cancelStub struct {
-	stubCoordinator
-
 	pending      map[ulid.ULID]error
+	failOn       map[ulid.ULID]bool
 	ownedCancels []ulid.ULID
 }
 
@@ -194,6 +201,9 @@ func (c *cancelStub) pendingCancellations(context.Context) (map[ulid.ULID]error,
 
 func (c *cancelStub) cancelOwnedRun(_ context.Context, version ulid.ULID, _ error) error {
 	c.ownedCancels = append(c.ownedCancels, version)
+	if c.failOn[version] {
+		return errors.New("cancel owned run failed")
+	}
 	return nil
 }
 
@@ -225,6 +235,27 @@ func TestSweepCancellationsRoutesByExecution(t *testing.T) {
 	}
 	if len(stub.ownedCancels) != 1 || stub.ownedCancels[0] != queued {
 		t.Fatalf("expected only the non-executing run driven via cancelOwnedRun, got %v", stub.ownedCancels)
+	}
+}
+
+// TestSweepCancellationsContinuesPastFailure verifies the sweep attempts every pending cancel even
+// when one cancelOwnedRun fails — one wedged run must not strand the cancellation of the rest. The
+// cancelSweeper seam lets this be asserted directly, without an object store.
+func TestSweepCancellationsContinuesPastFailure(t *testing.T) {
+	first, second := ulid.Make(), ulid.Make()
+	m := &Manager{
+		logger:  logrus.New(),
+		running: map[ulid.ULID]context.CancelCauseFunc{}, // neither is executing → both go through cancelOwnedRun
+	}
+	stub := &cancelStub{
+		pending: map[ulid.ULID]error{first: errors.New("stop first"), second: errors.New("stop second")},
+		failOn:  map[ulid.ULID]bool{first: true, second: true},
+	}
+
+	m.sweepCancellations(context.Background(), stub)
+
+	if len(stub.ownedCancels) != 2 {
+		t.Fatalf("expected every owned cancel attempted despite failures, got %v", stub.ownedCancels)
 	}
 }
 
