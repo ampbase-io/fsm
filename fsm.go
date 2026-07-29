@@ -524,7 +524,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		// path. Executing it locally here would bypass the shared capacity limit (this node would
 		// admit up to `size` of its own). Delayed/run-after runs are not admission-controlled and
 		// keep executing locally (matching runnerFromOpts precedence).
-		if m.lc != nil && admissionControlled(&startOpt) {
+		if _, ok := m.store.(runClaimer); ok && admissionControlled(&startOpt) {
 			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
 				logger.WithError(err).Error("failed to append start event")
 				return ulid.ULID{}, err
@@ -641,19 +641,21 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		parent     = run.Parent
 	)
 
+	// Only a backend with a node identity attributes the run to an owner node; bolt has neither a
+	// node identity nor leases, so it is labeled the single-process backend with no owner.
+	backend := "bolt"
 	startAttrs := []attribute.KeyValue{
 		attribute.String("fsm.action", action),
 		attribute.String("fsm.alias", alias),
 		attribute.String("fsm.type", typeName),
 		attribute.String("fsm.version", runVersion.String()),
 		attribute.Int("fsm.sdk_version", 2),
-		attribute.String("fsm.storage_backend", storageBackend(m.lc)),
 	}
-	// Only a lease-coordinated backend has an owner node; the object backend attributes the run
-	// to the node executing it, bolt has neither a node identity nor leases.
-	if m.lc != nil {
-		startAttrs = append(startAttrs, attribute.String("fsm.owner_node", m.lc.nodeID()))
+	if node, ok := m.store.(nodeIdentified); ok {
+		backend = "object"
+		startAttrs = append(startAttrs, attribute.String("fsm.owner_node", node.nodeID()))
 	}
+	startAttrs = append(startAttrs, attribute.String("fsm.storage_backend", backend))
 	if attr, ok := request.Any().(Attributable); ok {
 		startAttrs = append(startAttrs, attr.Attributes()...)
 	}
@@ -692,9 +694,9 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		// delayed or queued dispatch can trail its claim by arbitrarily long. Cancel before
 		// any side effects run rather than waiting to be fenced on the first write. The same
 		// lookup yields the lease epoch handlers read as their fencing token.
-		if m.lc != nil {
-			epoch, ok := m.lc.ownedEpoch(runVersion)
-			if !ok {
+		if f, ok := m.store.(fencer); ok {
+			epoch, owned := f.ownedEpoch(runVersion)
+			if !owned {
 				cancel(ErrLeaseLost)
 			}
 			request.withLeaseEpoch(epoch)
@@ -830,7 +832,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		// loop so the next pending run is admitted at once instead of on the periodic pass. This
 		// is the no-bus path — a live bus additionally gets the subjectPending publish from the
 		// store's finish cleanup.
-		if m.lc != nil && run.Queue != "" {
+		if _, ok := m.store.(runClaimer); ok && run.Queue != "" {
 			m.nudgeClaim()
 		}
 	}()

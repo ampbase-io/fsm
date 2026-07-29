@@ -595,7 +595,7 @@ func testFencingToken(t *testing.T, f *managerFactory) {
 	}
 
 	wantEpoch := int64(0)
-	if m.lc != nil {
+	if _, ok := m.store.(fencer); ok {
 		wantEpoch = 1
 	}
 

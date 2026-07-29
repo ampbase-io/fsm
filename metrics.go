@@ -81,12 +81,3 @@ func storageOutcome(err error) string {
 func observeStorage(op string, start time.Time, err error) {
 	storageLatencyVec.WithLabelValues(op, storageOutcome(err)).Observe(time.Since(start).Seconds())
 }
-
-// storageBackend names the backend a run executes under, for the fsm.storage_backend span
-// attribute: a lease-coordinated store is the object backend, otherwise bolt.
-func storageBackend(lc leaseCoordinator) string {
-	if lc == nil {
-		return "bolt"
-	}
-	return "object"
-}
