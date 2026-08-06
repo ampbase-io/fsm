@@ -344,6 +344,12 @@ type runState struct {
 	Error RunErr
 }
 
+// nodeIdentified is a backend with a node identity. The run span asserts it to attribute a run to
+// its owner node; a backend without one is single-process and has no owner to record.
+type nodeIdentified interface {
+	nodeID() string
+}
+
 // resume drives every resumable run of f through resumeOne. Which runs are resumable is
 // backend-defined: a lease-coordinated backend hands out only runs this node claimed. Every
 // run is dispatched even when another fails — the claims are already this node's, and an

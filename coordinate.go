@@ -27,9 +27,10 @@ type leaseCoordinator interface {
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
 }
 
-// The narrow capability views a store may satisfy. Each consumer — a per-run call site or a
-// coordinate-loop helper — depends on just the view it uses, so BoltDB, which implements none of
-// them, is excluded structurally, without a nil field or a fictional no-op implementation.
+// The coordinate loop's own capability views follow; the ones consumed elsewhere are declared with
+// their consumers (cancelRecorder in manager.go, nodeIdentified in fsm.go). Each consumer depends
+// on just the view it uses, so BoltDB, which implements none of them, is excluded structurally,
+// without a nil field or a fictional no-op implementation.
 
 // runClaimer is a backend that distributes runs through the claim loop. Asserting it both drives
 // resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
@@ -45,18 +46,6 @@ type fencer interface {
 	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
 	// the fencing token surfaced to handlers.
 	ownedEpoch(version ulid.ULID) (int64, bool)
-}
-
-// cancelRecorder is a backend that records a cancel durably for the owner to react to.
-type cancelRecorder interface {
-	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
-	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
-	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
-}
-
-// nodeIdentified is a backend with a node identity, recorded on run spans as fsm.owner_node.
-type nodeIdentified interface {
-	nodeID() string
 }
 
 // cancelSweeper is the coordinate loop's cancel-sweep view: find the cancels covering runs this

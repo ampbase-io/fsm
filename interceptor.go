@@ -10,6 +10,7 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/attribute"
@@ -100,7 +101,13 @@ func skipper() TransitionInterceptorFunc {
 	})
 }
 
-func canceller(store Store, codec Codec) TransitionInterceptorFunc {
+// appender writes a run's state events. It is the single mutation path all run state flows
+// through, and the only thing the transition interceptors need of a backend.
+type appender interface {
+	Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error)
+}
+
+func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			var (

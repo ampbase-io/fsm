@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -26,6 +27,61 @@ import (
 )
 
 const tracerName = "fsm"
+
+// Store is the persistence contract the Manager requires of a storage backend. It is declared
+// here, with its consumer, rather than beside either implementation: boltStore (store.go) and
+// objectStore (objstore_store.go) satisfy it structurally, and neither owns its shape. The
+// narrower views a single call site needs — appender for the transition interceptors, or a
+// backend that claims runs, fences them, or records cancels — are declared at those sites
+// instead (see interceptor.go, coordinate.go, and cancelRecorder below).
+type Store interface {
+	appender
+	io.Closer
+
+	Active(ctx context.Context, f *fsm) ([]*activeResource, error)
+	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
+	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
+	// Runs returns the versions of runs recorded for the resource, oldest first, including
+	// completed runs. Backends differ in retention: BoltDB serves runs whose events have not
+	// yet been archived, while the object storage backend indexes runs durably.
+	Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error)
+
+	// Run-state queries. The BoltDB backend answers from its private in-memory index; the
+	// object storage backend answers from object storage (locks/, index/, children/, and run
+	// manifests), so the answers hold across nodes sharing a bucket.
+
+	// ActiveRuns returns the incomplete runs recorded for the resource.
+	ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error)
+	// ActiveChildren returns the incomplete runs started from the given parent.
+	ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error)
+	// ResolveRun resolves a resource id to a run version, preferring an active run and falling
+	// back to the most recently recorded one. A miss returns a zero version.
+	ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error)
+	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
+	// recorded error (nil on success, and nil for runs no longer known to the backend).
+	WaitRun(ctx context.Context, runVersion ulid.ULID) error
+	// RunResult returns the marshaled W response of a completed run, or nil when it recorded
+	// none. Safe to read the moment WaitRun returns: the object backend answers from the
+	// terminal manifest, the BoltDB backend from the record written at FINISH.
+	RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error)
+	// ListActive returns every incomplete run the backend knows about.
+	ListActive(ctx context.Context) ([]runState, error)
+
+	// Run-state notes from the executor.
+
+	// SetRunning records that the run has begun executing transitions on this node.
+	SetRunning(run Run) error
+	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
+	ForgetRun(run Run) error
+}
+
+// cancelRecorder is the Cancel path's view of a backend that records a cancel durably for the
+// owning node to react to; a backend without it is single-process, so Cancel stops the local run.
+type cancelRecorder interface {
+	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
+	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
+	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
+}
 
 type Manager struct {
 	logger logrus.FieldLogger
