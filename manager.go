@@ -38,7 +38,7 @@ type Store interface {
 	appender
 	io.Closer
 
-	Active(ctx context.Context, f *fsm) ([]*activeResource, error)
+	Active(ctx context.Context, d Descriptor) ([]*activeResource, error)
 	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
 	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
 	// Runs returns the versions of runs recorded for the resource, oldest first, including

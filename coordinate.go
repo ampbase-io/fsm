@@ -78,7 +78,7 @@ type claimedRun struct {
 func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	claimer, ok := m.store.(runClaimer)
 	if !ok {
-		return m.store.Active(ctx, f)
+		return m.store.Active(ctx, f.descriptor())
 	}
 
 	claimed, err := claimer.claimRuns(ctx, []*fsm{f})

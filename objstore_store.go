@@ -739,15 +739,15 @@ func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) erro
 }
 
 // Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
-func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(f.typeName))
+func (s *objectStore) Active(ctx context.Context, d Descriptor) ([]*activeResource, error) {
+	entries, err := s.scanLocks(ctx, s.lockPrefix(d.TypeName))
 	if err != nil {
 		return nil, err
 	}
 
 	var active []*activeResource
 	for _, e := range entries {
-		if e.action != f.action {
+		if e.action != d.Action {
 			continue
 		}
 		active = append(active, manifestResource(e.version, e.manifest))

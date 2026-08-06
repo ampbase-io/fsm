@@ -394,9 +394,9 @@ type activeResource struct {
 	fsmError RunErr
 }
 
-func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
+func (s *boltStore) Active(ctx context.Context, d Descriptor) ([]*activeResource, error) {
 	var (
-		resourceType = f.typeName
+		resourceType = d.TypeName
 		activeEvents []*activeResource
 		// "<resource_name>#"
 		resourcePrefixKey = bytes.Join([][]byte{[]byte(resourceType), emptyPrefix}, keySeparator)
@@ -492,9 +492,9 @@ func (s *boltStore) Active(ctx context.Context, f *fsm) ([]*activeResource, erro
 			Run: Run{
 				ID:           ae.active.GetResourceId(),
 				StartVersion: ae.version,
-				Action:       f.action,
-				ResourceName: f.alias,
-				TypeName:     f.typeName,
+				Action:       d.Action,
+				ResourceName: d.Alias,
+				TypeName:     d.TypeName,
 				Queue:        ae.active.GetOptions().GetQueue(),
 				Parent:       parent,
 				fsmErr:       ae.fsmError,
