@@ -102,7 +102,8 @@ func skipper() TransitionInterceptorFunc {
 }
 
 // appender writes a run's state events. It is the single mutation path all run state flows
-// through, and the only thing the transition interceptors need of a backend.
+// through, and all either transition interceptor needs of a backend: canceller records a
+// transition's outcome and retry records its attempts, and neither reads anything back.
 type appender interface {
 	Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error)
 }
@@ -160,7 +161,7 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 	})
 }
 
-func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
+func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			logger := req.Log()
