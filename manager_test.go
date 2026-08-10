@@ -377,6 +377,60 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	}
 }
 
+// TestRunningDerivedFromTransition pins that a run reads RUNNING once it has recorded a
+// transition, on both backends. Neither backend is told when execution starts: the object
+// backend flips the manifest in appendMidRun and BoltDB flips its memdb row in Append, so the
+// state is derived from the durable event rather than from an executor note.
+func TestRunningDerivedFromTransition(t *testing.T) { runBackends(t, testRunningDerivedFromTransition) }
+
+func testRunningDerivedFromTransition(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	// The first transition completes — recording an event — and the second blocks, so the run is
+	// observably mid-flight with one transition behind it.
+	entered := make(chan struct{}, 1)
+	block := make(chan struct{})
+	defer close(block)
+
+	start, _, err := m.Register[orderReq, orderResp]("derive-running").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			return NewResponse(&orderResp{Status: "first"}), nil
+		}).
+		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			select {
+			case <-block:
+				return NewResponse(&orderResp{Status: "ok"}), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "derive-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	<-entered
+
+	active, err := m.Active(ctx, "derive-1")
+	if err != nil {
+		t.Fatalf("Active failed: %v", err)
+	}
+	state, ok := active[ActiveKey{Action: "derive-running", Version: version}]
+	if !ok {
+		t.Fatalf("expected the run to be active, got %v", active)
+	}
+	if state != fsmv1.RunState_RUN_STATE_RUNNING {
+		t.Fatalf("expected a run with a recorded transition to read RUNNING, got %v", state)
+	}
+}
+
 func TestActiveAcrossTypes(t *testing.T) { runBackends(t, testActiveAcrossTypes) }
 
 func testActiveAcrossTypes(t *testing.T, f *managerFactory) {

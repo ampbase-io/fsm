@@ -906,12 +906,6 @@ func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {
 	return active, nil
 }
 
-// SetRunning is a no-op: the manifest's status, maintained by Append, is the object backend's
-// run state, so a run reads as PENDING until its first transition writes an event.
-func (s *objectStore) SetRunning(run Run) error {
-	return nil
-}
-
 // ForgetRun releases this node's claim on the run after a failed resume so another node (or a
 // later claim pass) can adopt it; the resource lock stays visible until recovery succeeds.
 func (s *objectStore) ForgetRun(run Run) error {

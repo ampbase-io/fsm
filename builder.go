@@ -176,8 +176,7 @@ type Transition[R, W any] func(context.Context, *Request[R, W]) (*Response[W], e
 func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOpts ...StartOption[R, W]) *fsmTransition[R, W] {
 	s.f.startState = name
 
-	opts := make([]Option[R, W], 0, len(startOpts)+1)
-	opts = append(opts, WithInitializers(setStarted[R, W](s.m.store)))
+	opts := make([]Option[R, W], 0, len(startOpts))
 	for _, o := range startOpts {
 		opts = append(opts, o)
 	}

@@ -68,8 +68,6 @@ type Store interface {
 
 	// Run-state notes from the executor.
 
-	// SetRunning records that the run has begun executing transitions on this node.
-	SetRunning(run Run) error
 	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
 	ForgetRun(run Run) error
 }
