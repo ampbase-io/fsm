@@ -350,20 +350,11 @@ type nodeIdentified interface {
 	nodeID() string
 }
 
-// Descriptor names one registered FSM to a storage backend: the resource type and action that
-// identify its runs, plus the alias the BoltDB backend records on its index rows. It is what a
-// backend needs of an FSM and nothing more — the fsm itself additionally carries codecs,
-// transitions, and generic dispatch closures that no backend may see.
-type Descriptor struct {
-	TypeName string
-
-	Action string
-
-	Alias string
-}
-
-func (f *fsm) descriptor() Descriptor {
-	return Descriptor{TypeName: f.typeName, Action: f.action, Alias: f.alias}
+// key identifies this FSM by the resource type and action its runs are recorded under. It is both
+// the registry key and everything a backend needs to select an FSM's runs — the fsm itself
+// additionally carries codecs, transitions, and generic dispatch closures no backend may see.
+func (f *fsm) key() fsmKey {
+	return fsmKey{typeName: f.typeName, action: f.action}
 }
 
 // resume drives every resumable run of f through resumeOne. Which runs are resumable is

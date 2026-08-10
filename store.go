@@ -394,9 +394,9 @@ type activeResource struct {
 	fsmError RunErr
 }
 
-func (s *boltStore) Active(ctx context.Context, d Descriptor) ([]*activeResource, error) {
+func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, error) {
 	var (
-		resourceType = d.TypeName
+		resourceType = key.typeName
 		activeEvents []*activeResource
 		// "<resource_name>#"
 		resourcePrefixKey = bytes.Join([][]byte{[]byte(resourceType), emptyPrefix}, keySeparator)
@@ -425,7 +425,7 @@ func (s *boltStore) Active(ctx context.Context, d Descriptor) ([]*activeResource
 			// descriptor's runs may be returned — the caller stamps its own action and alias on
 			// them and resumes them through its own transitions. The object backend filters the
 			// same way in objectStore.Active.
-			if ae.GetAction() != d.Action {
+			if ae.GetAction() != key.action {
 				continue
 			}
 
@@ -501,9 +501,13 @@ func (s *boltStore) Active(ctx context.Context, d Descriptor) ([]*activeResource
 			Run: Run{
 				ID:           ae.active.GetResourceId(),
 				StartVersion: ae.version,
-				Action:       d.Action,
-				ResourceName: d.Alias,
-				TypeName:     d.TypeName,
+				Action:       key.action,
+				// The alias is a Manager-side presentation concern, not storage state: readers
+				// of these rows either overwrite it from the registered FSM (Manager.Children)
+				// or ignore it (ActiveRuns, ListActive). The object backend never records one
+				// either, so both backends now leave it to the Manager.
+				ResourceName: "",
+				TypeName:     key.typeName,
 				Queue:        ae.active.GetOptions().GetQueue(),
 				Parent:       parent,
 				fsmErr:       ae.fsmError,

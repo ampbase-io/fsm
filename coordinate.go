@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"math/rand/v2"
 	"slices"
@@ -72,13 +73,26 @@ type claimedRun struct {
 	resource *activeResource
 }
 
-// resumable returns the runs of f this node should resume. A lease-coordinated backend hands
-// out only runs this node can claim, so a restarting node cannot hijack runs whose owner is
-// live; otherwise every active run is local by definition.
+// activeScanner reads every incomplete run of one FSM. It is the resume strategy of a backend
+// without a claim loop, where all active runs are local by definition; a lease-coordinated
+// backend implements runClaimer instead, and never this.
+type activeScanner interface {
+	Active(ctx context.Context, key fsmKey) ([]*activeResource, error)
+}
+
+// resumable returns the runs of f this node should resume. A backend implements exactly one of
+// the two resume strategies: a lease-coordinated one hands out only runs this node can claim, so
+// a restarting node cannot hijack runs whose owner is live; otherwise every active run is local
+// and the whole active set is scanned. Go cannot express "exactly one of these", so a backend
+// offering neither is reported rather than silently resuming nothing.
 func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	claimer, ok := m.store.(runClaimer)
 	if !ok {
-		return m.store.Active(ctx, f.descriptor())
+		scanner, ok := m.store.(activeScanner)
+		if !ok {
+			return nil, fmt.Errorf("%T implements neither resume strategy (runClaimer nor activeScanner)", m.store)
+		}
+		return scanner.Active(ctx, f.key())
 	}
 
 	claimed, err := claimer.claimRuns(ctx, []*fsm{f})

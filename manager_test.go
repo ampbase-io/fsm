@@ -358,7 +358,14 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	}
 	<-rollbackEntered
 
-	active, err := m.store.Active(ctx, Descriptor{TypeName: "orderReq", Action: "iso-deploy"})
+	// Active is the resume strategy of a backend without a claim loop; a lease-coordinated one
+	// resumes through claimRuns, which selects by action when it groups FSMs by type.
+	scanner, ok := m.store.(activeScanner)
+	if !ok {
+		t.Skip("backend resumes via the claim loop, not Active")
+	}
+
+	active, err := scanner.Active(ctx, fsmKey{typeName: "orderReq", action: "iso-deploy"})
 	if err != nil {
 		t.Fatalf("Active failed: %v", err)
 	}

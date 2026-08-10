@@ -38,7 +38,6 @@ type Store interface {
 	appender
 	io.Closer
 
-	Active(ctx context.Context, d Descriptor) ([]*activeResource, error)
 	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
 	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
 	// Runs returns the versions of runs recorded for the resource, oldest first, including
@@ -114,7 +113,7 @@ type Manager struct {
 }
 
 type fsmKey struct {
-	name string
+	typeName string
 
 	action string
 }
@@ -408,7 +407,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 	// one; restore it from the registered FSM.
 	m.mu.RLock()
 	for i, child := range children {
-		f, ok := m.fsms[fsmKey{name: child.TypeName, action: child.Action}]
+		f, ok := m.fsms[fsmKey{typeName: child.TypeName, action: child.Action}]
 		if !ok {
 			continue
 		}
@@ -552,7 +551,7 @@ func (m *Manager) lookupFSM(typeName, action string) (*fsm, error) {
 	defer m.mu.RUnlock()
 
 	if typeName != "" {
-		f, ok := m.fsms[fsmKey{name: typeName, action: action}]
+		f, ok := m.fsms[fsmKey{typeName: typeName, action: action}]
 		if !ok {
 			return nil, fmt.Errorf("%w: %s/%s", errFSMNotRegistered, typeName, action)
 		}

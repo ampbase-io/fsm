@@ -738,23 +738,6 @@ func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) erro
 	return s.deleteObject(ctx, lockKey)
 }
 
-// Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
-func (s *objectStore) Active(ctx context.Context, d Descriptor) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(d.TypeName))
-	if err != nil {
-		return nil, err
-	}
-
-	var active []*activeResource
-	for _, e := range entries {
-		if e.action != d.Action {
-			continue
-		}
-		active = append(active, manifestResource(e.version, e.manifest))
-	}
-	return active, nil
-}
-
 // manifestResource rebuilds the resume-path DTO from the manifest's materialized fields.
 func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
 	return &activeResource{
