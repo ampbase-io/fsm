@@ -274,7 +274,7 @@ func TestArchivedFailedRunPreservesError(t *testing.T) {
 	// record the cause.
 	run := startRun(t, a, "arch-failed")
 	run.fsmErr = RunErr{Err: errors.New("boom"), State: "exploding"}
-	if _, err := a.Append(ctx, run, finishEvent(run, "exploding"), run.Queue); err != nil {
+	if _, err := a.Append(ctx, run, finishEvent(run, "exploding"), run.Queue, AppendOptions{}); err != nil {
 		t.Fatalf("failed to finish run with error: %v", err)
 	}
 	ageRun(t, a, run.StartVersion, pastRetention)

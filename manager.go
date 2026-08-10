@@ -61,7 +61,7 @@ type Store interface {
 	// terminal manifest, the BoltDB backend from the record written at FINISH.
 	RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error)
 	// ListActive returns every incomplete run the backend knows about.
-	ListActive(ctx context.Context) ([]runState, error)
+	ListActive(ctx context.Context) ([]RunSnapshot, error)
 
 	// Run-state notes from the executor.
 
@@ -550,7 +550,7 @@ func (m *Manager) startOpaque(ctx context.Context, typeName, action, id string, 
 	}
 
 	runVersion := ulid.Make()
-	if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+	if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
 		return ulid.ULID{}, err
 	}
 

@@ -114,20 +114,13 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 
 // Append writes an event object and updates the run manifest according to the event type. It is
 // the object storage implementation of the single mutation path all run state flows through.
-func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error) {
+func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts AppendOptions) (ulid.ULID, error) {
 	// Persistence must complete even when the run itself is being canceled — the CANCEL and
 	// FINISH events are appended from an already-canceled run context, and BoltDB's local
 	// writes are likewise not interruptible. Values (e.g. trace context) are preserved.
 	ctx = context.WithoutCancel(ctx)
 
-	var ao appendOption
-	for _, opt := range opts {
-		if err := opt(&ao); err != nil {
-			return ulid.ULID{}, err
-		}
-	}
-
-	if ao.start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
+	if opts.Start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
 		return ulid.ULID{}, errors.New("start option must be set")
 	}
 
@@ -152,7 +145,7 @@ func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEve
 
 	switch event.GetType() {
 	case fsmv1.EventType_EVENT_TYPE_START:
-		err = s.appendStart(ctx, run, event, queue, &ao, eventKey, eventBytes)
+		err = s.appendStart(ctx, run, event, queue, opts, eventKey, eventBytes)
 	case fsmv1.EventType_EVENT_TYPE_ERROR,
 		fsmv1.EventType_EVENT_TYPE_COMPLETE,
 		fsmv1.EventType_EVENT_TYPE_CANCEL:
@@ -273,7 +266,7 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 	return &AlreadyRunningError{Version: ownerVersion}
 }
 
-func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, eventBytes []byte) error {
+func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts AppendOptions, eventKey string, eventBytes []byte) error {
 	runVersionBytes, err := run.StartVersion.MarshalText()
 	if err != nil {
 		return err
@@ -298,16 +291,16 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	}
 
 	// 4. Create the manifest, leased to this node.
-	manifestBytes, err := s.startManifest(ctx, run, event, queue, ao, eventKey, runVersionBytes)
+	manifestBytes, err := s.startManifest(ctx, run, event, queue, opts, eventKey, runVersionBytes)
 	if err != nil {
 		return err
 	}
-	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, ao.unowned); err != nil {
+	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, opts.Unowned); err != nil {
 		return err
 	}
 
 	// 5. Record the parent-child relationship.
-	return s.linkParent(ctx, ao.parent, run.StartVersion)
+	return s.linkParent(ctx, opts.Parent, run.StartVersion)
 }
 
 // startManifest materializes a new run's initial manifest. By default it is leased to this node
@@ -315,11 +308,11 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 // tick. An unowned START (the RPC ingress' persist-then-ack) leaves the lease empty so the claim
 // loop distributes the run across the worker pool; its epoch is bumped from zero on the first
 // claim.
-func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
+func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts AppendOptions, eventKey string, runVersionBytes []byte) ([]byte, error) {
 	ownerNode := s.node
 	leaseExpiry := time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
 	leaseEpoch := int64(1)
-	if ao.unowned {
+	if opts.Unowned {
 		ownerNode = ""
 		leaseExpiry = 0
 		leaseEpoch = 0
@@ -334,12 +327,12 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 		StartEventKey:  []byte(eventKey),
 		LatestEventKey: []byte(eventKey),
 		EventCount:     1,
-		Transitions:    ao.start.transitions,
-		Resource:       ao.start.resource,
+		Transitions:    opts.Start.Transitions,
+		Resource:       opts.Start.Resource,
 		Queue:          queue,
-		Parent:         ao.parent,
-		DelayUntil:     ao.delayUntil,
-		RunAfter:       ao.runAfter,
+		Parent:         opts.Parent,
+		DelayUntil:     opts.DelayUntil,
+		RunAfter:       opts.RunAfter,
 		OwnerNode:      ownerNode,
 		LeaseExpiry:    leaseExpiry,
 		LeaseEpoch:     leaseEpoch,
@@ -864,15 +857,15 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	}
 }
 
-func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {
+func (s *objectStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
 	entries, err := s.scanLocks(ctx, s.locksPrefix())
 	if err != nil {
 		return nil, err
 	}
 
-	active := make([]runState, 0, len(entries))
+	active := make([]RunSnapshot, 0, len(entries))
 	for _, e := range entries {
-		active = append(active, runState{
+		active = append(active, RunSnapshot{
 			Run:   runFromManifest(e.version, e.manifest),
 			State: e.manifest.GetStatus(),
 			Error: manifestRunErr(e.manifest),

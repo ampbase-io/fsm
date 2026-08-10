@@ -99,7 +99,7 @@ func appendStarted(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", withStartOption([]byte("{}"), []string{"created", "done"}))
+	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}})
 	return err
 }
 
@@ -110,7 +110,7 @@ func appendComplete(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "")
+	}, "", AppendOptions{})
 	return err
 }
 
@@ -121,7 +121,7 @@ func appendFinished(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "done",
-	}, "")
+	}, "", AppendOptions{})
 	return err
 }
 
@@ -297,7 +297,7 @@ func TestUnownedStartClaimableByPeer(t *testing.T) {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", withStartOption([]byte("{}"), []string{"created", "done"}), withUnowned())
+	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}, Unowned: true})
 	if err != nil {
 		t.Fatalf("failed to append unowned start: %v", err)
 	}
@@ -901,7 +901,7 @@ func TestDelayUntilStoredAsMilliseconds(t *testing.T) {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", withStartOption([]byte("{}"), []string{"created", "done"}), withDelayUntil(target)); err != nil {
+	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}, DelayUntil: target.UnixMilli()}); err != nil {
 		t.Fatalf("failed to append start: %v", err)
 	}
 

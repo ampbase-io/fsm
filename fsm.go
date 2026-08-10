@@ -336,7 +336,7 @@ func newFinalizer[R, W any](finalFn func(context.Context, *Request[R, W], RunErr
 	})
 }
 
-type runState struct {
+type RunSnapshot struct {
 	Run
 
 	State fsmv1.RunState
@@ -538,7 +538,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		// admit up to `size` of its own). Delayed/run-after runs are not admission-controlled and
 		// keep executing locally (matching runnerFromOpts precedence).
 		if _, ok := m.store.(runClaimer); ok && admissionControlled(&startOpt) {
-			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
 				logger.WithError(err).Error("failed to append start event")
 				return ulid.ULID{}, err
 			}
@@ -561,7 +561,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 			}])
 		}
 
-		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt)
+		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, false)
 		if err != nil {
 			m.logger.WithError(err).Error("failed to append start event")
 			return ulid.ULID{}, err
@@ -578,7 +578,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 // is the single home for the START persistence contract: the embedded start (leased to this node)
 // and the opaque ingress start (unowned, for the claim loop) share it, differing only in the
 // extra append options they pass. Non-generic — persistence never touches R/W.
-func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, extra ...appendOptionFunc) (Run, error) {
+func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, unowned bool) (Run, error) {
 	run := Run{
 		ID:           id,
 		StartVersion: runVersion,
@@ -588,13 +588,25 @@ func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersio
 		Queue:        startOpt.queue,
 		Parent:       startOpt.parent,
 	}
-	opts := append([]appendOptionFunc{
-		withStartOption(resource, f.transitionSlice()),
-		withDelayUntil(startOpt.until),
-		withRunAfter(startOpt.runAfter),
-		withParent(startOpt.parent),
-	}, extra...)
-	if _, err := m.store.Append(ctx, run, f.startEvent(id), startOpt.queue, opts...); err != nil {
+	runAfter, err := marshalVersion(startOpt.runAfter)
+	if err != nil {
+		return Run{}, err
+	}
+	parent, err := marshalVersion(startOpt.parent)
+	if err != nil {
+		return Run{}, err
+	}
+
+	opts := AppendOptions{
+		Start:    &StartRecord{Resource: resource, Transitions: f.transitionSlice()},
+		RunAfter: runAfter,
+		Parent:   parent,
+		Unowned:  unowned,
+	}
+	if !startOpt.until.IsZero() {
+		opts.DelayUntil = startOpt.until.UnixMilli()
+	}
+	if _, err := m.store.Append(ctx, run, f.startEvent(id), startOpt.queue, opts); err != nil {
 		return Run{}, err
 	}
 	return run, nil
