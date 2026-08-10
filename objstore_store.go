@@ -786,31 +786,6 @@ func (s *objectStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]R
 	return active, nil
 }
 
-// ResolveRun prefers the oldest active run holding a lock for the resource; with no lock held
-// it falls back to the most recent run in the index/ prefix, so a just-finished run's outcome
-// remains reachable through WaitRun.
-func (s *objectStore) ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error) {
-	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
-	if err != nil {
-		return ulid.ULID{}, err
-	}
-	if len(entries) > 0 {
-		oldest := entries[0].version
-		for _, e := range entries[1:] {
-			if e.version.Compare(oldest) < 0 {
-				oldest = e.version
-			}
-		}
-		return oldest, nil
-	}
-
-	runs, err := s.Runs(ctx, resourceType, resourceID)
-	if err != nil || len(runs) == 0 {
-		return ulid.ULID{}, err
-	}
-	return runs[len(runs)-1], nil
-}
-
 // WaitRun blocks until the run records a terminal state, polling its manifest under exponential
 // backoff with the bus as a fast path: a fsm.run.done event wakes the wait immediately instead
 // of on the next poll tick, and a live bus relaxes the poll floor to a rare insurance interval

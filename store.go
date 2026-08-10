@@ -570,17 +570,6 @@ func (s *boltStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run
 	return children, nil
 }
 
-func (s *boltStore) ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error) {
-	txn := s.memDB.Txn(false)
-	defer txn.Abort()
-
-	item, err := txn.First(fsmTable, runIndex, resourceID)
-	if err != nil || item == nil {
-		return ulid.ULID{}, err
-	}
-	return item.(runState).StartVersion, nil
-}
-
 // WaitRun parks on the index's watch channel, which fires on the next state change of the
 // watched run. A run missing from the index is answered from history: the store is
 // authoritative for a run that already finished.

@@ -53,9 +53,6 @@ type Store interface {
 	ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error)
 	// ActiveChildren returns the incomplete runs started from the given parent.
 	ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error)
-	// ResolveRun resolves a resource id to a run version, preferring an active run and falling
-	// back to the most recently recorded one. A miss returns a zero version.
-	ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error)
 	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
 	// recorded error (nil on success, and nil for runs no longer known to the backend).
 	WaitRun(ctx context.Context, runVersion ulid.ULID) error
@@ -481,15 +478,34 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 	return m.store.WaitRun(ctx, version)
 }
 
-// resolveRun resolves an id to its run version across the registered types.
+// resolveRun resolves an id to its run version across the registered types, preferring an active
+// run and falling back to the most recently recorded one. It is composed from the two queries a
+// backend already answers rather than being a backend method of its own, so both backends resolve
+// by the same rule instead of each implementing the preference separately.
 func (m *Manager) resolveRun(ctx context.Context, id string) (ulid.ULID, error) {
 	for _, typeName := range m.registeredTypes() {
-		version, err := m.store.ResolveRun(ctx, typeName, id)
+		// The oldest active run: a caller waiting by id follows the one that started first.
+		active, err := m.store.ActiveRuns(ctx, typeName, id)
 		if err != nil {
 			return ulid.ULID{}, err
 		}
-		if version.Compare(ulid.ULID{}) != 0 {
-			return version, nil
+		var oldest ulid.ULID
+		for key := range active {
+			if oldest.Compare(ulid.ULID{}) == 0 || key.Version.Compare(oldest) < 0 {
+				oldest = key.Version
+			}
+		}
+		if oldest.Compare(ulid.ULID{}) != 0 {
+			return oldest, nil
+		}
+
+		// Nothing active: the most recently recorded run, which Runs returns oldest first.
+		runs, err := m.store.Runs(ctx, typeName, id)
+		if err != nil {
+			return ulid.ULID{}, err
+		}
+		if len(runs) > 0 {
+			return runs[len(runs)-1], nil
 		}
 	}
 	return ulid.ULID{}, nil
