@@ -322,6 +322,54 @@ func testDelayedStart(t *testing.T, f *managerFactory) {
 
 // TestActiveAcrossTypes verifies Active merges runs across every registered resource type for
 // an id, deduplicated by run — the Manager queries the store once per distinct type.
+// TestStoreActiveIsolatesActions pins that Store.Active returns only the runs of the descriptor's
+// action. Two FSMs may share a resource type — the registry keys on {type, action} — and each
+// backend scans by type, so an unfiltered scan hands one FSM the other's runs. Resume would then
+// drive them under the wrong action: transition lookups miss, every state degrades to a no-op, no
+// FINISH is ever appended, and both FSMs execute the same run.
+func TestStoreActiveIsolatesActions(t *testing.T) { runBackends(t, testStoreActiveIsolatesActions) }
+
+func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	// Both FSMs are registered on the same resource type (orderReq) under different actions.
+	var (
+		deployEntered = make(chan struct{}, 1)
+		deployBlock   = make(chan struct{})
+	)
+	startDeploy := blockingFSM(t, m, "iso-deploy", deployEntered, deployBlock)
+	defer close(deployBlock)
+
+	var (
+		rollbackEntered = make(chan struct{}, 1)
+		rollbackBlock   = make(chan struct{})
+	)
+	startRollback := blockingFSM(t, m, "iso-rollback", rollbackEntered, rollbackBlock)
+	defer close(rollbackBlock)
+
+	deployVersion, err := startDeploy(ctx, "iso-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start deploy FSM: %v", err)
+	}
+	<-deployEntered
+	if _, err := startRollback(ctx, "iso-2", NewRequest(&orderReq{}, &orderResp{})); err != nil {
+		t.Fatalf("failed to start rollback FSM: %v", err)
+	}
+	<-rollbackEntered
+
+	active, err := m.store.Active(ctx, Descriptor{TypeName: "orderReq", Action: "iso-deploy"})
+	if err != nil {
+		t.Fatalf("Active failed: %v", err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("expected only the iso-deploy run, got %d runs", len(active))
+	}
+	if active[0].version != deployVersion {
+		t.Fatalf("expected the iso-deploy run %s, got %s", deployVersion, active[0].version)
+	}
+}
+
 func TestActiveAcrossTypes(t *testing.T) { runBackends(t, testActiveAcrossTypes) }
 
 func testActiveAcrossTypes(t *testing.T, f *managerFactory) {

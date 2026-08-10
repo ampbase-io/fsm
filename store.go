@@ -420,6 +420,15 @@ func (s *boltStore) Active(ctx context.Context, d Descriptor) ([]*activeResource
 				continue
 			}
 
+			// The ACTIVE key is <type>#<id>#<action>#<version> and the scan prefix is the type
+			// alone, so runs of every action registered on this type are walked. Only this
+			// descriptor's runs may be returned — the caller stamps its own action and alias on
+			// them and resumes them through its own transitions. The object backend filters the
+			// same way in objectStore.Active.
+			if ae.GetAction() != d.Action {
+				continue
+			}
+
 			var version ulid.ULID
 			if err := version.UnmarshalText(ae.StartVersion); err != nil {
 				logger.WithError(err).Error("failed to unmarshal version")
