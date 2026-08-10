@@ -393,9 +393,6 @@ type Store interface {
     Append(ctx context.Context, run Run, event *fsmv1.StateEvent,
         queue string, opts ...appendOptionFunc) (ulid.ULID, error)
 
-    // Active returns all incomplete runs for the given FSM type.
-    Active(ctx context.Context, f *fsm) ([]*activeResource, error)
-
     // History returns the archived history for a completed run.
     History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
 
@@ -409,6 +406,15 @@ type Store interface {
     Close() error
 }
 ```
+
+**As implemented,** `Store` is declared in `manager.go` with the `Manager` that consumes it, not
+beside an implementation, and it carries the run-state queries the distributed-execution addendum
+moved onto it (`ActiveRuns`, `ActiveChildren`, `WaitRun`, `RunResult`, `ListActive`, …).
+
+Resume is **not** on `Store`. A backend implements exactly one of two resume strategies, each a
+narrow view asserted at its call site in `coordinate.go`: `activeScanner` (`Active`, BoltDB — every
+active run is local) or `runClaimer` (`claimRuns`, the object backend — the claim loop hands out
+only runs this node may take). The object backend never implements `Active`.
 
 The existing `*store` struct is refactored to satisfy this interface as `boltStore`, with no changes to its internal behavior. The new `objectStore` implements the same interface against S3. The `Manager` accepts a `Store` via configuration. When `DBPath` is set, the manager creates a `boltStore` (identical to today's behavior). When `ObjectStorage` is set, it creates an `objectStore`.
 

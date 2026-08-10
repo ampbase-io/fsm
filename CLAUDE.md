@@ -25,9 +25,15 @@ backend's distributed-execution design is the active work.
   is a node identity, never a routable address — there is no worker-to-worker RPC in the design.
 
 ## Architecture map
-- `store.go` — the `Store` interface. **`Append` is the single mutation path** all run state
-  flows through; run-state queries (`ActiveRuns`, `WaitRun`, `Runs`, …) are backend-typed.
-  BoltDB impl `boltStore` is memdb-backed and private; object impl is `objectStore`.
+- `manager.go` — the `Store` interface, declared with the `Manager` that consumes it (interfaces
+  live with their consumer, never beside an implementation). **`Append` is the single mutation
+  path** all run state flows through; run-state queries (`ActiveRuns`, `WaitRun`, `Runs`, …) are
+  backend-typed. A backend may also satisfy narrow capability views, each declared at its own
+  call site: `appender` (interceptor.go), `activeScanner`, `runClaimer`, `fencer`, `cancelSweeper`
+  (coordinate.go), `cancelRecorder` (manager.go), `nodeIdentified` (fsm.go). BoltDB implements
+  none of the lease-shaped ones, so it is excluded structurally rather than by a nil check.
+- `store.go` — the BoltDB implementation. `boltStore` is memdb-backed and private; the object
+  impl is `objectStore`.
 - `objstore_store.go` / `objstore_lease.go` / `objstore_cancel.go` / `objstore.go` — the object
   backend: Append + queries + WaitRun; leases and `lease_epoch` fencing; cancel sentinels; the
   S3 client, key helpers, and conditional writes.
