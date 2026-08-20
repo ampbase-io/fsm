@@ -342,6 +342,25 @@ func (m *Manager) registeredFSMs() []*fsm {
 	return fsms
 }
 
+// registeredKeys returns a snapshot of the registered FSM keys, the identities the claim loop
+// hands a backend to select runs by.
+func (m *Manager) registeredKeys() []fsmKey {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return slices.Collect(maps.Keys(m.fsms))
+}
+
+// registeredFSM resolves a key to its registered FSM, reporting whether one is registered. It is
+// how a claimed run finds the FSM that resumes it, so the claim itself carries only the key.
+func (m *Manager) registeredFSM(key fsmKey) (*fsm, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	f, ok := m.fsms[key]
+	return f, ok
+}
+
 // registeredTypes returns the distinct resource type names registered with this manager. A
 // type's runs are the same regardless of which action registered it.
 func (m *Manager) registeredTypes() []string {

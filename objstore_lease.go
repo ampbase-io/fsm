@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -239,54 +240,72 @@ func (s *objectStore) claimReserved(ctx context.Context, version ulid.ULID, queu
 // pass or a caller-invoked Resume. One lock scan per distinct resource type serves every
 // action registered on it; failures on individual runs are logged and skipped so one bad
 // manifest cannot block the rest.
-func (s *objectStore) claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error) {
+func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey) ([]claimedRun, error) {
+	registered := keySet(keys)
+
 	var claimed []claimedRun
-	for typeName, actions := range fsmsByType(fsms) {
-		entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
+	for _, typeName := range resourceTypes(keys) {
+		runs, err := s.claimLocks(ctx, typeName, registered)
 		if err != nil {
 			return nil, err
 		}
-		for _, e := range entries {
-			f, ok := actions[e.action]
-			if !ok {
-				continue
-			}
-			run, won := s.claimEntry(ctx, f, e)
-			if !won {
-				continue
-			}
+		claimed = append(claimed, runs...)
+	}
+	return claimed, nil
+}
+
+// claimLocks claims every run under one resource type's lock prefix whose action this node runs.
+func (s *objectStore) claimLocks(ctx context.Context, typeName string, registered map[fsmKey]struct{}) ([]claimedRun, error) {
+	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
+	if err != nil {
+		return nil, err
+	}
+
+	// At most one claim per lock, so the scan bounds the result exactly.
+	claimed := make([]claimedRun, 0, len(entries))
+	for _, e := range entries {
+		key := fsmKey{typeName: typeName, action: e.action}
+		if _, ok := registered[key]; !ok {
+			continue
+		}
+		if run, won := s.claimEntry(ctx, key, e); won {
 			claimed = append(claimed, run)
 		}
 	}
 	return claimed, nil
 }
 
-// fsmsByType groups the FSMs by resource type, then action, so one lock scan per distinct
-// type serves every action registered on it.
-func fsmsByType(fsms []*fsm) map[string]map[string]*fsm {
-	byType := map[string]map[string]*fsm{}
-	for _, f := range fsms {
-		actions, ok := byType[f.typeName]
-		if !ok {
-			actions = map[string]*fsm{}
-			byType[f.typeName] = actions
-		}
-		actions[f.action] = f
+// resourceTypes returns the distinct resource types among keys — one lock prefix to scan each.
+// Sorting makes the scan order deterministic across passes and nodes.
+func resourceTypes(keys []fsmKey) []string {
+	types := make([]string, 0, len(keys))
+	for _, k := range keys {
+		types = append(types, k.typeName)
 	}
-	return byType
+	slices.Sort(types)
+	return slices.Compact(types)
 }
 
-// claimEntry attempts to claim one scanned run for f, reporting whether it was won. A run
+// keySet indexes the registered FSM keys for membership tests against scanned locks.
+func keySet(keys []fsmKey) map[fsmKey]struct{} {
+	set := make(map[fsmKey]struct{}, len(keys))
+	for _, k := range keys {
+		set[k] = struct{}{}
+	}
+	return set
+}
+
+// claimEntry attempts to claim one scanned run for key, reporting whether it was won. A run
 // this store already holds or is mid-claim on falls out at reserveClaim, which checks
 // atomically; the claimable pre-filter just avoids pointless CAS attempts. Lost races and
 // individual failures are skipped so one bad manifest cannot block the rest of the pass.
-func (s *objectStore) claimEntry(ctx context.Context, f *fsm, e lockEntry) (claimedRun, bool) {
+func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry) (claimedRun, bool) {
 	if !s.claimable(e.manifest, time.Now()) {
 		return claimedRun{}, false
 	}
 
 	if queue := admissionQueue(e.manifest); queue != "" {
-		return s.claimQueued(ctx, f, e, queue)
+		return s.claimQueued(ctx, key, e, queue)
 	}
 
 	manifest, err := s.claimManifest(ctx, e.version)
@@ -298,7 +317,7 @@ func (s *objectStore) claimEntry(ctx context.Context, f *fsm, e lockEntry) (clai
 		return claimedRun{}, false
 	}
 
-	return claimedRun{f: f, resource: manifestResource(e.version, manifest)}, true
+	return claimedRun{key: key, resource: manifestResource(e.version, manifest)}, true
 }
 
 // claimQueued claims a queued run only if its queue admits it under the cluster-wide capacity
@@ -307,7 +326,7 @@ func (s *objectStore) claimEntry(ctx context.Context, f *fsm, e lockEntry) (clai
 // CAS-admits it into the queue roster, then claims the manifest lease, releasing the admitted slot
 // if that manifest claim loses the race (per the RFC's "Interaction with run manifests"). A full
 // queue leaves the run pending for a later pass, when a finishing run frees a slot.
-func (s *objectStore) claimQueued(ctx context.Context, f *fsm, e lockEntry, queue string) (claimedRun, bool) {
+func (s *objectStore) claimQueued(ctx context.Context, key fsmKey, e lockEntry, queue string) (claimedRun, bool) {
 	if !s.reserveClaim(e.version) {
 		return claimedRun{}, false
 	}
@@ -337,7 +356,7 @@ func (s *objectStore) claimQueued(ctx context.Context, f *fsm, e lockEntry, queu
 		return claimedRun{}, false
 	}
 
-	return claimedRun{f: f, resource: manifestResource(e.version, manifest)}, true
+	return claimedRun{key: key, resource: manifestResource(e.version, manifest)}, true
 }
 
 // releaseLease clears this node's ownership under the fence so peers can claim the run
