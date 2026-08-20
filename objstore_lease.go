@@ -275,8 +275,8 @@ func (s *objectStore) claimLocks(ctx context.Context, typeName string, registere
 	return claimed, nil
 }
 
-// resourceTypes returns the distinct resource types among keys — one lock prefix to scan each.
-// Sorting makes the scan order deterministic across passes and nodes.
+// resourceTypes returns the distinct resource types among keys, one lock prefix to scan each.
+// Sorted, so scan order is deterministic across passes and nodes.
 func resourceTypes(keys []fsmKey) []string {
 	types := make([]string, 0, len(keys))
 	for _, k := range keys {
@@ -286,7 +286,6 @@ func resourceTypes(keys []fsmKey) []string {
 	return slices.Compact(types)
 }
 
-// keySet indexes the registered FSM keys for membership tests against scanned locks.
 func keySet(keys []fsmKey) map[fsmKey]struct{} {
 	set := make(map[fsmKey]struct{}, len(keys))
 	for _, k := range keys {

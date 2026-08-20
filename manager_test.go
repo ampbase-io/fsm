@@ -322,18 +322,15 @@ func testDelayedStart(t *testing.T, f *managerFactory) {
 
 // TestActiveAcrossTypes verifies Active merges runs across every registered resource type for
 // an id, deduplicated by run — the Manager queries the store once per distinct type.
-// TestStoreActiveIsolatesActions pins that Store.Active returns only the runs of the descriptor's
-// action. Two FSMs may share a resource type — the registry keys on {type, action} — and each
-// backend scans by type, so an unfiltered scan hands one FSM the other's runs. Resume would then
-// drive them under the wrong action: transition lookups miss, every state degrades to a no-op, no
-// FINISH is ever appended, and both FSMs execute the same run.
+// TestStoreActiveIsolatesActions pins that Active returns only the runs of its own action. Two
+// FSMs may share a resource type, and both backends scan by type, so an unfiltered scan resumes
+// one FSM's runs under the other's transitions.
 func TestStoreActiveIsolatesActions(t *testing.T) { runBackends(t, testStoreActiveIsolatesActions) }
 
 func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
-	// Both FSMs are registered on the same resource type (orderReq) under different actions.
 	var (
 		deployEntered = make(chan struct{}, 1)
 		deployBlock   = make(chan struct{})
@@ -358,8 +355,7 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	}
 	<-rollbackEntered
 
-	// Active is the resume strategy of a backend without a claim loop; a lease-coordinated one
-	// resumes through claimRuns, which selects by action when it groups FSMs by type.
+	// A lease-coordinated backend resumes through claimRuns instead, which selects by action too.
 	scanner, ok := m.store.(activeScanner)
 	if !ok {
 		t.Skip("backend resumes via the claim loop, not Active")
@@ -378,8 +374,7 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 }
 
 // TestRunningBeforeFirstTransition pins that a run reads RUNNING while its first transition is
-// still executing, on both backends. A consumer that treats PENDING as "not picked up yet" would
-// otherwise re-dispatch a run already in flight.
+// still executing. A consumer treating PENDING as "not picked up yet" would re-dispatch it.
 func TestRunningBeforeFirstTransition(t *testing.T) { runBackends(t, testRunningBeforeFirstTransition) }
 
 func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {

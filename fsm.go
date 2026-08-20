@@ -344,15 +344,13 @@ type RunSnapshot struct {
 	Error RunErr
 }
 
-// nodeIdentified is a backend with a node identity. The run span asserts it to attribute a run to
-// its owner node; a backend without one is single-process and has no owner to record.
+// nodeIdentified is a backend with a node identity; one without is single-process and has no
+// owner to record on a run span.
 type nodeIdentified interface {
 	nodeID() string
 }
 
-// key identifies this FSM by the resource type and action its runs are recorded under. It is both
-// the registry key and everything a backend needs to select an FSM's runs — the fsm itself
-// additionally carries codecs, transitions, and generic dispatch closures no backend may see.
+// key identifies this FSM by the resource type and action its runs are recorded under.
 func (f *fsm) key() fsmKey {
 	return fsmKey{typeName: f.typeName, action: f.action}
 }

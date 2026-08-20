@@ -28,12 +28,8 @@ import (
 
 const tracerName = "fsm"
 
-// Store is the persistence contract the Manager requires of a storage backend. It is declared
-// here, with its consumer, rather than beside either implementation: boltStore (store.go) and
-// objectStore (objstore_store.go) satisfy it structurally, and neither owns its shape. The
-// narrower views a single call site needs — appender for the transition interceptors, or a
-// backend that claims runs, fences them, or records cancels — are declared at those sites
-// instead (see interceptor.go, coordinate.go, and cancelRecorder below).
+// Store is the persistence contract the Manager requires of a storage backend. Narrower views a
+// single call site needs are declared at that site instead.
 type Store interface {
 	appender
 	io.Closer
@@ -72,8 +68,8 @@ type Store interface {
 	ForgetRun(run Run) error
 }
 
-// cancelRecorder is the Cancel path's view of a backend that records a cancel durably for the
-// owning node to react to; a backend without it is single-process, so Cancel stops the local run.
+// cancelRecorder is a backend whose cancels are durable and cluster-visible. A backend without it
+// is single-process, so Cancel stops the local run instead.
 type cancelRecorder interface {
 	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
 	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
@@ -345,8 +341,7 @@ func (m *Manager) registeredFSMs() []*fsm {
 	return fsms
 }
 
-// registeredKeys returns a snapshot of the registered FSM keys, the identities the claim loop
-// hands a backend to select runs by.
+// registeredKeys returns a snapshot of the registered FSM keys.
 func (m *Manager) registeredKeys() []fsmKey {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -354,8 +349,7 @@ func (m *Manager) registeredKeys() []fsmKey {
 	return slices.Collect(maps.Keys(m.fsms))
 }
 
-// registeredFSM resolves a key to its registered FSM, reporting whether one is registered. It is
-// how a claimed run finds the FSM that resumes it, so the claim itself carries only the key.
+// registeredFSM resolves a key to its registered FSM, so a claim can carry only the key.
 func (m *Manager) registeredFSM(key fsmKey) (*fsm, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -501,9 +495,8 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 }
 
 // resolveRun resolves an id to its run version across the registered types, preferring an active
-// run and falling back to the most recently recorded one. It is composed from the two queries a
-// backend already answers rather than being a backend method of its own, so both backends resolve
-// by the same rule instead of each implementing the preference separately.
+// run and falling back to the most recently recorded one. Composed here so both backends resolve
+// by one rule rather than each implementing the preference.
 func (m *Manager) resolveRun(ctx context.Context, id string) (ulid.ULID, error) {
 	for _, typeName := range m.registeredTypes() {
 		// The oldest active run: a caller waiting by id follows the one that started first.

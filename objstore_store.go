@@ -874,13 +874,11 @@ func (s *objectStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
 	return active, nil
 }
 
-// errRunNotPending aborts the SetRunning CAS when the run has already left PENDING, so a resume
-// of a run mid-flight costs a read rather than a write.
+// errRunNotPending aborts the SetRunning CAS, so resuming a mid-flight run costs no write.
 var errRunNotPending = errors.New("run is not pending")
 
 // SetRunning flips the manifest to RUNNING under the fence. Appending a transition would set it
-// too, but only once the first transition has finished; a consumer reading run state must be able
-// to tell a run this node is executing from one still waiting to be picked up.
+// too, but not until the first one finished — too late to tell an executing run from a waiting one.
 func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
 	epoch, ok := s.ownedEpoch(run.StartVersion)
 	if !ok {

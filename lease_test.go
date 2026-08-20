@@ -79,7 +79,6 @@ func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectS
 	return store
 }
 
-// deployKey is the FSM identity claimRuns selects runs by.
 var deployKey = fsmKey{typeName: "orderReq", action: "deploy"}
 
 func startRun(t *testing.T, s *objectStore, id string) Run {

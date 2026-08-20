@@ -420,11 +420,9 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 				continue
 			}
 
-			// The ACTIVE key is <type>#<id>#<action>#<version> and the scan prefix is the type
-			// alone, so runs of every action registered on this type are walked. Only this
-			// descriptor's runs may be returned — the caller stamps its own action and alias on
-			// them and resumes them through its own transitions. The object backend filters the
-			// same way in objectStore.Active.
+			// The scan prefix is the type alone, but the ACTIVE key is
+			// <type>#<id>#<action>#<version>, so every action on this type is walked. The
+			// caller resumes what it gets under its own action.
 			if ae.GetAction() != key.action {
 				continue
 			}
@@ -502,10 +500,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 				ID:           ae.active.GetResourceId(),
 				StartVersion: ae.version,
 				Action:       key.action,
-				// The alias is a Manager-side presentation concern, not storage state: readers
-				// of these rows either overwrite it from the registered FSM (Manager.Children)
-				// or ignore it (ActiveRuns, ListActive). The object backend never records one
-				// either, so both backends now leave it to the Manager.
+				// Restored by the Manager from the registered FSM, as on the object backend.
 				ResourceName: "",
 				TypeName:     key.typeName,
 				Queue:        ae.active.GetOptions().GetQueue(),
@@ -644,22 +639,19 @@ func (s *boltStore) ForgetRun(run Run) error {
 	return nil
 }
 
-// AppendOptions carries the per-append details that are not on the event itself. The zero value
-// is an ordinary mid-run append. It is a plain struct rather than functional options so the
-// Append contract names no unexported type and a backend outside this package can implement it.
+// AppendOptions carries the per-append details that are not on the event itself. The zero value is
+// an ordinary mid-run append.
 type AppendOptions struct {
-	// Start marks a START append and carries the run's initial record. Required for a START
-	// event and ignored for every other type.
+	// Start is required for a START event and ignored for every other type.
 	Start *StartRecord
 
-	// DelayUntil is Unix milliseconds, matching lease_expiry: whole-second truncation made a
-	// delayed run's dispatch time nondeterministic within the second it was scheduled for.
+	// DelayUntil is Unix milliseconds, matching lease_expiry.
 	DelayUntil int64
 
-	// RunAfter is the marshaled version of the run this one waits on, empty when it waits on none.
+	// RunAfter is the marshaled version of the run this one waits on.
 	RunAfter []byte
 
-	// Parent is the marshaled version of the parent run, empty when the run has no parent.
+	// Parent is the marshaled version of the parent run.
 	Parent []byte
 
 	// Unowned records a START that must be persisted without a lease, so the claim loop
@@ -675,8 +667,7 @@ type StartRecord struct {
 	Resource []byte
 }
 
-// marshalVersion renders a run version for an AppendOptions field, mapping the zero version to
-// nil so an absent parent or run-after stays absent.
+// marshalVersion maps the zero version to nil, so an absent parent or run-after stays absent.
 func marshalVersion(version ulid.ULID) ([]byte, error) {
 	if version.Compare(ulid.ULID{}) == 0 {
 		return nil, nil
