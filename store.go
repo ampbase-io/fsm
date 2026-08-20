@@ -622,6 +622,17 @@ func (s *boltStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
 	return active, nil
 }
 
+func (s *boltStore) SetRunning(ctx context.Context, run Run) error {
+	txn := s.memDB.Txn(true)
+	defer txn.Abort()
+
+	if err := txn.Insert(fsmTable, RunSnapshot{Run: run, State: fsmv1.RunState_RUN_STATE_RUNNING}); err != nil {
+		return err
+	}
+	txn.Commit()
+	return nil
+}
+
 func (s *boltStore) ForgetRun(run Run) error {
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
@@ -824,14 +835,6 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 			fsmv1.EventType_EVENT_TYPE_CANCEL:
 			if err := eventB.Put(eventKey, eventBytes); err != nil {
 				return err
-			}
-
-			// A recorded transition is what moves a run out of PENDING. The object backend
-			// derives RUNNING the same way (appendMidRun), so both backends report a run as
-			// running from its first transition event rather than from an executor note.
-			rs.State = fsmv1.RunState_RUN_STATE_RUNNING
-			if err := txn.Insert(fsmTable, rs); err != nil {
-				return fmt.Errorf("failed to update state: %w", err)
 			}
 
 			return nil

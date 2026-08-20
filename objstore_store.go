@@ -874,6 +874,35 @@ func (s *objectStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
 	return active, nil
 }
 
+// errRunNotPending aborts the SetRunning CAS when the run has already left PENDING, so a resume
+// of a run mid-flight costs a read rather than a write.
+var errRunNotPending = errors.New("run is not pending")
+
+// SetRunning flips the manifest to RUNNING under the fence. Appending a transition would set it
+// too, but only once the first transition has finished; a consumer reading run state must be able
+// to tell a run this node is executing from one still waiting to be picked up.
+func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
+
+	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
+		if m.Status != fsmv1.RunState_RUN_STATE_PENDING {
+			return errRunNotPending
+		}
+		m.Status = fsmv1.RunState_RUN_STATE_RUNNING
+		return nil
+	})
+	if errors.Is(err, errRunNotPending) {
+		return nil
+	}
+	return err
+}
+
 // ForgetRun releases this node's claim on the run after a failed resume so another node (or a
 // later claim pass) can adopt it; the resource lock stays visible until recovery succeeds.
 func (s *objectStore) ForgetRun(run Run) error {

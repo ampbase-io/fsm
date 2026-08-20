@@ -65,6 +65,9 @@ type Store interface {
 
 	// Run-state notes from the executor.
 
+	// SetRunning records that the run has begun executing transitions on this node, moving it
+	// out of PENDING before the first transition rather than after it.
+	SetRunning(ctx context.Context, run Run) error
 	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
 	ForgetRun(run Run) error
 }

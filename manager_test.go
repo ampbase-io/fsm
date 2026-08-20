@@ -377,57 +377,37 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	}
 }
 
-// TestRunningDerivedFromTransition pins that a run reads RUNNING once it has recorded a
-// transition, on both backends. Neither backend is told when execution starts: the object
-// backend flips the manifest in appendMidRun and BoltDB flips its memdb row in Append, so the
-// state is derived from the durable event rather than from an executor note.
-func TestRunningDerivedFromTransition(t *testing.T) { runBackends(t, testRunningDerivedFromTransition) }
+// TestRunningBeforeFirstTransition pins that a run reads RUNNING while its first transition is
+// still executing, on both backends. A consumer that treats PENDING as "not picked up yet" would
+// otherwise re-dispatch a run already in flight.
+func TestRunningBeforeFirstTransition(t *testing.T) { runBackends(t, testRunningBeforeFirstTransition) }
 
-func testRunningDerivedFromTransition(t *testing.T, f *managerFactory) {
+func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {
 	m, _ := f.newManager(nil)
 	ctx := context.Background()
 
-	// The first transition completes — recording an event — and the second blocks, so the run is
-	// observably mid-flight with one transition behind it.
 	entered := make(chan struct{}, 1)
 	block := make(chan struct{})
 	defer close(block)
+	start := blockingFSM(t, m, "early-running", entered, block)
 
-	start, _, err := m.Register[orderReq, orderResp]("derive-running").
-		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			return NewResponse(&orderResp{Status: "first"}), nil
-		}).
-		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			entered <- struct{}{}
-			select {
-			case <-block:
-				return NewResponse(&orderResp{Status: "ok"}), nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}).
-		End("done").
-		Build(ctx)
-	if err != nil {
-		t.Fatalf("failed to build FSM: %v", err)
-	}
-
-	version, err := start(ctx, "derive-1", NewRequest(&orderReq{}, &orderResp{}))
+	version, err := start(ctx, "early-1", NewRequest(&orderReq{}, &orderResp{}))
 	if err != nil {
 		t.Fatalf("failed to start FSM: %v", err)
 	}
+	// The initializer runs before the transition, so the state is settled once entered fires.
 	<-entered
 
-	active, err := m.Active(ctx, "derive-1")
+	active, err := m.Active(ctx, "early-1")
 	if err != nil {
 		t.Fatalf("Active failed: %v", err)
 	}
-	state, ok := active[ActiveKey{Action: "derive-running", Version: version}]
+	state, ok := active[ActiveKey{Action: "early-running", Version: version}]
 	if !ok {
 		t.Fatalf("expected the run to be active, got %v", active)
 	}
 	if state != fsmv1.RunState_RUN_STATE_RUNNING {
-		t.Fatalf("expected a run with a recorded transition to read RUNNING, got %v", state)
+		t.Fatalf("expected a run executing its first transition to read RUNNING, got %v", state)
 	}
 }
 
