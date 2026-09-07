@@ -34,6 +34,10 @@ type Store interface {
 	appender
 	io.Closer
 
+	// Start records a run's START event with its start record — the resource, transitions, and
+	// scheduling every later append reads back. Start and Append are the two entry points to a
+	// backend's single mutation path; the run's queue and parent travel on the Run itself.
+	Start(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error)
 	// Active returns every incomplete run recorded under the FSM's type and action, for resume.
 	// A lease-coordinated backend additionally implements runClaimer, which the Manager prefers
 	// for resume because it hands out only the runs this node may take.

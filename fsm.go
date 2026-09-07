@@ -594,7 +594,7 @@ func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersio
 		RunAfter:    startOpt.runAfter,
 		Unowned:     unowned,
 	}
-	if _, err := m.store.Append(ctx, run, f.startEvent(id), start); err != nil {
+	if _, err := m.store.Start(ctx, run, f.startEvent(id), start); err != nil {
 		return Run{}, err
 	}
 	return run, nil

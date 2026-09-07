@@ -338,7 +338,7 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 func startQueuedRun(t *testing.T, s *objectStore, id, queue string) Run {
 	t.Helper()
 	run := Run{ID: id, StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq", Queue: queue}
-	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
+	_, err := s.Start(context.Background(), run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,

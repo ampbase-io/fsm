@@ -92,7 +92,7 @@ func startRun(t *testing.T, s *objectStore, id string) Run {
 }
 
 func appendStarted(s *objectStore, run Run) error {
-	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
+	_, err := s.Start(context.Background(), run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,
@@ -109,7 +109,7 @@ func appendComplete(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, nil)
+	})
 	return err
 }
 
@@ -120,7 +120,7 @@ func appendFinished(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "done",
-	}, nil)
+	})
 	return err
 }
 
@@ -290,7 +290,7 @@ func TestUnownedStartClaimableByPeer(t *testing.T) {
 
 	ingress := h.store("node-ingress", 10*time.Second)
 	run := Run{ID: "unowned-1", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
-	_, err := ingress.Append(ctx, run, &fsmv1.StateEvent{
+	_, err := ingress.Start(ctx, run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,
@@ -894,7 +894,7 @@ func TestDelayUntilStoredAsMilliseconds(t *testing.T) {
 	// A target with a guaranteed non-zero sub-second component, so seconds truncation is visible.
 	target := time.Now().Truncate(time.Second).Add(1234 * time.Millisecond)
 	run := Run{ID: "delay-ms", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
-	if _, err := s.Append(ctx, run, &fsmv1.StateEvent{
+	if _, err := s.Start(ctx, run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,

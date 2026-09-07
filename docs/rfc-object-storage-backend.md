@@ -389,10 +389,13 @@ func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
 
 ```go
 type Store interface {
-    // Append writes an event and updates the run manifest. A START event carries its
-    // startRecord (resource, transitions, scheduling); every other event passes nil.
-    Append(ctx context.Context, run Run, event *fsmv1.StateEvent,
+    // Start records a run's START event with its start record (resource, transitions,
+    // scheduling). Start and Append are the two entry points to one mutation path.
+    Start(ctx context.Context, run Run, event *fsmv1.StateEvent,
         start *startRecord) (ulid.ULID, error)
+
+    // Append records every later event and updates the run manifest.
+    Append(ctx context.Context, run Run, event *fsmv1.StateEvent) (ulid.ULID, error)
 
     // Active returns all incomplete runs for the given FSM (type and action).
     Active(ctx context.Context, key fsmKey) ([]*activeResource, error)

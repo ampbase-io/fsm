@@ -677,7 +677,18 @@ func optionalVersionBytes(version ulid.ULID) []byte {
 	return versionBytes(version)
 }
 
-func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+func (s *boltStore) Start(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+	return s.record(ctx, run, event, start)
+}
+
+func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent) (ulid.ULID, error) {
+	return s.record(ctx, run, event, nil)
+}
+
+// record is the single mutation path all BoltDB run state flows through: one write
+// transaction across the ACTIVE, EVENTS, and CHILDREN buckets plus the in-memory index. start is
+// set for START only.
+func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
 	if start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
 		return ulid.ULID{}, errors.New("start record must be set")
 	}

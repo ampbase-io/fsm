@@ -112,9 +112,18 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 	return updated, nil
 }
 
-// Append writes an event object and updates the run manifest according to the event type. It is
-// the object storage implementation of the single mutation path all run state flows through.
-func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+func (s *objectStore) Start(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+	return s.record(ctx, run, event, start)
+}
+
+func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent) (ulid.ULID, error) {
+	return s.record(ctx, run, event, nil)
+}
+
+// record writes an event object and updates the run manifest according to the event type. It
+// is the object storage implementation of the single mutation path all run state flows through;
+// start is set for START only.
+func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
 	// Persistence must complete even when the run itself is being canceled — the CANCEL and
 	// FINISH events are appended from an already-canceled run context, and BoltDB's local
 	// writes are likewise not interruptible. Values (e.g. trace context) are preserved.
