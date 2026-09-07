@@ -98,7 +98,7 @@ func appendStarted(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}})
+	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}})
 	return err
 }
 
@@ -109,7 +109,7 @@ func appendComplete(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", AppendOptions{})
+	}, nil)
 	return err
 }
 
@@ -120,7 +120,7 @@ func appendFinished(s *objectStore, run Run) error {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "done",
-	}, "", AppendOptions{})
+	}, nil)
 	return err
 }
 
@@ -296,7 +296,7 @@ func TestUnownedStartClaimableByPeer(t *testing.T) {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}, Unowned: true})
+	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}, Unowned: true})
 	if err != nil {
 		t.Fatalf("failed to append unowned start: %v", err)
 	}
@@ -882,7 +882,7 @@ func TestLostLeaseDelayedRunNeverExecutes(t *testing.T) {
 	}
 }
 
-// TestDelayUntilStoredAsMilliseconds verifies withDelayUntil records the delay at millisecond
+// TestDelayUntilStoredAsMilliseconds verifies a START records the delay at millisecond
 // precision. A regression to Unix seconds would truncate the sub-second component, making a
 // resumed delayed run's dispatch nondeterministic; the resume read-side (time.UnixMilli in
 // resumeOne) is exercised by TestLostLeaseDelayedRunNeverExecutes.
@@ -900,7 +900,7 @@ func TestDelayUntilStoredAsMilliseconds(t *testing.T) {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, "", AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}, DelayUntil: target.UnixMilli()}); err != nil {
+	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}, DelayUntil: target}); err != nil {
 		t.Fatalf("failed to append start: %v", err)
 	}
 

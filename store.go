@@ -60,7 +60,7 @@ var fsmSchema = &memdb.DBSchema{
 					Name:   idIndex,
 					Unique: true,
 					Indexer: ulidIndexer{
-						fieldFn: func(rs RunSnapshot) ulid.ULID {
+						fieldFn: func(rs runSnapshot) ulid.ULID {
 							return rs.StartVersion
 						},
 					},
@@ -75,7 +75,7 @@ var fsmSchema = &memdb.DBSchema{
 					AllowMissing: true,
 					Unique:       false,
 					Indexer: ulidIndexer{
-						fieldFn: func(rs RunSnapshot) ulid.ULID {
+						fieldFn: func(rs runSnapshot) ulid.ULID {
 							return rs.Parent
 						},
 					},
@@ -495,7 +495,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 				s.logger.WithError(err).Error("failed to unmarshal parent")
 			}
 		}
-		rs := RunSnapshot{
+		rs := runSnapshot{
 			Run: Run{
 				ID:           ae.active.GetResourceId(),
 				StartVersion: ae.version,
@@ -531,7 +531,7 @@ func (s *boltStore) ActiveRuns(ctx context.Context, resourceType, resourceID str
 
 	active := ActiveSet{}
 	for next := it.Next(); next != nil; next = it.Next() {
-		rs := next.(RunSnapshot)
+		rs := next.(runSnapshot)
 		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
 			continue
 		}
@@ -552,7 +552,7 @@ func (s *boltStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run
 
 	children := []Run{}
 	for next := it.Next(); next != nil; next = it.Next() {
-		rs := next.(RunSnapshot)
+		rs := next.(runSnapshot)
 		if rs.StartVersion.Compare(ulid.ULID{}) == 0 {
 			continue
 		}
@@ -581,7 +581,7 @@ func (s *boltStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 			return historyOutcome(ctx, s, runVersion)
 		}
 
-		rs, ok := item.(RunSnapshot)
+		rs, ok := item.(runSnapshot)
 		if !ok {
 			return fmt.Errorf("unexpected type %T", item)
 		}
@@ -597,7 +597,7 @@ func (s *boltStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	}
 }
 
-func (s *boltStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
+func (s *boltStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
 	txn := s.memDB.Txn(false)
 	defer txn.Abort()
 
@@ -606,9 +606,9 @@ func (s *boltStore) ListActive(ctx context.Context) ([]RunSnapshot, error) {
 		return nil, err
 	}
 
-	active := []RunSnapshot{}
+	active := []runSnapshot{}
 	for next := it.Next(); next != nil; next = it.Next() {
-		rs := next.(RunSnapshot)
+		rs := next.(runSnapshot)
 		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
 			continue
 		}
@@ -621,7 +621,7 @@ func (s *boltStore) SetRunning(ctx context.Context, run Run) error {
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
 
-	if err := txn.Insert(fsmTable, RunSnapshot{Run: run, State: fsmv1.RunState_RUN_STATE_RUNNING}); err != nil {
+	if err := txn.Insert(fsmTable, runSnapshot{Run: run, State: fsmv1.RunState_RUN_STATE_RUNNING}); err != nil {
 		return err
 	}
 	txn.Commit()
@@ -632,27 +632,26 @@ func (s *boltStore) ForgetRun(run Run) error {
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
 
-	if err := txn.Delete(fsmTable, RunSnapshot{Run: run}); err != nil {
+	if err := txn.Delete(fsmTable, runSnapshot{Run: run}); err != nil {
 		return err
 	}
 	txn.Commit()
 	return nil
 }
 
-// AppendOptions carries the per-append details that are not on the event itself. The zero value is
-// an ordinary mid-run append.
-type AppendOptions struct {
-	// Start is required for a START event and ignored for every other type.
-	Start *StartRecord
+// startRecord is what a START append records beyond the event and the run itself: the initial
+// resource and transition list, plus the scheduling the run was started with. The run's queue and
+// parent are on the Run already, so they are not repeated here.
+type startRecord struct {
+	Transitions []string
 
-	// DelayUntil is Unix milliseconds, matching lease_expiry.
-	DelayUntil int64
+	Resource []byte
 
-	// RunAfter is the marshaled version of the run this one waits on.
-	RunAfter []byte
+	// DelayUntil defers the first transition; zero starts at once.
+	DelayUntil time.Time
 
-	// Parent is the marshaled version of the parent run.
-	Parent []byte
+	// RunAfter is the run this one waits on; zero waits on nothing.
+	RunAfter ulid.ULID
 
 	// Unowned records a START that must be persisted without a lease, so the claim loop
 	// distributes it across the worker pool rather than the accepting node executing it. Only
@@ -660,24 +659,27 @@ type AppendOptions struct {
 	Unowned bool
 }
 
-// StartRecord is the initial state a START append records for a run.
-type StartRecord struct {
-	Transitions []string
-
-	Resource []byte
-}
-
-// marshalVersion maps the zero version to nil, so an absent parent or run-after stays absent.
-func marshalVersion(version ulid.ULID) ([]byte, error) {
-	if version.Compare(ulid.ULID{}) == 0 {
-		return nil, nil
+// delayMillis is the persisted form of DelayUntil: Unix milliseconds, matching lease_expiry, so a
+// delayed run's dispatch is deterministic within the second it was scheduled for. Zero stays zero.
+func delayMillis(until time.Time) int64 {
+	if until.IsZero() {
+		return 0
 	}
-	return version.MarshalText()
+	return until.UnixMilli()
 }
 
-func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts AppendOptions) (ulid.ULID, error) {
-	if opts.Start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
-		return ulid.ULID{}, errors.New("start option must be set")
+// optionalVersionBytes is the persisted form of a version that may be absent: nil for the zero
+// version, so an absent parent or run-after is recorded as absent rather than as zero.
+func optionalVersionBytes(version ulid.ULID) []byte {
+	if version.Compare(ulid.ULID{}) == 0 {
+		return nil
+	}
+	return versionBytes(version)
+}
+
+func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+	if start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
+		return ulid.ULID{}, errors.New("start record must be set")
 	}
 
 	if run.StartVersion.Compare(ulid.ULID{}) == 0 {
@@ -712,7 +714,7 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 	// ACTIVE Bucket
 	// <resource_name>#<resource_id>#<action>#<run_version_or_empty>
 	activeKeyVersion := ulid.ULID{}
-	if queue != "" {
+	if run.Queue != "" {
 		activeKeyVersion = run.StartVersion
 	}
 
@@ -722,6 +724,7 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 	}
 
 	aeEventKey := bytes.Join([][]byte{[]byte(event.GetResourceType()), eventIdentifier, activeKeyVersionBytes}, keySeparator)
+	parentBytes := optionalVersionBytes(run.Parent)
 	var aeEventBytes []byte
 	if event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
 		ae := &fsmv1.ActiveEvent{
@@ -729,13 +732,13 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 			StartVersion: runVersionBytes,
 			Action:       event.GetAction(),
 			ResourceId:   event.GetId(),
-			Resource:     opts.Start.Resource,
-			Transitions:  opts.Start.Transitions,
+			Resource:     start.Resource,
+			Transitions:  start.Transitions,
 			Options: &fsmv1.EventOptions{
-				DelayUntil: opts.DelayUntil,
-				RunAfter:   opts.RunAfter,
-				Queue:      queue,
-				Parent:     opts.Parent,
+				DelayUntil: delayMillis(start.DelayUntil),
+				RunAfter:   optionalVersionBytes(start.RunAfter),
+				Queue:      run.Queue,
+				Parent:     parentBytes,
 			},
 			TraceContext: map[string]string{},
 		}
@@ -747,7 +750,7 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 		}
 	}
 
-	rs := RunSnapshot{
+	rs := runSnapshot{
 		Run: run,
 	}
 
@@ -760,7 +763,7 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 		switch event.GetType() {
 		case fsmv1.EventType_EVENT_TYPE_START:
 			// NOTE: we only allow one active event per resource unless it's getting queued
-			if queue == "" && activeB.Get(aeEventKey) != nil {
+			if run.Queue == "" && activeB.Get(aeEventKey) != nil {
 				var ae fsmv1.ActiveEvent
 				if err := proto.Unmarshal(activeB.Get(aeEventKey), &ae); err != nil {
 					return err
@@ -783,9 +786,9 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 				return err
 			}
 
-			if opts.Parent != nil {
+			if parentBytes != nil {
 				// <parent_run_version>#<child_run_version>
-				parentKey := bytes.Join([][]byte{opts.Parent, runVersionBytes}, keySeparator)
+				parentKey := bytes.Join([][]byte{parentBytes, runVersionBytes}, keySeparator)
 				if err := tx.Bucket(childrenBucket).Put(parentKey, runVersionBytes); err != nil {
 					return err
 				}
@@ -801,7 +804,7 @@ func (s *boltStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent
 			default:
 				deleted := 0
 				for next := iter.Next(); next != nil; next = iter.Next() {
-					rs := next.(RunSnapshot)
+					rs := next.(runSnapshot)
 					if rs.State != fsmv1.RunState_RUN_STATE_COMPLETE {
 						continue
 					}

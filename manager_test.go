@@ -320,11 +320,9 @@ func testDelayedStart(t *testing.T, f *managerFactory) {
 	}
 }
 
-// TestActiveAcrossTypes verifies Active merges runs across every registered resource type for
-// an id, deduplicated by run — the Manager queries the store once per distinct type.
-// TestStoreActiveIsolatesActions pins that Active returns only the runs of its own action. Two
-// FSMs may share a resource type, and both backends scan by type, so an unfiltered scan resumes
-// one FSM's runs under the other's transitions.
+// TestStoreActiveIsolatesActions pins that Store.Active returns only the runs of its own action.
+// Two FSMs may share a resource type, and both backends scan by type, so an unfiltered scan
+// resumes one FSM's runs under the other's transitions.
 func TestStoreActiveIsolatesActions(t *testing.T) { runBackends(t, testStoreActiveIsolatesActions) }
 
 func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
@@ -355,13 +353,7 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 	}
 	<-rollbackEntered
 
-	// A lease-coordinated backend resumes through claimRuns instead, which selects by action too.
-	scanner, ok := m.store.(activeScanner)
-	if !ok {
-		t.Skip("backend resumes via the claim loop, not Active")
-	}
-
-	active, err := scanner.Active(ctx, fsmKey{typeName: "orderReq", action: "iso-deploy"})
+	active, err := m.store.Active(ctx, fsmKey{typeName: "orderReq", action: "iso-deploy"})
 	if err != nil {
 		t.Fatalf("Active failed: %v", err)
 	}
@@ -406,6 +398,8 @@ func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {
 	}
 }
 
+// TestActiveAcrossTypes verifies Active merges runs across every registered resource type for
+// an id, deduplicated by run — the Manager queries the store once per distinct type.
 func TestActiveAcrossTypes(t *testing.T) { runBackends(t, testActiveAcrossTypes) }
 
 func testActiveAcrossTypes(t *testing.T, f *managerFactory) {

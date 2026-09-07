@@ -336,7 +336,8 @@ func newFinalizer[R, W any](finalFn func(context.Context, *Request[R, W], RunErr
 	})
 }
 
-type RunSnapshot struct {
+// runSnapshot is a run with the state and error a backend has recorded for it.
+type runSnapshot struct {
 	Run
 
 	State fsmv1.RunState
@@ -574,8 +575,8 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 // persistStart writes a run's START event through the store and returns the Run it recorded. It
 // is the single home for the START persistence contract: the embedded start (leased to this node)
-// and the opaque ingress start (unowned, for the claim loop) share it, differing only in the
-// extra append options they pass. Non-generic — persistence never touches R/W.
+// and the opaque ingress start (unowned, for the claim loop) share it, differing only in whether
+// the START is persisted unowned. Non-generic — persistence never touches R/W.
 func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, unowned bool) (Run, error) {
 	run := Run{
 		ID:           id,
@@ -586,25 +587,14 @@ func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersio
 		Queue:        startOpt.queue,
 		Parent:       startOpt.parent,
 	}
-	runAfter, err := marshalVersion(startOpt.runAfter)
-	if err != nil {
-		return Run{}, err
+	start := &startRecord{
+		Resource:    resource,
+		Transitions: f.transitionSlice(),
+		DelayUntil:  startOpt.until,
+		RunAfter:    startOpt.runAfter,
+		Unowned:     unowned,
 	}
-	parent, err := marshalVersion(startOpt.parent)
-	if err != nil {
-		return Run{}, err
-	}
-
-	opts := AppendOptions{
-		Start:    &StartRecord{Resource: resource, Transitions: f.transitionSlice()},
-		RunAfter: runAfter,
-		Parent:   parent,
-		Unowned:  unowned,
-	}
-	if !startOpt.until.IsZero() {
-		opts.DelayUntil = startOpt.until.UnixMilli()
-	}
-	if _, err := m.store.Append(ctx, run, f.startEvent(id), startOpt.queue, opts); err != nil {
+	if _, err := m.store.Append(ctx, run, f.startEvent(id), start); err != nil {
 		return Run{}, err
 	}
 	return run, nil

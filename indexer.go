@@ -7,7 +7,7 @@ import (
 )
 
 type ulidIndexer struct {
-	fieldFn func(rs RunSnapshot) ulid.ULID
+	fieldFn func(rs runSnapshot) ulid.ULID
 }
 
 func (ulidIndexer) FromArgs(args ...interface{}) ([]byte, error) {
@@ -29,9 +29,9 @@ func (ulidIndexer) FromArgs(args ...interface{}) ([]byte, error) {
 }
 
 func (u ulidIndexer) FromObject(raw interface{}) (bool, []byte, error) {
-	s, ok := raw.(RunSnapshot)
+	s, ok := raw.(runSnapshot)
 	if !ok {
-		return false, nil, fmt.Errorf("wrong type for arg %T, expected RunSnapshot", raw)
+		return false, nil, fmt.Errorf("wrong type for arg %T, expected runSnapshot", raw)
 	}
 
 	val := u.fieldFn(s)

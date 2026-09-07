@@ -344,7 +344,7 @@ func startQueuedRun(t *testing.T, s *objectStore, id, queue string) Run {
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, queue, AppendOptions{Start: &StartRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}}, Unowned: true})
+	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}, Unowned: true})
 	if err != nil {
 		t.Fatalf("failed to start queued run: %v", err)
 	}

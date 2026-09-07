@@ -58,7 +58,7 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 			event.Response = req.response
 		}
 
-		if _, err := m.store.Append(ctx, run, event, run.Queue, AppendOptions{}); err != nil {
+		if _, err := m.store.Append(ctx, run, event, nil); err != nil {
 			logger.WithError(err).Error("failed to append complete event")
 			return nil, err
 		}
@@ -104,7 +104,9 @@ func skipper() TransitionInterceptorFunc {
 // appender writes a run's state events: the single mutation path all run state flows through, and
 // all a transition interceptor needs of a backend.
 type appender interface {
-	Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts AppendOptions) (ulid.ULID, error)
+	// Append records event for run. A START event carries its startRecord; every other event
+	// passes nil, since the run's queue and parent travel on the Run itself.
+	Append(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error)
 }
 
 func canceller(store appender, codec Codec) TransitionInterceptorFunc {
@@ -145,7 +147,7 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				}
 			}
 
-			switch _, appendErr := store.Append(ctx, run, event, run.Queue, AppendOptions{}); {
+			switch _, appendErr := store.Append(ctx, run, event, nil); {
 			case errors.Is(appendErr, ErrLeaseLost):
 				// A fenced append means the run must halt here even though the transition
 				// itself succeeded; swallowing it would keep executing without a durable record.
@@ -278,8 +280,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 									Error:        err.Error(),
 									RetryCount:   retryCount,
 								},
-								run.Queue,
-								AppendOptions{},
+								nil,
 							)
 						}
 

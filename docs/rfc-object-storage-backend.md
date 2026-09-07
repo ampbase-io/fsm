@@ -389,9 +389,13 @@ func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
 
 ```go
 type Store interface {
-    // Append writes an event and updates the run manifest.
+    // Append writes an event and updates the run manifest. A START event carries its
+    // startRecord (resource, transitions, scheduling); every other event passes nil.
     Append(ctx context.Context, run Run, event *fsmv1.StateEvent,
-        queue string, opts ...appendOptionFunc) (ulid.ULID, error)
+        start *startRecord) (ulid.ULID, error)
+
+    // Active returns all incomplete runs for the given FSM (type and action).
+    Active(ctx context.Context, key fsmKey) ([]*activeResource, error)
 
     // History returns the archived history for a completed run.
     History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
@@ -411,10 +415,15 @@ type Store interface {
 beside an implementation, and it carries the run-state queries the distributed-execution addendum
 moved onto it (`ActiveRuns`, `ActiveChildren`, `WaitRun`, `RunResult`, `ListActive`, …).
 
-Resume is **not** on `Store`. A backend implements exactly one of two resume strategies, each a
-narrow view asserted at its call site in `coordinate.go`: `activeScanner` (`Active`, BoltDB — every
-active run is local) or `runClaimer` (`claimRuns`, the object backend — the claim loop hands out
-only runs this node may take). The object backend never implements `Active`.
+Resume goes through `Active` unless the backend is a `runClaimer`, a narrow view asserted at its
+call site in `coordinate.go`. The object backend is one: its claim loop (`claimRuns`) hands out
+only the runs this node may take, so a restarting node cannot hijack a run whose owner is live.
+Both backends implement `Active`; on the object backend it is the query form of the same lock scan.
+
+A run's manifest reads `PENDING` from its START until the owning node begins executing it, when
+`SetRunning` CASes it to `RUNNING` under the lease fence — before the first transition, not after
+it. A consumer may therefore read `PENDING` as "not yet picked up" and `RUNNING` as "in flight on
+`owner_node`". A CAS that finds the run already past `PENDING` (a resume) aborts without a write.
 
 The existing `*store` struct is refactored to satisfy this interface as `boltStore`, with no changes to its internal behavior. The new `objectStore` implements the same interface against S3. The `Manager` accepts a `Store` via configuration. When `DBPath` is set, the manager creates a `boltStore` (identical to today's behavior). When `ObjectStorage` is set, it creates an `objectStore`.
 

@@ -34,6 +34,10 @@ type Store interface {
 	appender
 	io.Closer
 
+	// Active returns every incomplete run recorded under the FSM's type and action, for resume.
+	// A lease-coordinated backend additionally implements runClaimer, which the Manager prefers
+	// for resume because it hands out only the runs this node may take.
+	Active(ctx context.Context, key fsmKey) ([]*activeResource, error)
 	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
 	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
 	// Runs returns the versions of runs recorded for the resource, oldest first, including
@@ -57,7 +61,7 @@ type Store interface {
 	// terminal manifest, the BoltDB backend from the record written at FINISH.
 	RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error)
 	// ListActive returns every incomplete run the backend knows about.
-	ListActive(ctx context.Context) ([]RunSnapshot, error)
+	ListActive(ctx context.Context) ([]runSnapshot, error)
 
 	// Run-state notes from the executor.
 

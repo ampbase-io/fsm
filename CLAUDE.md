@@ -28,10 +28,13 @@ backend's distributed-execution design is the active work.
 - `manager.go` — the `Store` interface, declared with the `Manager` that consumes it (interfaces
   live with their consumer, never beside an implementation). **`Append` is the single mutation
   path** all run state flows through; run-state queries (`ActiveRuns`, `WaitRun`, `Runs`, …) are
-  backend-typed. A backend may also satisfy narrow capability views, each declared at its own
-  call site: `appender` (interceptor.go), `activeScanner`, `runClaimer`, `fencer`, `cancelSweeper`
-  (coordinate.go), `cancelRecorder` (manager.go), `nodeIdentified` (fsm.go). BoltDB implements
-  none of the lease-shaped ones, so it is excluded structurally rather than by a nil check.
+  backend-typed. `Active` (every incomplete run of one FSM) is on `Store` and implemented by both
+  backends; the Manager resumes through it unless the backend is a `runClaimer`, whose claim loop
+  hands out only the runs this node may take. A backend may also satisfy narrow capability views,
+  each declared at its own call site: `appender` (interceptor.go), `runClaimer`, `fencer`,
+  `cancelSweeper` (coordinate.go), `cancelRecorder` (manager.go), `nodeIdentified` (fsm.go).
+  BoltDB implements none of the lease-shaped ones, so it is excluded structurally rather than by
+  a nil check.
 - `store.go` — the BoltDB implementation. `boltStore` is memdb-backed and private; the object
   impl is `objectStore`.
 - `objstore_store.go` / `objstore_lease.go` / `objstore_cancel.go` / `objstore.go` — the object
