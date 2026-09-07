@@ -223,10 +223,7 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 // The registry lock covers the whole registration so concurrent End calls cannot both pass the
 // duplicate check; the claim loop reads the registry concurrently.
 func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[R, W] {
-	fk := fsmKey{
-		name:   s.f.typeName,
-		action: s.f.action,
-	}
+	fk := s.f.key()
 
 	s.m.mu.Lock()
 	defer s.m.mu.Unlock()

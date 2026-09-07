@@ -10,6 +10,7 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/attribute"
@@ -57,7 +58,7 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 			event.Response = req.response
 		}
 
-		if _, err := m.store.Append(ctx, run, event, run.Queue); err != nil {
+		if _, err := m.store.Append(ctx, run, event); err != nil {
 			logger.WithError(err).Error("failed to append complete event")
 			return nil, err
 		}
@@ -100,7 +101,13 @@ func skipper() TransitionInterceptorFunc {
 	})
 }
 
-func canceller(store Store, codec Codec) TransitionInterceptorFunc {
+// appender records a run's transition events — everything after START — and is all a transition
+// interceptor needs of a backend. START goes through Store.Start, which carries the start record.
+type appender interface {
+	Append(ctx context.Context, run Run, event *fsmv1.StateEvent) (ulid.ULID, error)
+}
+
+func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			var (
@@ -138,7 +145,7 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 				}
 			}
 
-			switch _, appendErr := store.Append(ctx, run, event, run.Queue); {
+			switch _, appendErr := store.Append(ctx, run, event); {
 			case errors.Is(appendErr, ErrLeaseLost):
 				// A fenced append means the run must halt here even though the transition
 				// itself succeeded; swallowing it would keep executing without a durable record.
@@ -153,7 +160,7 @@ func canceller(store Store, codec Codec) TransitionInterceptorFunc {
 	})
 }
 
-func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
+func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			logger := req.Log()
@@ -271,7 +278,6 @@ func retry(tracer trace.Tracer, store Store) TransitionInterceptorFunc {
 									Error:        err.Error(),
 									RetryCount:   retryCount,
 								},
-								run.Queue,
 							)
 						}
 

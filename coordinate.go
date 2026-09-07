@@ -10,12 +10,9 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// leaseCoordinator is the coordinate loop's view of a lease-owning backend: everything one
-// heartbeat-and-claim pass drives, composed of the narrow roles its helpers each use plus the two
-// heartbeat methods. The object backend implements it; BoltDB does not, so the Manager runs no
-// coordination loop for BoltDB. It is asserted once in New, and only the loop consumes it — every
-// per-run call site and every loop helper depends on the narrow view it actually uses, not this
-// union.
+// leaseCoordinator is everything one heartbeat-and-claim pass drives. Only the coordinate loop
+// consumes it; each helper takes the narrow role it uses. BoltDB does not implement it, so the
+// Manager runs no coordination loop for BoltDB.
 type leaseCoordinator interface {
 	runClaimer    // claimPass
 	fencer        // cancelUnleased
@@ -27,17 +24,13 @@ type leaseCoordinator interface {
 	coordinationIntervals() (heartbeatEvery, claimEvery time.Duration)
 }
 
-// The narrow capability views a store may satisfy. Each consumer — a per-run call site or a
-// coordinate-loop helper — depends on just the view it uses, so BoltDB, which implements none of
-// them, is excluded structurally, without a nil field or a fictional no-op implementation.
-
 // runClaimer is a backend that distributes runs through the claim loop. Asserting it both drives
 // resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
 // execution-placement sites (an unowned Start the loop picks up, rather than local execution).
 type runClaimer interface {
-	// claimRuns claims every eligible run of the given FSMs, paired with the FSM that will
-	// resume each.
-	claimRuns(ctx context.Context, fsms []*fsm) ([]claimedRun, error)
+	// claimRuns claims every eligible run of the given FSMs, each paired with the key of the
+	// FSM that will resume it. Keys, not fsms: a backend selects runs but never executes one.
+	claimRuns(ctx context.Context, keys []fsmKey) ([]claimedRun, error)
 }
 
 // fencer is a backend that fences runs by lease epoch.
@@ -45,18 +38,6 @@ type fencer interface {
 	// ownedEpoch reports the epoch this node holds the run's lease at, and whether it holds it —
 	// the fencing token surfaced to handlers.
 	ownedEpoch(version ulid.ULID) (int64, bool)
-}
-
-// cancelRecorder is a backend that records a cancel durably for the owner to react to.
-type cancelRecorder interface {
-	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
-	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
-	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
-}
-
-// nodeIdentified is a backend with a node identity, recorded on run spans as fsm.owner_node.
-type nodeIdentified interface {
-	nodeID() string
 }
 
 // cancelSweeper is the coordinate loop's cancel-sweep view: find the cancels covering runs this
@@ -76,23 +57,23 @@ type cancelSweeper interface {
 // track the periodic cadence — and the claim CAS makes any residual overlap safe.
 const claimWakeDelay = 50 * time.Millisecond
 
-// claimedRun pairs a claimed resource with the FSM that will resume it.
+// claimedRun pairs a claimed resource with the key of the FSM that will resume it.
 type claimedRun struct {
-	f *fsm
+	key fsmKey
 
 	resource *activeResource
 }
 
-// resumable returns the runs of f this node should resume. A lease-coordinated backend hands
-// out only runs this node can claim, so a restarting node cannot hijack runs whose owner is
-// live; otherwise every active run is local by definition.
+// resumable returns the runs of f this node should resume. A lease-coordinated backend hands out
+// only runs this node can claim, so a restarting node cannot hijack runs whose owner is live; on
+// any other backend every active run is local by definition, so Active is the whole answer.
 func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, error) {
 	claimer, ok := m.store.(runClaimer)
 	if !ok {
-		return m.store.Active(ctx, f)
+		return m.store.Active(ctx, f.key())
 	}
 
-	claimed, err := claimer.claimRuns(ctx, []*fsm{f})
+	claimed, err := claimer.claimRuns(ctx, []fsmKey{f.key()})
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +231,7 @@ func (m *Manager) runningVersions() []ulid.ULID {
 
 // claimPass claims and dispatches eligible runs across every registered FSM.
 func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
-	claimed, err := claimer.claimRuns(ctx, m.registeredFSMs())
+	claimed, err := claimer.claimRuns(ctx, m.registeredKeys())
 	if err != nil {
 		m.logger.WithError(err).Error("claim pass failed")
 		return
@@ -258,10 +239,16 @@ func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
 
 	for _, c := range claimed {
 		logger := m.logger.WithField("run_version", c.resource.version.String())
+		f, ok := m.registeredFSM(c.key)
+		if !ok {
+			// Registration is append-only, so this cannot happen; a miss would strand a lease.
+			logger.WithField("action", c.key.action).Error("claimed a run for an unregistered FSM")
+			continue
+		}
 		logger.Info("claimed run")
 		// TODO: a run that repeatedly fails to resume is released by ForgetRun and re-claimed
 		// by every node's next pass; add per-run claim backoff or dead-lettering.
-		if err := c.f.resumeOne(ctx, c.resource); err != nil {
+		if err := f.resumeOne(ctx, c.resource); err != nil {
 			logger.WithError(err).Error("failed to resume claimed run")
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -26,6 +27,62 @@ import (
 )
 
 const tracerName = "fsm"
+
+// Store is the persistence contract the Manager requires of a storage backend. Narrower views a
+// single call site needs are declared at that site instead.
+type Store interface {
+	appender
+	io.Closer
+
+	// Start records a run's START event with its start record — the resource, transitions, and
+	// scheduling every later append reads back. Start and Append are the two entry points to a
+	// backend's single mutation path; the run's queue and parent travel on the Run itself.
+	Start(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error)
+	// Active returns every incomplete run recorded under the FSM's type and action, for resume.
+	// A lease-coordinated backend additionally implements runClaimer, which the Manager prefers
+	// for resume because it hands out only the runs this node may take.
+	Active(ctx context.Context, key fsmKey) ([]*activeResource, error)
+	History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error)
+	Children(ctx context.Context, parent ulid.ULID) ([]ulid.ULID, error)
+	// Runs returns the versions of runs recorded for the resource, oldest first, including
+	// completed runs. Backends differ in retention: BoltDB serves runs whose events have not
+	// yet been archived, while the object storage backend indexes runs durably.
+	Runs(ctx context.Context, resourceType, resourceID string) ([]ulid.ULID, error)
+
+	// Run-state queries. The BoltDB backend answers from its private in-memory index; the
+	// object storage backend answers from object storage (locks/, index/, children/, and run
+	// manifests), so the answers hold across nodes sharing a bucket.
+
+	// ActiveRuns returns the incomplete runs recorded for the resource.
+	ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error)
+	// ActiveChildren returns the incomplete runs started from the given parent.
+	ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error)
+	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
+	// recorded error (nil on success, and nil for runs no longer known to the backend).
+	WaitRun(ctx context.Context, runVersion ulid.ULID) error
+	// RunResult returns the marshaled W response of a completed run, or nil when it recorded
+	// none. Safe to read the moment WaitRun returns: the object backend answers from the
+	// terminal manifest, the BoltDB backend from the record written at FINISH.
+	RunResult(ctx context.Context, runVersion ulid.ULID) ([]byte, error)
+	// ListActive returns every incomplete run the backend knows about.
+	ListActive(ctx context.Context) ([]runSnapshot, error)
+
+	// Run-state notes from the executor.
+
+	// SetRunning records that the run has begun executing transitions on this node, moving it
+	// out of PENDING before the first transition rather than after it.
+	SetRunning(ctx context.Context, run Run) error
+	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
+	ForgetRun(run Run) error
+}
+
+// cancelRecorder is a backend whose cancels are durable and cluster-visible. A backend without it
+// is single-process, so Cancel stops the local run instead.
+type cancelRecorder interface {
+	// requestCancel records a cancel durably and broadcasts it; the owner reacts, not the
+	// caller. Reports ErrFsmNotFound for a terminal or unknown run.
+	requestCancel(ctx context.Context, version ulid.ULID, cause error) error
+}
 
 type Manager struct {
 	logger logrus.FieldLogger
@@ -58,7 +115,7 @@ type Manager struct {
 }
 
 type fsmKey struct {
-	name string
+	typeName string
 
 	action string
 }
@@ -292,6 +349,23 @@ func (m *Manager) registeredFSMs() []*fsm {
 	return fsms
 }
 
+// registeredKeys returns a snapshot of the registered FSM keys.
+func (m *Manager) registeredKeys() []fsmKey {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return slices.Collect(maps.Keys(m.fsms))
+}
+
+// registeredFSM resolves a key to its registered FSM, so a claim can carry only the key.
+func (m *Manager) registeredFSM(key fsmKey) (*fsm, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	f, ok := m.fsms[key]
+	return f, ok
+}
+
 // registeredTypes returns the distinct resource type names registered with this manager. A
 // type's runs are the same regardless of which action registered it.
 func (m *Manager) registeredTypes() []string {
@@ -352,7 +426,7 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 	// one; restore it from the registered FSM.
 	m.mu.RLock()
 	for i, child := range children {
-		f, ok := m.fsms[fsmKey{name: child.TypeName, action: child.Action}]
+		f, ok := m.fsms[fsmKey{typeName: child.TypeName, action: child.Action}]
 		if !ok {
 			continue
 		}
@@ -428,15 +502,33 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 	return m.store.WaitRun(ctx, version)
 }
 
-// resolveRun resolves an id to its run version across the registered types.
+// resolveRun resolves an id to its run version across the registered types, preferring an active
+// run and falling back to the most recently recorded one. Composed here so both backends resolve
+// by one rule rather than each implementing the preference.
 func (m *Manager) resolveRun(ctx context.Context, id string) (ulid.ULID, error) {
 	for _, typeName := range m.registeredTypes() {
-		version, err := m.store.ResolveRun(ctx, typeName, id)
+		// The oldest active run: a caller waiting by id follows the one that started first.
+		active, err := m.store.ActiveRuns(ctx, typeName, id)
 		if err != nil {
 			return ulid.ULID{}, err
 		}
-		if version.Compare(ulid.ULID{}) != 0 {
-			return version, nil
+		var oldest ulid.ULID
+		for key := range active {
+			if oldest.Compare(ulid.ULID{}) == 0 || key.Version.Compare(oldest) < 0 {
+				oldest = key.Version
+			}
+		}
+		if oldest.Compare(ulid.ULID{}) != 0 {
+			return oldest, nil
+		}
+
+		// Nothing active: the most recently recorded run, which Runs returns oldest first.
+		runs, err := m.store.Runs(ctx, typeName, id)
+		if err != nil {
+			return ulid.ULID{}, err
+		}
+		if len(runs) > 0 {
+			return runs[len(runs)-1], nil
 		}
 	}
 	return ulid.ULID{}, nil
@@ -481,7 +573,7 @@ func (m *Manager) startOpaque(ctx context.Context, typeName, action, id string, 
 	}
 
 	runVersion := ulid.Make()
-	if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+	if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
 		return ulid.ULID{}, err
 	}
 
@@ -496,7 +588,7 @@ func (m *Manager) lookupFSM(typeName, action string) (*fsm, error) {
 	defer m.mu.RUnlock()
 
 	if typeName != "" {
-		f, ok := m.fsms[fsmKey{name: typeName, action: action}]
+		f, ok := m.fsms[fsmKey{typeName: typeName, action: action}]
 		if !ok {
 			return nil, fmt.Errorf("%w: %s/%s", errFSMNotRegistered, typeName, action)
 		}
