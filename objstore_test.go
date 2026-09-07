@@ -38,6 +38,12 @@ type fakeS3 struct {
 	// that crashes partway through its deletes.
 	failDelete string
 
+	// prePut, when set, runs just before a PUT is applied, outside the harness lock so the hook may
+	// itself write through a store. It lets a test land a competing write at an exact point inside
+	// a CAS loop — the losing attempt has read and mutated, but has not yet written — instead of
+	// racing one in on timing.
+	prePut func(key string)
+
 	puts               int
 	consistentReads    int
 	nonConsistentReads int
@@ -49,6 +55,25 @@ func (f *fakeS3) setFailDelete(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failDelete = key
+}
+
+// setPrePut arms (or, with nil, disarms) the pre-PUT hook. Set under the harness lock, so a test
+// goroutine can arm it race-free against the server goroutines that read it.
+func (f *fakeS3) setPrePut(fn func(key string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prePut = fn
+}
+
+// firePrePut invokes the armed hook, if any, with the lock released — the hook is expected to
+// drive the store, whose requests need the handler lock in turn.
+func (f *fakeS3) firePrePut(key string) {
+	f.mu.Lock()
+	fn := f.prePut
+	f.mu.Unlock()
+	if fn != nil {
+		fn(key)
+	}
 }
 
 func newFakeS3() *fakeS3 {
@@ -63,10 +88,13 @@ func (f *fakeS3) etag(key string) string {
 
 func (f *fakeS3) handler(bucket string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/"+bucket), "/")
+		if r.Method == http.MethodPut {
+			f.firePrePut(key)
+		}
+
 		f.mu.Lock()
 		defer f.mu.Unlock()
-
-		key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/"+bucket), "/")
 
 		switch {
 		case r.Method == http.MethodPut:

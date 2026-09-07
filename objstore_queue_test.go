@@ -86,6 +86,53 @@ func TestAdmitQueuedIdempotentAndOwnerChecked(t *testing.T) {
 	}
 }
 
+// TestAdmitQueuedCASRetryLosesLastSlot pins the admission verdict to the roster the CAS actually
+// wrote, not to whatever a losing attempt computed. node-a reads a roster with one slot free and
+// appends its job, a peer takes that slot before node-a's conditional write lands, and the retry
+// re-reads a full roster: node-a must report "not admitted". Carrying the losing attempt's verdict
+// out instead lets node-a lease and run the manifest with no slot behind it, putting capacity+1
+// transitions in flight cluster-wide.
+func TestAdmitQueuedCASRetryLosesLastSlot(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.queueStore("node-a", 30*time.Second, map[string]int{"q": 2})
+	peer := h.queueStore("node-peer", 30*time.Second, map[string]int{"q": 2})
+	ctx := context.Background()
+
+	// One of q's two slots is already taken, so node-a's first attempt sees room for its job.
+	mustAdmit(t, peer, "q", ulid.Make(), true)
+
+	// The peer claims the last slot inside node-a's CAS window — after node-a has read and mutated
+	// the roster, before its write lands — so the conditional PUT fails and casQueue retries
+	// against a full roster. Errors go through t.Errorf: the hook runs on a server goroutine.
+	queueKey := a.queueKey("q")
+	h.fake.setPrePut(func(key string) {
+		if key != queueKey {
+			return
+		}
+		h.fake.setPrePut(nil) // one interposition only, so the peer's own write is not intercepted
+		switch admitted, err := peer.admitQueued(ctx, "q", ulid.Make()); {
+		case err != nil:
+			t.Errorf("peer admitQueued: %v", err)
+		case !admitted:
+			t.Error("peer failed to take the last slot; the CAS window was not exercised")
+		}
+	})
+
+	v := ulid.Make()
+	mustAdmit(t, a, "q", v, false)
+
+	q, _, err := a.getQueue(ctx, "q")
+	if err != nil {
+		t.Fatalf("getQueue: %v", err)
+	}
+	if len(q.GetJobs()) != 2 {
+		t.Fatalf("expected the roster to stay at its capacity of 2, got %d jobs: %+v", len(q.GetJobs()), q.GetJobs())
+	}
+	if job := findJob(q, v); job != nil {
+		t.Fatalf("expected no roster slot for the refused run, got %+v", job)
+	}
+}
+
 // TestReclaimStaleJobs checks the roster staleness filter: a job whose heartbeat predates the
 // lease timeout is dropped, a fresh one is kept.
 func TestReclaimStaleJobs(t *testing.T) {

@@ -53,9 +53,11 @@ func (s *objectStore) getQueue(ctx context.Context, name string) (*fsmv1.QueueFi
 
 // casQueue applies mutate to the queue roster under a compare-and-swap, creating the object
 // (seeded with this node's configured capacity) when absent and retrying on concurrent
-// modification, so mutate always observes fresh state. mutate may return errQueueNoChange to skip
-// the write when the roster already holds the desired state — leaving a not-yet-created roster
-// uncreated. It returns the roster as written (or as read, for a no-op).
+// modification, so mutate always observes fresh state. mutate therefore runs once per attempt and
+// must derive everything it reports from the roster it is handed, resetting any verdict it carries
+// out to the caller rather than accumulating it across attempts. mutate may return
+// errQueueNoChange to skip the write when the roster already holds the desired state — leaving a
+// not-yet-created roster uncreated. It returns the roster as written (or as read, for a no-op).
 func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fsmv1.QueueFile) error) (*fsmv1.QueueFile, error) {
 	key := s.queueKey(name)
 	var result *fsmv1.QueueFile
@@ -138,6 +140,11 @@ func (s *objectStore) putRoster(ctx context.Context, key string, body []byte, et
 func (s *objectStore) admitQueued(ctx context.Context, name string, version ulid.ULID) (bool, error) {
 	admitted := false
 	_, err := s.casQueue(ctx, name, func(q *fsmv1.QueueFile) error {
+		// casQueue re-runs this on every CAS retry, against a freshly read roster, so the verdict
+		// is recomputed from scratch: an attempt that appended a job and then lost the write must
+		// not leave admitted set when the retry finds the race winner holding the last slot.
+		admitted = false
+
 		changed := s.reclaimStaleJobs(q)
 
 		switch job := findJob(q, version); {
