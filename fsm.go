@@ -336,12 +336,24 @@ func newFinalizer[R, W any](finalFn func(context.Context, *Request[R, W], RunErr
 	})
 }
 
-type runState struct {
+// runSnapshot is a run with the state and error a backend has recorded for it.
+type runSnapshot struct {
 	Run
 
 	State fsmv1.RunState
 
 	Error RunErr
+}
+
+// nodeIdentified is a backend with a node identity; one without is single-process and has no
+// owner to record on a run span.
+type nodeIdentified interface {
+	nodeID() string
+}
+
+// key identifies this FSM by the resource type and action its runs are recorded under.
+func (f *fsm) key() fsmKey {
+	return fsmKey{typeName: f.typeName, action: f.action}
 }
 
 // resume drives every resumable run of f through resumeOne. Which runs are resumable is
@@ -525,7 +537,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		// admit up to `size` of its own). Delayed/run-after runs are not admission-controlled and
 		// keep executing locally (matching runnerFromOpts precedence).
 		if _, ok := m.store.(runClaimer); ok && admissionControlled(&startOpt) {
-			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, withUnowned()); err != nil {
+			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
 				logger.WithError(err).Error("failed to append start event")
 				return ulid.ULID{}, err
 			}
@@ -548,7 +560,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 			}])
 		}
 
-		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt)
+		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, false)
 		if err != nil {
 			m.logger.WithError(err).Error("failed to append start event")
 			return ulid.ULID{}, err
@@ -563,9 +575,9 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 // persistStart writes a run's START event through the store and returns the Run it recorded. It
 // is the single home for the START persistence contract: the embedded start (leased to this node)
-// and the opaque ingress start (unowned, for the claim loop) share it, differing only in the
-// extra append options they pass. Non-generic — persistence never touches R/W.
-func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, extra ...appendOptionFunc) (Run, error) {
+// and the opaque ingress start (unowned, for the claim loop) share it, differing only in whether
+// the START is persisted unowned. Non-generic — persistence never touches R/W.
+func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersion ulid.ULID, resource []byte, startOpt *startOptions, unowned bool) (Run, error) {
 	run := Run{
 		ID:           id,
 		StartVersion: runVersion,
@@ -575,13 +587,14 @@ func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersio
 		Queue:        startOpt.queue,
 		Parent:       startOpt.parent,
 	}
-	opts := append([]appendOptionFunc{
-		withStartOption(resource, f.transitionSlice()),
-		withDelayUntil(startOpt.until),
-		withRunAfter(startOpt.runAfter),
-		withParent(startOpt.parent),
-	}, extra...)
-	if _, err := m.store.Append(ctx, run, f.startEvent(id), startOpt.queue, opts...); err != nil {
+	start := &startRecord{
+		Resource:    resource,
+		Transitions: f.transitionSlice(),
+		DelayUntil:  startOpt.until,
+		RunAfter:    startOpt.runAfter,
+		Unowned:     unowned,
+	}
+	if _, err := m.store.Start(ctx, run, f.startEvent(id), start); err != nil {
 		return Run{}, err
 	}
 	return run, nil

@@ -338,13 +338,13 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 func startQueuedRun(t *testing.T, s *objectStore, id, queue string) Run {
 	t.Helper()
 	run := Run{ID: id, StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq", Queue: queue}
-	_, err := s.Append(context.Background(), run, &fsmv1.StateEvent{
+	_, err := s.Start(context.Background(), run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, queue, withStartOption([]byte("{}"), []string{"created", "done"}), withUnowned())
+	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}, Unowned: true})
 	if err != nil {
 		t.Fatalf("failed to start queued run: %v", err)
 	}
@@ -374,11 +374,11 @@ func TestClaimQueuedSkipsHeldRun(t *testing.T) {
 	startQueuedRun(t, a, "app-1", "deploys")
 	e := scanOne(t, a)
 
-	if _, won := a.claimEntry(ctx, deployFSM, e); !won {
+	if _, won := a.claimEntry(ctx, deployKey, e); !won {
 		t.Fatal("expected node-a to win the first queued claim")
 	}
 	// A second claim of the same run on the same store falls out at reserveClaim without re-admitting.
-	if _, won := a.claimEntry(ctx, deployFSM, e); won {
+	if _, won := a.claimEntry(ctx, deployKey, e); won {
 		t.Fatal("expected the repeat claim of a held run to be skipped")
 	}
 
@@ -408,7 +408,7 @@ func TestClaimQueuedReleasesSlotOnLostRace(t *testing.T) {
 		t.Fatalf("node-b claim: %v", err)
 	}
 
-	if _, won := a.claimEntry(ctx, deployFSM, e); won {
+	if _, won := a.claimEntry(ctx, deployKey, e); won {
 		t.Fatal("expected node-a to lose the queued claim after b took the manifest")
 	}
 
@@ -430,7 +430,7 @@ func TestReleaseLeaseFreesQueueSlot(t *testing.T) {
 	ctx := context.Background()
 
 	run := startQueuedRun(t, a, "app-1", "deploys")
-	if _, won := a.claimEntry(ctx, deployFSM, scanOne(t, a)); !won {
+	if _, won := a.claimEntry(ctx, deployKey, scanOne(t, a)); !won {
 		t.Fatal("expected node-a to claim the queued run")
 	}
 

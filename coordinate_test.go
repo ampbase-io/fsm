@@ -37,7 +37,7 @@ type stubCoordinator struct {
 
 func (s *stubCoordinator) extendLeases(context.Context) {}
 
-func (s *stubCoordinator) claimRuns(context.Context, []*fsm) ([]claimedRun, error) {
+func (s *stubCoordinator) claimRuns(context.Context, []fsmKey) ([]claimedRun, error) {
 	return nil, nil
 }
 
@@ -78,7 +78,7 @@ type wakeCoordinator struct {
 	claimCount atomic.Int32
 }
 
-func (w *wakeCoordinator) claimRuns(context.Context, []*fsm) ([]claimedRun, error) {
+func (w *wakeCoordinator) claimRuns(context.Context, []fsmKey) ([]claimedRun, error) {
 	w.claimCount.Add(1)
 	return nil, nil
 }

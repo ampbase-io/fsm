@@ -320,6 +320,84 @@ func testDelayedStart(t *testing.T, f *managerFactory) {
 	}
 }
 
+// TestStoreActiveIsolatesActions pins that Store.Active returns only the runs of its own action.
+// Two FSMs may share a resource type, and both backends scan by type, so an unfiltered scan
+// resumes one FSM's runs under the other's transitions.
+func TestStoreActiveIsolatesActions(t *testing.T) { runBackends(t, testStoreActiveIsolatesActions) }
+
+func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	var (
+		deployEntered = make(chan struct{}, 1)
+		deployBlock   = make(chan struct{})
+	)
+	startDeploy := blockingFSM(t, m, "iso-deploy", deployEntered, deployBlock)
+	defer close(deployBlock)
+
+	var (
+		rollbackEntered = make(chan struct{}, 1)
+		rollbackBlock   = make(chan struct{})
+	)
+	startRollback := blockingFSM(t, m, "iso-rollback", rollbackEntered, rollbackBlock)
+	defer close(rollbackBlock)
+
+	deployVersion, err := startDeploy(ctx, "iso-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start deploy FSM: %v", err)
+	}
+	<-deployEntered
+	if _, err := startRollback(ctx, "iso-2", NewRequest(&orderReq{}, &orderResp{})); err != nil {
+		t.Fatalf("failed to start rollback FSM: %v", err)
+	}
+	<-rollbackEntered
+
+	active, err := m.store.Active(ctx, fsmKey{typeName: "orderReq", action: "iso-deploy"})
+	if err != nil {
+		t.Fatalf("Active failed: %v", err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("expected only the iso-deploy run, got %d runs", len(active))
+	}
+	if active[0].version != deployVersion {
+		t.Fatalf("expected the iso-deploy run %s, got %s", deployVersion, active[0].version)
+	}
+}
+
+// TestRunningBeforeFirstTransition pins that a run reads RUNNING while its first transition is
+// still executing. A consumer treating PENDING as "not picked up yet" would re-dispatch it.
+func TestRunningBeforeFirstTransition(t *testing.T) { runBackends(t, testRunningBeforeFirstTransition) }
+
+func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {
+	m, _ := f.newManager(nil)
+	ctx := context.Background()
+
+	entered := make(chan struct{}, 1)
+	block := make(chan struct{})
+	defer close(block)
+	start := blockingFSM(t, m, "early-running", entered, block)
+
+	version, err := start(ctx, "early-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	// The initializer runs before the transition, so the state is settled once entered fires.
+	<-entered
+
+	active, err := m.Active(ctx, "early-1")
+	if err != nil {
+		t.Fatalf("Active failed: %v", err)
+	}
+	state, ok := active[ActiveKey{Action: "early-running", Version: version}]
+	if !ok {
+		t.Fatalf("expected the run to be active, got %v", active)
+	}
+	if state != fsmv1.RunState_RUN_STATE_RUNNING {
+		t.Fatalf("expected a run executing its first transition to read RUNNING, got %v", state)
+	}
+}
+
 // TestActiveAcrossTypes verifies Active merges runs across every registered resource type for
 // an id, deduplicated by run — the Manager queries the store once per distinct type.
 func TestActiveAcrossTypes(t *testing.T) { runBackends(t, testActiveAcrossTypes) }

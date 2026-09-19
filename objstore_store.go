@@ -112,23 +112,25 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 	return updated, nil
 }
 
-// Append writes an event object and updates the run manifest according to the event type. It is
-// the object storage implementation of the single mutation path all run state flows through.
-func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, opts ...appendOptionFunc) (ulid.ULID, error) {
+func (s *objectStore) Start(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
+	return s.record(ctx, run, event, start)
+}
+
+func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEvent) (ulid.ULID, error) {
+	return s.record(ctx, run, event, nil)
+}
+
+// record writes an event object and updates the run manifest according to the event type. It
+// is the object storage implementation of the single mutation path all run state flows through;
+// start is set for START only.
+func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord) (ulid.ULID, error) {
 	// Persistence must complete even when the run itself is being canceled — the CANCEL and
 	// FINISH events are appended from an already-canceled run context, and BoltDB's local
 	// writes are likewise not interruptible. Values (e.g. trace context) are preserved.
 	ctx = context.WithoutCancel(ctx)
 
-	var ao appendOption
-	for _, opt := range opts {
-		if err := opt(&ao); err != nil {
-			return ulid.ULID{}, err
-		}
-	}
-
-	if ao.start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
-		return ulid.ULID{}, errors.New("start option must be set")
+	if start == nil && event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
+		return ulid.ULID{}, errors.New("start record must be set")
 	}
 
 	if run.StartVersion.Compare(ulid.ULID{}) == 0 {
@@ -152,13 +154,13 @@ func (s *objectStore) Append(ctx context.Context, run Run, event *fsmv1.StateEve
 
 	switch event.GetType() {
 	case fsmv1.EventType_EVENT_TYPE_START:
-		err = s.appendStart(ctx, run, event, queue, &ao, eventKey, eventBytes)
+		err = s.appendStart(ctx, run, event, start, eventKey, eventBytes)
 	case fsmv1.EventType_EVENT_TYPE_ERROR,
 		fsmv1.EventType_EVENT_TYPE_COMPLETE,
 		fsmv1.EventType_EVENT_TYPE_CANCEL:
 		err = s.appendMidRun(ctx, run, event, eventKey, eventBytes)
 	case fsmv1.EventType_EVENT_TYPE_FINISH:
-		err = s.appendFinish(ctx, run, event, queue, eventKey, eventBytes)
+		err = s.appendFinish(ctx, run, event, eventKey, eventBytes)
 	default:
 		err = fmt.Errorf("%T: %w", event.Type, errInvalidEventType)
 	}
@@ -273,14 +275,14 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 	return &AlreadyRunningError{Version: ownerVersion}
 }
 
-func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, eventBytes []byte) error {
+func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord, eventKey string, eventBytes []byte) error {
 	runVersionBytes, err := run.StartVersion.MarshalText()
 	if err != nil {
 		return err
 	}
 
 	// 1. Acquire the resource lock. A 412 means another run holds it.
-	lockKey := s.lockKey(event.GetResourceType(), event.GetId(), event.GetAction(), queue, run.StartVersion)
+	lockKey := s.lockKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.Queue, run.StartVersion)
 	if err := s.acquireRunLock(ctx, lockKey, runVersionBytes); err != nil {
 		return err
 	}
@@ -298,16 +300,16 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	}
 
 	// 4. Create the manifest, leased to this node.
-	manifestBytes, err := s.startManifest(ctx, run, event, queue, ao, eventKey, runVersionBytes)
+	manifestBytes, err := s.startManifest(ctx, run, event, start, eventKey, runVersionBytes)
 	if err != nil {
 		return err
 	}
-	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, ao.unowned); err != nil {
+	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, start.Unowned); err != nil {
 		return err
 	}
 
 	// 5. Record the parent-child relationship.
-	return s.linkParent(ctx, ao.parent, run.StartVersion)
+	return s.linkParent(ctx, run.Parent, run.StartVersion)
 }
 
 // startManifest materializes a new run's initial manifest. By default it is leased to this node
@@ -315,11 +317,11 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 // tick. An unowned START (the RPC ingress' persist-then-ack) leaves the lease empty so the claim
 // loop distributes the run across the worker pool; its epoch is bumped from zero on the first
 // claim.
-func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, ao *appendOption, eventKey string, runVersionBytes []byte) ([]byte, error) {
+func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord, eventKey string, runVersionBytes []byte) ([]byte, error) {
 	ownerNode := s.node
 	leaseExpiry := time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
 	leaseEpoch := int64(1)
-	if ao.unowned {
+	if start.Unowned {
 		ownerNode = ""
 		leaseExpiry = 0
 		leaseEpoch = 0
@@ -334,12 +336,12 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 		StartEventKey:  []byte(eventKey),
 		LatestEventKey: []byte(eventKey),
 		EventCount:     1,
-		Transitions:    ao.start.transitions,
-		Resource:       ao.start.resource,
-		Queue:          queue,
-		Parent:         ao.parent,
-		DelayUntil:     ao.delayUntil,
-		RunAfter:       ao.runAfter,
+		Transitions:    start.Transitions,
+		Resource:       start.Resource,
+		Queue:          run.Queue,
+		Parent:         optionalVersionBytes(run.Parent),
+		DelayUntil:     delayMillis(start.DelayUntil),
+		RunAfter:       optionalVersionBytes(start.RunAfter),
 		OwnerNode:      ownerNode,
 		LeaseExpiry:    leaseExpiry,
 		LeaseEpoch:     leaseEpoch,
@@ -397,16 +399,11 @@ func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey str
 }
 
 // linkParent records the parent-child relationship for runs started with a parent.
-func (s *objectStore) linkParent(ctx context.Context, parent []byte, child ulid.ULID) error {
-	if parent == nil {
+func (s *objectStore) linkParent(ctx context.Context, parent, child ulid.ULID) error {
+	if parent.Compare(ulid.ULID{}) == 0 {
 		return nil
 	}
-
-	var parentVersion ulid.ULID
-	if err := parentVersion.UnmarshalText(parent); err != nil {
-		return fmt.Errorf("invalid parent version: %w", err)
-	}
-	return s.writeChild(ctx, parentVersion, child)
+	return s.writeChild(ctx, parent, child)
 }
 
 func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
@@ -452,7 +449,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 	return err
 }
 
-func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, queue string, eventKey string, eventBytes []byte) error {
+func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {
 	s.beginFinish(run.StartVersion)
 	defer s.settleFinish(run.StartVersion)
 
@@ -502,7 +499,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 
 	// The lock is deleted after the manifest records completion; a crash in between leaves an
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
-	lockKey := s.lockKey(manifest.GetResourceType(), manifest.GetResourceId(), manifest.GetAction(), queue, run.StartVersion)
+	lockKey := s.lockKey(manifest.GetResourceType(), manifest.GetResourceId(), manifest.GetAction(), manifest.GetQueue(), run.StartVersion)
 	if err := s.deleteObject(ctx, lockKey); err != nil {
 		s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete resource lock")
 	}
@@ -738,16 +735,18 @@ func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) erro
 	return s.deleteObject(ctx, lockKey)
 }
 
-// Active returns all incomplete runs for the given FSM, enumerated from the locks/ prefix.
-func (s *objectStore) Active(ctx context.Context, f *fsm) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(f.typeName))
+// Active returns every incomplete run of one FSM, enumerated from the locks/ prefix. The Manager
+// resumes through claimRuns on this backend, so Active is the query form of the same scan: every
+// active run, whether or not this node may take it.
+func (s *objectStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, error) {
+	entries, err := s.scanLocks(ctx, s.lockPrefix(key.typeName))
 	if err != nil {
 		return nil, err
 	}
 
 	var active []*activeResource
 	for _, e := range entries {
-		if e.action != f.action {
+		if e.action != key.action {
 			continue
 		}
 		active = append(active, manifestResource(e.version, e.manifest))
@@ -801,31 +800,6 @@ func (s *objectStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]R
 		active = append(active, runFromManifest(child, manifest))
 	}
 	return active, nil
-}
-
-// ResolveRun prefers the oldest active run holding a lock for the resource; with no lock held
-// it falls back to the most recent run in the index/ prefix, so a just-finished run's outcome
-// remains reachable through WaitRun.
-func (s *objectStore) ResolveRun(ctx context.Context, resourceType, resourceID string) (ulid.ULID, error) {
-	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
-	if err != nil {
-		return ulid.ULID{}, err
-	}
-	if len(entries) > 0 {
-		oldest := entries[0].version
-		for _, e := range entries[1:] {
-			if e.version.Compare(oldest) < 0 {
-				oldest = e.version
-			}
-		}
-		return oldest, nil
-	}
-
-	runs, err := s.Runs(ctx, resourceType, resourceID)
-	if err != nil || len(runs) == 0 {
-		return ulid.ULID{}, err
-	}
-	return runs[len(runs)-1], nil
 }
 
 // WaitRun blocks until the run records a terminal state, polling its manifest under exponential
@@ -906,15 +880,15 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	}
 }
 
-func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {
+func (s *objectStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
 	entries, err := s.scanLocks(ctx, s.locksPrefix())
 	if err != nil {
 		return nil, err
 	}
 
-	active := make([]runState, 0, len(entries))
+	active := make([]runSnapshot, 0, len(entries))
 	for _, e := range entries {
-		active = append(active, runState{
+		active = append(active, runSnapshot{
 			Run:   runFromManifest(e.version, e.manifest),
 			State: e.manifest.GetStatus(),
 			Error: manifestRunErr(e.manifest),
@@ -923,10 +897,31 @@ func (s *objectStore) ListActive(ctx context.Context) ([]runState, error) {
 	return active, nil
 }
 
-// SetRunning is a no-op: the manifest's status, maintained by Append, is the object backend's
-// run state, so a run reads as PENDING until its first transition writes an event.
-func (s *objectStore) SetRunning(run Run) error {
-	return nil
+// errRunNotPending aborts the SetRunning CAS, so resuming a mid-flight run costs no write.
+var errRunNotPending = errors.New("run is not pending")
+
+// SetRunning flips the manifest to RUNNING under the fence. Appending a transition would set it
+// too, but not until the first one finished — too late to tell an executing run from a waiting one.
+func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
+	epoch, ok := s.ownedEpoch(run.StartVersion)
+	if !ok {
+		return ErrLeaseLost
+	}
+
+	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+		if err := s.checkFence(m, epoch); err != nil {
+			return err
+		}
+		if m.Status != fsmv1.RunState_RUN_STATE_PENDING {
+			return errRunNotPending
+		}
+		m.Status = fsmv1.RunState_RUN_STATE_RUNNING
+		return nil
+	})
+	if errors.Is(err, errRunNotPending) {
+		return nil
+	}
+	return err
 }
 
 // ForgetRun releases this node's claim on the run after a failed resume so another node (or a

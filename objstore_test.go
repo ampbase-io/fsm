@@ -393,19 +393,12 @@ func TestLinkParent(t *testing.T) {
 	store, _ := newTestObjectStore(t)
 	ctx := context.Background()
 
-	if err := store.linkParent(ctx, nil, ulid.Make()); err != nil {
-		t.Fatalf("expected a nil parent to be a no-op, got %v", err)
-	}
-	if err := store.linkParent(ctx, []byte("not-a-ulid"), ulid.Make()); err == nil {
-		t.Fatal("expected an error for an invalid parent version")
+	if err := store.linkParent(ctx, ulid.ULID{}, ulid.Make()); err != nil {
+		t.Fatalf("expected a zero parent to be a no-op, got %v", err)
 	}
 
 	parent, child := testULID(t, 1), testULID(t, 2)
-	parentBytes, err := parent.MarshalText()
-	if err != nil {
-		t.Fatalf("failed to marshal parent: %v", err)
-	}
-	if err := store.linkParent(ctx, parentBytes, child); err != nil {
+	if err := store.linkParent(ctx, parent, child); err != nil {
 		t.Fatalf("failed to link parent: %v", err)
 	}
 	children, err := store.listChildren(ctx, parent)
