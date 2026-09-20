@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 // pastRetention is an age comfortably beyond the default 7-day ArchiveRetention, so a run aged by
@@ -216,8 +218,8 @@ func TestArchiveRepairsMissingHistory(t *testing.T) {
 	if err := s.deleteObject(ctx, histKey); err != nil {
 		t.Fatalf("failed to remove history: %v", err)
 	}
-	if _, err := s.History(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
-		t.Fatalf("expected history gone before the pass, got %v", err)
+	if _, err := s.readHistory(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected the history object gone before the pass, got %v", err)
 	}
 
 	s.runArchive(ctx)
@@ -232,6 +234,63 @@ func TestArchiveRepairsMissingHistory(t *testing.T) {
 	}
 	if _, _, err := s.getManifest(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("expected the manifest reaped after repair, got %v", err)
+	}
+}
+
+// TestHistoryReadableInFinishWindow verifies a peer can read a run's history the moment it can
+// observe the run terminal. The owner flips the manifest before it writes history, and a peer's
+// WaitRun returns at the flip — so a History that needed the history object would call a run that
+// just finished unknown, and a caller deciding whether a child exists would start it again.
+func TestHistoryReadableInFinishWindow(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.store("node-a", 10*time.Second)
+	b := h.store("node-b", 10*time.Second)
+	ctx := context.Background()
+
+	run := startRun(t, a, "finish-window")
+	run.fsmErr = RunErr{Err: errors.New("boom"), State: "exploding"}
+
+	// Hold node-a inside its finish: the manifest is terminal, the history write has not landed.
+	// The held write is released on every path, or a failure here would wedge the fake's shutdown.
+	inWindow, held := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	defer release()
+	h.fake.setPrePut(func(key string) {
+		if !strings.Contains(key, "/history/") {
+			return
+		}
+		h.fake.setPrePut(nil)
+		close(inWindow)
+		<-held
+	})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := a.Append(ctx, run, finishEvent(run, "exploding"))
+		finished <- err
+	}()
+	<-inWindow
+
+	if err := b.WaitRun(ctx, run.StartVersion); err == nil || err.Error() != "boom" {
+		t.Fatalf("expected the peer to observe the run's outcome at the manifest flip, got %v", err)
+	}
+	early, err := b.History(ctx, run.StartVersion)
+	if err != nil {
+		t.Fatalf("expected history readable once the run is observably terminal, got %v", err)
+	}
+	if got := early.GetLastEvent().GetError(); got != "boom" {
+		t.Fatalf("expected the finish event's error in the early record, got %q", got)
+	}
+
+	release()
+	if err := <-finished; err != nil {
+		t.Fatalf("failed to finish run: %v", err)
+	}
+	durable, err := b.readHistory(ctx, run.StartVersion)
+	if err != nil {
+		t.Fatalf("failed to read the durable history: %v", err)
+	}
+	if !proto.Equal(early, durable) {
+		t.Fatalf("the record read in the finish window differs from the durable one:\n early: %v\ndurable: %v", early, durable)
 	}
 }
 
