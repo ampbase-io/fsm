@@ -14,6 +14,10 @@ var (
 	// without recording FINISH; the new owner drives it to completion.
 	ErrLeaseLost = errors.New("run lease lost")
 
+	// ErrShutdown is the cancel cause of a run stopped because its Manager is shutting down. The
+	// run records nothing and resumes where it left off on the next start or claim.
+	ErrShutdown = errors.New("manager shutting down")
+
 	// errFSMNotRegistered reports that no FSM matches the (type, action) an opaque Start named.
 	errFSMNotRegistered = errors.New("no FSM registered")
 
@@ -32,6 +36,16 @@ type AlreadyRunningError struct {
 
 func (e *AlreadyRunningError) Error() string {
 	return fmt.Sprintf("FSM already running, version = %s", e.Version.String())
+}
+
+// CancelError is the cancel cause of a run stopped by Manager.Cancel, on whichever node issued
+// it. The run halts, records the reason, and runs its finalizers.
+type CancelError struct {
+	Reason string
+}
+
+func (e *CancelError) Error() string {
+	return e.Reason
 }
 
 // haltError wraps the underlying error returned from a transition and signals the FSM to halt

@@ -50,6 +50,29 @@ if err := m.Wait(ctx, version); err != nil {
 Request/response types are persisted with a protobuf codec when they implement `proto.Message`,
 with a custom codec when they implement `fsm.Codec`, and with JSON otherwise.
 
+## Cancellation
+
+A transition's context ends for one of three reasons, and `context.Cause(ctx)` names which:
+
+| Cause | Meaning | What the handler should do |
+|---|---|---|
+| `*fsm.CancelError` | `Manager.Cancel` was called; `Reason` carries its cause. | Stop. The run halts, skips its remaining transitions, and runs its finalizers. |
+| `fsm.ErrShutdown` | This `Manager` is shutting down. | Return promptly and record nothing; the run resumes on the next start or claim. |
+| `fsm.ErrLeaseLost` | Another node now owns the run. | Return promptly and record nothing; the new owner is already running it. |
+
+```go
+<-ctx.Done()
+if cancel, ok := errors.AsType[*fsm.CancelError](context.Cause(ctx)); ok {
+    // An operator stopped the run: cancel.Reason says why.
+}
+return nil, ctx.Err()
+```
+
+Finalizers run on a context that an operator's cancel does not end, so they can do the work the
+cancel calls for — start a compensating run and wait on it, say. That context still ends on
+`ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed before it
+finished.
+
 ## Storage backends
 
 State is persisted through a `Store` interface with two implementations, selected by `Config`

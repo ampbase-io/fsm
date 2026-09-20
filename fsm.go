@@ -285,7 +285,7 @@ type Attributable interface {
 func newTransition[R, W any](name string, transitionFn func(context.Context, *Request[R, W]) (*Response[W], error), cfg TransitionConfig[R, W]) *transition {
 	// Wrap the strongly-typed implementation so we can apply interceptors.
 	untyped := TransitionFunc(func(ctx context.Context, request AnyRequest) (AnyResponse, error) {
-		if context.Cause(ctx) == context.Canceled {
+		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		typed, ok := request.(*Request[R, W])
@@ -697,20 +697,23 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	})
 
 	runFn := func() {
-		ctx, cancel := context.WithCancelCause(ctx)
+		// What ends the run on this node and what halts its transitions are different events:
+		// runCtx ends on a shutdown or a lost lease, ctx additionally on an operator's cancel.
+		runCtx, stop := context.WithCancelCause(ctx)
+		ctx, cancel := context.WithCancelCause(runCtx)
 
 		m.mu.Lock()
-		m.running[runVersion] = cancel
+		m.running[runVersion] = runHandle{cancel: cancel, stop: stop}
 		m.mu.Unlock()
 
 		// A lease-coordinated run may have lost ownership before reaching execution — a
-		// delayed or queued dispatch can trail its claim by arbitrarily long. Cancel before
+		// delayed or queued dispatch can trail its claim by arbitrarily long. Stop before
 		// any side effects run rather than waiting to be fenced on the first write. The same
 		// lookup yields the lease epoch handlers read as their fencing token.
 		if f, ok := m.store.(fencer); ok {
 			epoch, owned := f.ownedEpoch(runVersion)
 			if !owned {
-				cancel(ErrLeaseLost)
+				stop(ErrLeaseLost)
 			}
 			request.withLeaseEpoch(epoch)
 			span.SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
@@ -721,7 +724,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			m.mu.Lock()
 			delete(m.running, runVersion)
 			m.mu.Unlock()
-			cancel(nil)
+			stop(nil)
 		}()
 
 		logger.Info("starting fsm")
@@ -741,10 +744,15 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			ctx = init(ctx, request)
 		}
 
-		var err error
+		finalizerCtx, release := finalizerContext(ctx, runCtx)
+		defer release()
+
+		// The finisher is always the last transition, on a fresh start and on a resume alike.
+		finisher := ri.transitions.Len() - 1
+
 		iter := ri.transitions.Iterator()
 		for !iter.Done() {
-			_, transition := iter.Next()
+			idx, transition := iter.Next()
 			transitionName := transition.name
 			transitionVersion := ulid.Make()
 			logger = logger.WithFields(logrus.Fields{
@@ -753,44 +761,27 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			})
 			request.withTransition(transitionName, transitionVersion)
 
-			select {
-			case <-ctx.Done():
-				switch ctxErr := context.Cause(ctx); {
-				case errors.Is(ctxErr, context.Canceled):
-					logger.Info("context canceled, fsm shutting down")
-					return
-				case errors.Is(ctxErr, ErrLeaseLost):
-					// The new owner drives the run to completion; nothing may be recorded here.
-					logger.Warn("run lease lost, halting")
-					return
-				default:
-					// continue running through the transitions until we reach the end
-				}
-			default:
+			if stopped(runCtx, logger) {
+				return
 			}
 
 			logger.Info("running transition")
 
-			errc := make(chan error)
-			defer close(errc)
-			go func() {
-				_, implErr := transition.impl(ctx, request)
-				errc <- implErr
-			}()
+			transitionCtx := ctx
+			if idx == finisher {
+				transitionCtx = finalizerCtx
+			}
+			_, err := transition.impl(transitionCtx, request)
 
-			select {
-			case <-ctx.Done():
-				if context.Cause(ctx) == context.Canceled {
-					logger.Debug("context canceled, fsm shutting down")
-				}
-				err = context.Cause(ctx)
-				chanErr := <-errc
-				if chanErr != nil {
-					err = chanErr
-				}
-			case err = <-errc:
+			if stopped(runCtx, logger) {
+				return
 			}
 
+			// A handler that ran to completion despite an operator's cancel still halts the run;
+			// halt(nil) is nil, so a live context changes nothing.
+			if err == nil {
+				err = halt(context.Cause(transitionCtx))
+			}
 			if err == nil {
 				continue
 			}
@@ -800,6 +791,12 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				// and the new owner runs them at its own finish.
 				logger.Warn("run lease lost, halting")
 				return
+			}
+
+			// The first halt is the run's outcome. Every transition after it is skipped, yet
+			// still sees the canceled context, and must not claim the halt as its own.
+			if request.Run().fsmErr.Err != nil {
+				continue
 			}
 
 			var (
@@ -828,9 +825,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				State: transitionName,
 			})
 		}
-		// err only reflects the last transition executed; skipped transitions after a failure
-		// return nil, so the recorded run error is the source of truth for overall success.
-		if err == nil && request.Run().fsmErr.Err == nil {
+		if request.Run().fsmErr.Err == nil {
 			localActionCounterVec.WithLabelValues("ok", "").Inc()
 			localActionDurationVec.WithLabelValues("ok", "").Observe(time.Since(actionStartTime).Seconds())
 		}
@@ -852,6 +847,28 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 	<-ack
 	return
+}
+
+// stopped reports whether the run was ended on this node by a shutdown or a lost lease. Nothing
+// more may be recorded here; the run's next owner resumes it.
+func stopped(runCtx context.Context, logger logrus.FieldLogger) bool {
+	cause := context.Cause(runCtx)
+	if cause == nil {
+		return false
+	}
+	logger.WithError(cause).Info("run stopped on this node")
+	return true
+}
+
+// finalizerContext returns a context carrying ctx's values that ends only when the run stops on
+// this node, so finalizers outlive the operator's cancel that halted the transitions.
+func finalizerContext(ctx, runCtx context.Context) (context.Context, func()) {
+	finalizerCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	unlink := context.AfterFunc(runCtx, func() { cancel(context.Cause(runCtx)) })
+	return finalizerCtx, func() {
+		unlink()
+		cancel(nil)
+	}
 }
 
 func noOp[R, W any](ctx context.Context, req *Request[R, W]) (*Response[W], error) {

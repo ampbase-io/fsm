@@ -2,11 +2,330 @@ package fsm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
+
+	"connectrpc.com/connect"
 )
+
+// within receives from ch, failing the test if nothing arrives in d.
+func within[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	var zero T
+	return zero
+}
+
+// TestCancelCause verifies a handler can name why its context ended: an operator's cancel arrives
+// as a *CancelError carrying the reason, a shutdown as ErrShutdown.
+func TestCancelCause(t *testing.T) { runBackends(t, testCancelCause) }
+
+func testCancelCause(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+	m, stop := f.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	causes := make(chan error, 1)
+	start, _, err := m.Register[orderReq, orderResp]("cause").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			<-ctx.Done()
+			causes <- context.Cause(ctx)
+			return nil, ctx.Err()
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "cause-canceled", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the canceled run to start")
+	if err := m.Cancel(ctx, version, "operator says stop"); err != nil {
+		t.Fatalf("cancel failed: %v", err)
+	}
+	cause := within(t, causes, 10*time.Second, "the cancel cause")
+	if ce, ok := errors.AsType[*CancelError](cause); !ok || ce.Reason != "operator says stop" {
+		t.Fatalf("expected a *CancelError carrying the reason, got %T %v", cause, cause)
+	}
+
+	if _, err := start(ctx, "cause-shutdown", NewRequest(&orderReq{}, &orderResp{})); err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the shut-down run to start")
+	stop()
+	if cause := within(t, causes, 10*time.Second, "the shutdown cause"); !errors.Is(cause, ErrShutdown) {
+		t.Fatalf("expected ErrShutdown, got %T %v", cause, cause)
+	}
+}
+
+// TestCancelRecordsStoppingState verifies a canceled run reports the state it stopped in, not a
+// later skipped one — to its finalizer, in its durable record, and as its Wait outcome.
+func TestCancelRecordsStoppingState(t *testing.T) { runBackends(t, testCancelRecordsStoppingState) }
+
+func testCancelRecordsStoppingState(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+	m, _ := f.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	finalized := make(chan RunErr, 1)
+	pass := func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+		return nil, nil
+	}
+	start, _, err := m.Register[orderReq, orderResp]("stopstate").
+		Start("a", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}).
+		To("b", pass).
+		To("c", pass).
+		End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], runErr RunErr) {
+			finalized <- runErr
+		})).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "stopstate-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the run to start")
+	if err := m.Cancel(ctx, version, "operator says stop"); err != nil {
+		t.Fatalf("cancel failed: %v", err)
+	}
+
+	runErr := within(t, finalized, 10*time.Second, "the finalizer")
+	if runErr.State != "a" {
+		t.Fatalf("expected the run to report stopping in state a, got %q", runErr.State)
+	}
+	if _, ok := errors.AsType[*CancelError](runErr.Err); !ok {
+		t.Fatalf("expected the finalizer to observe a *CancelError, got %T %v", runErr.Err, runErr.Err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	admin := &adminServer{m: m}
+	waitResp, err := admin.Wait(waitCtx, connect.NewRequest(&fsmv1.WaitRequest{Version: version.String()}))
+	if err != nil {
+		t.Fatalf("expected Wait to report the cancel as the run's outcome, got %v", err)
+	}
+	if waitResp.Msg.GetError() != "operator says stop" {
+		t.Fatalf("expected the cancel reason from Wait, got %q", waitResp.Msg.GetError())
+	}
+
+	store, ok := m.store.(*objectStore)
+	if !ok {
+		return
+	}
+	if state := mustManifest(t, store, version).GetErrorState(); state != "a" {
+		t.Fatalf("expected the manifest to record error state a, got %q", state)
+	}
+}
+
+// TestFinalizerOutlivesCancel verifies an operator's cancel halts a run's transitions but leaves
+// its finalizers a live context: a finalizer that waits on a child run holds the parent — and
+// its resource lock — until the child finishes.
+func TestFinalizerOutlivesCancel(t *testing.T) { runBackends(t, testFinalizerOutlivesCancel) }
+
+func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+	m, _ := f.newManager(nil)
+
+	release := make(chan struct{})
+	startChild, _, err := m.Register[orderReq, orderResp]("finalizer-child").
+		Start("soak", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			select {
+			case <-release:
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build child FSM: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	finalizing := make(chan error, 1)
+	childDone := make(chan error, 1)
+	startParent, _, err := m.Register[orderReq, orderResp]("finalizer-parent").
+		Start("hold", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}).
+		End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], _ RunErr) {
+			finalizing <- ctx.Err()
+			child, err := startChild(ctx, "finalizer-1/child", NewRequest(&orderReq{}, &orderResp{}), WithParent(req.Run().StartVersion))
+			if err != nil {
+				childDone <- err
+				return
+			}
+			childDone <- m.Wait(ctx, child)
+		})).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build parent FSM: %v", err)
+	}
+
+	parent, err := startParent(ctx, "finalizer-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start parent: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the parent to start")
+	if err := m.Cancel(ctx, parent, "operator says stop"); err != nil {
+		t.Fatalf("cancel failed: %v", err)
+	}
+
+	if err := within(t, finalizing, 10*time.Second, "the finalizer"); err != nil {
+		t.Fatalf("expected the finalizer's context live after an operator cancel, got %v", err)
+	}
+
+	// The finalizer is blocked on the child, so the parent is still running and holds its lock.
+	select {
+	case err := <-childDone:
+		t.Fatalf("the finalizer's wait on its child returned while the child was still running: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	_, err = startParent(ctx, "finalizer-1", NewRequest(&orderReq{}, &orderResp{}))
+	if _, already := errors.AsType[*AlreadyRunningError](err); !already {
+		t.Fatalf("expected the finalizing parent to still hold its lock, got %v", err)
+	}
+
+	close(release)
+	if err := within(t, childDone, 10*time.Second, "the finalizer's wait on its child"); err != nil {
+		t.Fatalf("expected the child to finish cleanly, got %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.Wait(waitCtx, parent); err == nil || err.Error() != "operator says stop" {
+		t.Fatalf("expected the parent to finish with the cancel reason, got %v", err)
+	}
+}
+
+// TestShutdownReleasesFinalizer verifies the other half of the finalizer's context contract: it
+// survives an operator's cancel but not a shutdown, so a blocked finalizer never holds a
+// redeploy to the shutdown timeout, and the unfinished run resumes elsewhere.
+func TestShutdownReleasesFinalizer(t *testing.T) { runBackends(t, testShutdownReleasesFinalizer) }
+
+func testShutdownReleasesFinalizer(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+
+	var resumed atomic.Bool
+	entered := make(chan struct{}, 1)
+	finalizing := make(chan struct{}, 1)
+	causes := make(chan error, 1)
+	register := func(m *Manager) (Start[orderReq, orderResp], Resume, error) {
+		return m.Register[orderReq, orderResp]("finalizer-shutdown").
+			Start("hold", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+				entered <- struct{}{}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}).
+			End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], _ RunErr) {
+				if resumed.Load() {
+					return
+				}
+				finalizing <- struct{}{}
+				<-ctx.Done()
+				causes <- context.Cause(ctx)
+			})).
+			Build(ctx)
+	}
+
+	m1, stop1 := f.newManager(nil)
+	start, _, err := register(m1)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+	version, err := start(ctx, "finalizer-shutdown-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the run to start")
+	if err := m1.Cancel(ctx, version, "operator says stop"); err != nil {
+		t.Fatalf("cancel failed: %v", err)
+	}
+	within(t, finalizing, 10*time.Second, "the finalizer")
+
+	began := time.Now()
+	stop1()
+	if took := time.Since(began); took > 2*time.Second {
+		t.Fatalf("shutdown took %s: the blocked finalizer held it to the timeout", took)
+	}
+	if cause := within(t, causes, 10*time.Second, "the finalizer's cancel cause"); !errors.Is(cause, ErrShutdown) {
+		t.Fatalf("expected the finalizer released by ErrShutdown, got %T %v", cause, cause)
+	}
+
+	resumed.Store(true)
+	m2, _ := f.newManager(nil)
+	_, resume, err := register(m2)
+	if err != nil {
+		t.Fatalf("failed to rebuild FSM: %v", err)
+	}
+	if err := resume(ctx); err != nil {
+		t.Fatalf("failed to resume: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m2.Wait(waitCtx, version); err == nil || !strings.Contains(err.Error(), "operator says stop") {
+		t.Fatalf("expected the resumed run to finish with the cancel reason, got %v", err)
+	}
+}
+
+// TestStrayCanceledIsRetried verifies a handler's own context.Canceled — from a context it
+// derived, while the run's is live — is an ordinary failure, not a completed transition.
+func TestStrayCanceledIsRetried(t *testing.T) { runBackends(t, testStrayCanceledIsRetried) }
+
+func testStrayCanceledIsRetried(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+	m, _ := f.newManager(nil)
+
+	var attempts atomic.Int32
+	start, _, err := m.Register[orderReq, orderResp]("stray").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			if attempts.Add(1) == 1 {
+				return nil, context.Canceled
+			}
+			return NewResponse(&orderResp{Status: "ok"}), nil
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "stray-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.Wait(waitCtx, version); err != nil {
+		t.Fatalf("expected the run to complete after a retry, got %v", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("expected the stray context.Canceled to be retried once, got %d attempts", got)
+	}
+}
 
 // TestCancelRunningAcrossNodesViaBus verifies subject-addressed cancel end to end: a node that
 // does not own a run issues the cancel, the durable sentinel + broadcast reach the owning node,
@@ -45,13 +364,10 @@ func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
 		t.Fatalf("cancel failed: %v", err)
 	}
 
-	select {
-	case cause := <-canceled:
-		if !strings.Contains(cause.Error(), "stop from another node") {
-			t.Fatalf("expected the cancel cause, got %v", cause)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the run was not canceled via the cancel broadcast")
+	// The owner rebuilds the cause from the sentinel, so the type must survive the node boundary.
+	cause := within(t, canceled, 5*time.Second, "the cancel broadcast to stop the run")
+	if ce, ok := errors.AsType[*CancelError](cause); !ok || ce.Reason != "stop from another node" {
+		t.Fatalf("expected a *CancelError carrying the reason, got %T %v", cause, cause)
 	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
