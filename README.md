@@ -69,9 +69,10 @@ return nil, ctx.Err()
 ```
 
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the
-cancel calls for — start a compensating run and wait on it, say. That context still ends on
-`ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed before it
-finished.
+cancel calls for — start a compensating run and wait on it, say. It carries no deadline: the
+run's lease is held until its finalizers return, so that wait may take minutes. The context still
+ends on `ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed before
+it finished.
 
 ## Storage backends
 
