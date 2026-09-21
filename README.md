@@ -68,11 +68,16 @@ if cancel, ok := errors.AsType[*fsm.CancelError](context.Cause(ctx)); ok {
 return nil, ctx.Err()
 ```
 
+Those three are every cause the library sets. A later version may add one — always an exported
+value, never an anonymous error — so treat a cause you do not recognize as a reason to stop, not
+as an operator's intent. A context an initializer derived can also end for reasons of its own.
+
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the
-cancel calls for — start a compensating run and wait on it, say. It carries no deadline: the
-run's lease is held until its finalizers return, so that wait may take minutes. The context still
-ends on `ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed before
-it finished.
+cancel calls for — start a compensating run and wait on it, say. It carries the values
+initializers put on the transitions' context but none of their cancellation, and no deadline:
+the run's lease is held until its finalizers return, so that wait may take minutes. The context
+still ends on `ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed
+before it finished.
 
 ## Storage backends
 

@@ -163,11 +163,13 @@ func (o finalizerOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *Transition
 }
 
 // Finalizer runs once the FSM has finished its transitions, with the error and state that halted
-// it, if any. Its context outlives an operator's Cancel, so it can do the work the halt calls
-// for, and carries no deadline: the run's lease is held until FINISH, which is recorded only
-// after the finalizers return, so a finalizer may wait as long as that work takes. The context
-// ends, with cause ErrShutdown or ErrLeaseLost, only when the run stops on this node. A finalizer
-// runs again if the run is resumed before its FINISH is recorded.
+// it, if any. Its context carries the values initializers put on the transitions' context but
+// none of their cancellation — neither a deadline nor a cancel func reaches it — and it outlives
+// an operator's Cancel, so it can do the work the halt calls for. It has no deadline of its own:
+// the run's lease is held until FINISH, which is recorded only after the finalizers return, so a
+// finalizer may wait as long as that work takes. The context ends, with cause ErrShutdown or
+// ErrLeaseLost, only when the run stops on this node. A finalizer runs again if the run is
+// resumed before its FINISH is recorded.
 type Finalizer[R, W any] func(context.Context, *Request[R, W], RunErr)
 
 // WithFinalizers adds the provided Finalizers to the list of finalizers to be executed when the FSM

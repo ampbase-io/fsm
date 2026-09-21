@@ -163,9 +163,12 @@ func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
 		t.Fatalf("failed to build child FSM: %v", err)
 	}
 
+	type seededKey struct{}
+
 	entered := make(chan struct{}, 1)
 	finalizing := make(chan error, 1)
 	deadlined := make(chan bool, 1)
+	seeded := make(chan any, 1)
 	childDone := make(chan error, 1)
 	startParent, _, err := m.Register[orderReq, orderResp]("finalizer-parent").
 		Start("hold", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -173,9 +176,9 @@ func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		},
-			// A deadline on the transitions' context must not reach the finalizer.
+			// An initializer's values must reach the finalizer; its cancellation must not.
 			WithInitializers(func(ctx context.Context, req *Request[orderReq, orderResp]) context.Context {
-				ctx, cancel := context.WithTimeout(ctx, time.Hour)
+				ctx, cancel := context.WithTimeout(context.WithValue(ctx, seededKey{}, "seeded"), time.Hour)
 				t.Cleanup(cancel)
 				return ctx
 			}),
@@ -183,6 +186,7 @@ func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
 		End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], _ RunErr) {
 			_, hasDeadline := ctx.Deadline()
 			deadlined <- hasDeadline
+			seeded <- ctx.Value(seededKey{})
 			finalizing <- ctx.Err()
 			child, err := startChild(ctx, "finalizer-1/child", NewRequest(&orderReq{}, &orderResp{}), WithParent(req.Run().StartVersion))
 			if err != nil {
@@ -207,6 +211,9 @@ func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
 
 	if within(t, deadlined, 10*time.Second, "the finalizer") {
 		t.Fatal("expected the finalizer's context to carry no deadline")
+	}
+	if got := within(t, seeded, 10*time.Second, "the finalizer"); got != "seeded" {
+		t.Fatalf("expected the finalizer's context to carry the initializer's value, got %v", got)
 	}
 	if err := within(t, finalizing, 10*time.Second, "the finalizer"); err != nil {
 		t.Fatalf("expected the finalizer's context live after an operator cancel, got %v", err)
