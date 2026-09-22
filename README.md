@@ -188,3 +188,36 @@ provider := sdkmetric.NewMeterProvider(
 )
 m, err := fsm.New(fsm.Config{DBPath: "/var/lib/myapp/fsm", MeterProvider: provider})
 ```
+
+## Testing
+
+The `fsmtest` package runs a scenario against both backends without external services: a temp
+BoltDB and an in-memory S3. Managers from one `Backend` share storage, so a restart is a stopped
+manager followed by a new one over the same state:
+
+```go
+func TestDeployResumes(t *testing.T) {
+    fsmtest.RunBackends(t, func(t *testing.T, b *fsmtest.Backend) {
+        m1, stop1 := b.NewManager(nil)
+        // register, start a run, let it block in its first transition ...
+        stop1()
+        m2, _ := b.NewManager(nil)
+        // register again, Resume, Wait ...
+    })
+}
+```
+
+A takeover needs the object backend, a lease the owner cannot defend, and optionally a bus so
+the peer claims on the event rather than the next scan:
+
+```go
+b := fsmtest.NewObjectBackend(t,
+    fsmtest.WithBus(fake.NewBus()),
+    fsmtest.WithObjectConfig(fsmtest.AsymmetricTimings(400*time.Millisecond)),
+)
+```
+
+The fakes live in `fsmtest/fake` and do not import `fsm`: a test that builds its own `Config`
+takes `fake.NewS3(t).Client()` for `ObjectStorageConfig.Client` and `fake.NewBus()` for
+`EventBus`. The S3 fake injects faults — `Conflicts`, `LostPuts`, `SetPrePut`, `SetFailDelete`
+— and counts `Puts()` and reads, for tests of the conditional-write paths.

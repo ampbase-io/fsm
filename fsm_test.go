@@ -26,14 +26,14 @@ type gadgetResp struct{ Status string }
 // backend-agnostic behavior tests use runBackends instead.
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
-	m, _ := newBoltFactory(t).newManager(nil)
+	m, _ := newBoltBackend(t).newManager(nil)
 	return m
 }
 
 func TestEndToEnd(t *testing.T) { runBackends(t, testEndToEnd) }
 
-func testEndToEnd(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testEndToEnd(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var transitions atomic.Int32
@@ -139,8 +139,8 @@ func TestHistoryAfterArchive(t *testing.T) {
 // (BoltDB serves it from the archive bucket, object storage from the FINISH-time history object).
 func TestHistory(t *testing.T) { runBackends(t, testHistory) }
 
-func testHistory(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testHistory(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	start, _, err := m.Register[orderReq, orderResp]("history").
@@ -174,8 +174,8 @@ func testHistory(t *testing.T, f *managerFactory) {
 // scoped to the requested id.
 func TestRuns(t *testing.T) { runBackends(t, testRuns) }
 
-func testRuns(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testRuns(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	registerAction := func(action string) Start[orderReq, orderResp] {
@@ -262,8 +262,8 @@ func testRuns(t *testing.T, f *managerFactory) {
 // TestActiveExactID verifies Active only returns runs for the exact id, not ids sharing a prefix.
 func TestActiveExactID(t *testing.T) { runBackends(t, testActiveExactID) }
 
-func testActiveExactID(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testActiveExactID(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -323,7 +323,7 @@ func testActiveExactID(t *testing.T, f *managerFactory) {
 // manager restarts on the same storage.
 func TestResumeAfterShutdown(t *testing.T) { runBackends(t, testResumeAfterShutdown) }
 
-func testResumeAfterShutdown(t *testing.T, f *managerFactory) {
+func testResumeAfterShutdown(t *testing.T, b *backend) {
 	ctx := context.Background()
 
 	var allowComplete, sawRestart atomic.Bool
@@ -349,7 +349,7 @@ func testResumeAfterShutdown(t *testing.T, f *managerFactory) {
 			Build(ctx)
 	}
 
-	m1, stop1 := f.newManager(nil)
+	m1, stop1 := b.newManager(nil)
 
 	start, _, err := register(m1)
 	if err != nil {
@@ -369,7 +369,7 @@ func testResumeAfterShutdown(t *testing.T, f *managerFactory) {
 
 	allowComplete.Store(true)
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 
 	_, resume, err := register(m2)
 	if err != nil {
@@ -402,8 +402,8 @@ func TestAbortSkipsRemainingTransitions(t *testing.T) {
 	runBackends(t, testAbortSkipsRemainingTransitions)
 }
 
-func testAbortSkipsRemainingTransitions(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testAbortSkipsRemainingTransitions(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var thirdRan atomic.Bool
@@ -463,8 +463,8 @@ func testAbortSkipsRemainingTransitions(t *testing.T, f *managerFactory) {
 // via RetryFromContext, and the run completes once the transition succeeds.
 func TestRetryUntilSuccess(t *testing.T) { runBackends(t, testRetryUntilSuccess) }
 
-func testRetryUntilSuccess(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testRetryUntilSuccess(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -508,8 +508,8 @@ func TestInitializersInterceptorsFinalizers(t *testing.T) {
 	runBackends(t, testInitializersInterceptorsFinalizers)
 }
 
-func testInitializersInterceptorsFinalizers(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testInitializersInterceptorsFinalizers(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	type ctxKey struct{}
@@ -573,8 +573,8 @@ func testInitializersInterceptorsFinalizers(t *testing.T, f *managerFactory) {
 // while BoltDB has no leases, so its token epoch is zero.
 func TestFencingToken(t *testing.T) { runBackends(t, testFencingToken) }
 
-func testFencingToken(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testFencingToken(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	tokens := make(chan FencingToken, 1)
@@ -620,10 +620,10 @@ func testFencingToken(t *testing.T, f *managerFactory) {
 // peer takes over a run whose owner's lease lapsed, its handler observes a higher epoch than the
 // original owner did — the property a Chubby-style token exists to provide.
 func TestFencingTokenIncrementsOnTakeover(t *testing.T) {
-	f := newObjectFactoryWith(t, asymmetricTimings(400*time.Millisecond))
+	b := newObjectBackendWith(t, asymmetricTimings(400*time.Millisecond))
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	first := make(chan FencingToken, 1)
 	start, _, err := m1.Register[orderReq, orderResp]("fence-takeover").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -648,7 +648,7 @@ func TestFencingTokenIncrementsOnTakeover(t *testing.T) {
 		t.Fatal("owner handler never ran")
 	}
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	second := make(chan FencingToken, 1)
 	_, _, err = m2.Register[orderReq, orderResp]("fence-takeover").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {

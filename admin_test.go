@@ -57,8 +57,8 @@ func startReq(t *testing.T, action, id, name string) *connect.Request[fsmv1.Star
 // loop under the object backend, locally under BoltDB), and Wait returns the W result inline.
 func TestControlStartWait(t *testing.T) { runBackends(t, testControlStartWait) }
 
-func testControlStartWait(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartWait(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	echoFSM(t, m, "control-start")
@@ -97,8 +97,8 @@ func testControlStartWait(t *testing.T, f *managerFactory) {
 // StartResponse error detail, from the resource lock alone — no execution need have begun.
 func TestControlStartAlreadyRunning(t *testing.T) { runBackends(t, testControlStartAlreadyRunning) }
 
-func testControlStartAlreadyRunning(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartAlreadyRunning(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -133,8 +133,8 @@ func testControlStartAlreadyRunning(t *testing.T, f *managerFactory) {
 // to a terminal state whose Wait reports the cause.
 func TestControlCancel(t *testing.T) { runBackends(t, testControlCancel) }
 
-func testControlCancel(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlCancel(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -181,8 +181,8 @@ func testControlCancel(t *testing.T, f *managerFactory) {
 // resource id and its terminal record — including the W result — is retrievable by version.
 func TestControlRunsHistory(t *testing.T) { runBackends(t, testControlRunsHistory) }
 
-func testControlRunsHistory(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlRunsHistory(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	echoFSM(t, m, "control-runs")
@@ -229,8 +229,8 @@ func TestControlResultUnchangedByFinalizer(t *testing.T) {
 	runBackends(t, testControlResultUnchangedByFinalizer)
 }
 
-func testControlResultUnchangedByFinalizer(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlResultUnchangedByFinalizer(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	_, _, err := m.Register[orderReq, orderResp]("control-final").
@@ -271,8 +271,8 @@ func testControlResultUnchangedByFinalizer(t *testing.T, f *managerFactory) {
 // not a persisted run.
 func TestControlStartUnregistered(t *testing.T) { runBackends(t, testControlStartUnregistered) }
 
-func testControlStartUnregistered(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartUnregistered(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	admin := &adminServer{m: m}
 
 	_, err := admin.Start(context.Background(), startReq(t, "control-missing", "missing-1", "x"))
@@ -288,8 +288,8 @@ func testControlStartUnregistered(t *testing.T, f *managerFactory) {
 // leaves a poison run for the claim loop.
 func TestControlStartInvalidPayload(t *testing.T) { runBackends(t, testControlStartInvalidPayload) }
 
-func testControlStartInvalidPayload(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartInvalidPayload(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	echoFSM(t, m, "control-bad")
@@ -320,8 +320,8 @@ func testControlStartInvalidPayload(t *testing.T, f *managerFactory) {
 // error.
 func TestControlStartActionOnly(t *testing.T) { runBackends(t, testControlStartActionOnly) }
 
-func testControlStartActionOnly(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartActionOnly(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	echoFSM(t, m, "solo")
@@ -371,8 +371,8 @@ func testControlStartActionOnly(t *testing.T, f *managerFactory) {
 // persisted run's parent-child link, and a malformed option version is a client error.
 func TestControlStartOptions(t *testing.T) { runBackends(t, testControlStartOptions) }
 
-func testControlStartOptions(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlStartOptions(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	echoFSM(t, m, "control-opt")
@@ -439,8 +439,8 @@ func testControlStartOptions(t *testing.T, f *managerFactory) {
 // while the run is still in flight surfaces as CodeDeadlineExceeded, not a run outcome.
 func TestControlWaitDeadline(t *testing.T) { runBackends(t, testControlWaitDeadline) }
 
-func testControlWaitDeadline(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testControlWaitDeadline(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (

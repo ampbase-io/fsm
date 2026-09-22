@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -16,17 +17,13 @@ import (
 
 // leaseHarness shares one fake S3 between several objectStores acting as distinct nodes.
 type leaseHarness struct {
-	t      *testing.T
-	bucket string
-	url    string
-	fake   *fakeS3
+	t  *testing.T
+	s3 *fake.S3
 }
 
 func newLeaseHarness(t *testing.T) *leaseHarness {
 	t.Helper()
-
-	bucket, url, fake := startFakeS3(t)
-	return &leaseHarness{t: t, bucket: bucket, url: url, fake: fake}
+	return &leaseHarness{t: t, s3: fake.NewS3(t)}
 }
 
 // owns reports whether the store currently holds the run's lease. The production owns method was
@@ -45,7 +42,7 @@ func mustManifest(t *testing.T, s *objectStore, version ulid.ULID) *fsmv1.RunMan
 	return manifest
 }
 
-// asymmetricTimings gives the first manager created by the factory a lapsing lease (slow or
+// asymmetricTimings gives the first manager a backend creates a lapsing lease (slow or
 // suppressed heartbeat, no claim loop) and every later manager aggressive claim timings, so
 // the second manager deterministically takes over the first's runs.
 func asymmetricTimings(ownerHeartbeat time.Duration) func(*ObjectStorageConfig) {
@@ -67,9 +64,8 @@ func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectS
 	h.t.Helper()
 
 	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
-		Bucket:       h.bucket,
-		Endpoint:     h.url,
-		Region:       "auto",
+		Bucket:       h.s3.Bucket(),
+		Client:       h.s3.Client(),
 		LeaseTimeout: leaseTimeout,
 	}, nodeID, nil, nil)
 	if err != nil {
@@ -415,7 +411,7 @@ func TestClaimSurvivesLostResponse(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 
 	b := h.store("node-b", 10*time.Second)
-	h.fake.lostPuts = 1 // the next conditional PUT is b's claim CAS
+	h.s3.LostPuts = 1 // the next conditional PUT is b's claim CAS
 	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the claim to survive a lost response, got %v (err=%v)", claimed, err)
@@ -673,14 +669,14 @@ func TestCloseReleasesLeases(t *testing.T) {
 // TestHeartbeatKeepsOwnership verifies a live owner is never robbed: a second manager with an
 // aggressive claim loop and an explicit Resume must not take a run whose owner heartbeats.
 func TestHeartbeatKeepsOwnership(t *testing.T) {
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = time.Second
 		cfg.HeartbeatPeriod = 100 * time.Millisecond
 		cfg.ClaimInterval = 100 * time.Millisecond
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 1)
 		block   = make(chan struct{})
@@ -692,7 +688,7 @@ func TestHeartbeatKeepsOwnership(t *testing.T) {
 	}
 	<-entered
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	var stolen atomic.Int32
 	_, resume, err := m2.Register[orderReq, orderResp]("keep").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -725,10 +721,10 @@ func TestHeartbeatKeepsOwnership(t *testing.T) {
 func TestLeaseLossCancelsRun(t *testing.T) {
 	// The first manager heartbeats slower than its lease expires, so every extension leaves a
 	// takeover window.
-	f := newObjectFactoryWith(t, asymmetricTimings(400*time.Millisecond))
+	b := newObjectBackendWith(t, asymmetricTimings(400*time.Millisecond))
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered  = make(chan struct{}, 1)
 		canceled = make(chan error, 1)
@@ -753,7 +749,7 @@ func TestLeaseLossCancelsRun(t *testing.T) {
 
 	// The second manager's claim loop takes the run once the lease lapses; no explicit
 	// Resume call is involved.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "takeover")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -777,7 +773,7 @@ func TestLeaseLossCancelsRun(t *testing.T) {
 // failure would leave the remainder heartbeat-extended but never executed.
 func TestResumeContinuesPastFailedRun(t *testing.T) {
 	nodes := 0
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		nodes++
 		cfg.LeaseTimeout = 150 * time.Millisecond
 		cfg.ClaimInterval = time.Hour // the explicit Resume is the only claim path
@@ -788,7 +784,7 @@ func TestResumeContinuesPastFailedRun(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 2)
 		block   = make(chan struct{})
@@ -820,7 +816,7 @@ func TestResumeContinuesPastFailedRun(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond) // let m1's undefended leases lapse
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	resume := completingFSM(t, m2, "poison")
 	if err := resume(ctx); err == nil {
 		t.Fatal("expected Resume to report the poisoned run")
@@ -842,10 +838,10 @@ func TestResumeContinuesPastFailedRun(t *testing.T) {
 // delayed run whose lease was claimed by another node during the delay must cancel before its
 // first transition's side effects run, no matter how long after the loss it dispatches.
 func TestLostLeaseDelayedRunNeverExecutes(t *testing.T) {
-	f := newObjectFactoryWith(t, asymmetricTimings(400*time.Millisecond))
+	b := newObjectBackendWith(t, asymmetricTimings(400*time.Millisecond))
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var executed atomic.Int32
 	start, _, err := m1.Register[orderReq, orderResp]("dsteal").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -865,7 +861,7 @@ func TestLostLeaseDelayedRunNeverExecutes(t *testing.T) {
 
 	// m2's claim loop takes the run while it waits out its delay (m1's slow heartbeat lets
 	// the lease lapse) and completes it after the delay elapses.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "dsteal")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -912,10 +908,10 @@ func TestDelayUntilStoredAsMilliseconds(t *testing.T) {
 // TestClaimResumesFromCompletedStates verifies a claimed run continues from the transitions
 // its previous owner durably completed rather than starting over.
 func TestClaimResumesFromCompletedStates(t *testing.T) {
-	f := newObjectFactoryWith(t, asymmetricTimings(time.Hour))
+	b := newObjectBackendWith(t, asymmetricTimings(time.Hour))
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 1)
 		block   = make(chan struct{})
@@ -945,7 +941,7 @@ func TestClaimResumesFromCompletedStates(t *testing.T) {
 	}
 	<-entered
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	var reranCreated, ranShipped atomic.Int32
 	if _, _, err := m2.Register[orderReq, orderResp]("phased").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {

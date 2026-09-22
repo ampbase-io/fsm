@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -88,10 +89,10 @@ func (w *wakeCoordinator) claims() int { return int(w.claimCount.Load()) }
 // runWakeLoop starts a coordinate loop over a wakeCoordinator (hour-long cadence, so only the
 // pending wakeup can drive a claim pass) and waits until it has subscribed to the pending
 // subject. It returns the bus and coordinator for driving and asserting the wake.
-func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
+func runWakeLoop(t *testing.T) (*fake.Bus, *wakeCoordinator) {
 	t.Helper()
 
-	bus := newTestBus()
+	bus := fake.NewBus()
 	lc := &wakeCoordinator{}
 	m := &Manager{
 		logger:  slog.Default(),
@@ -106,12 +107,12 @@ func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
 	t.Cleanup(func() { close(m.done); <-loopDone })
 
 	eventually(t, 2*time.Second, func() bool {
-		return bus.subscriberCount(subjectPending) >= 1
+		return bus.SubscriberCount(subjectPending) >= 1
 	}, "coordinate never subscribed to the pending subject")
 	return bus, lc
 }
 
-func publishPending(bus *testBus) {
+func publishPending(bus *fake.Bus) {
 	bus.Publish(subjectPending, &fsmv1.RunEvent{Kind: fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING})
 }
 
@@ -264,7 +265,7 @@ func TestSweepCancellationsContinuesPastFailure(t *testing.T) {
 // claim pass from completing the runs claimed after it.
 func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	nodes := 0
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		nodes++
 		cfg.LeaseTimeout = 150 * time.Millisecond
 		cfg.HeartbeatPeriod = 75 * time.Millisecond
@@ -276,7 +277,7 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 2)
 		block   = make(chan struct{})
@@ -306,7 +307,7 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	}
 
 	// No explicit Resume: only m2's claim loop can complete the healthy run.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "cpoison")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -319,12 +320,12 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 // TestCoordinateStopsPromptly pins that shutdown does not wait out heartbeat or claim ticks:
 // the coordinate goroutine exits as soon as done closes.
 func TestCoordinateStopsPromptly(t *testing.T) {
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = time.Second
 		cfg.HeartbeatPeriod = 20 * time.Millisecond
 		cfg.ClaimInterval = 20 * time.Millisecond
 	})
-	m, stop := f.newManager(nil)
+	m, stop := b.newManager(nil)
 	completingFSM(t, m, "tick")
 	time.Sleep(100 * time.Millisecond) // let a few heartbeat and claim ticks run
 

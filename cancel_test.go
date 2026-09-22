@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"connectrpc.com/connect"
@@ -30,9 +31,9 @@ func within[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
 // as a *CancelError carrying the reason, a shutdown as ErrShutdown.
 func TestCancelCause(t *testing.T) { runBackends(t, testCancelCause) }
 
-func testCancelCause(t *testing.T, f *managerFactory) {
+func testCancelCause(t *testing.T, b *backend) {
 	ctx := context.Background()
-	m, stop := f.newManager(nil)
+	m, stop := b.newManager(nil)
 
 	entered := make(chan struct{}, 1)
 	causes := make(chan error, 1)
@@ -76,9 +77,9 @@ func testCancelCause(t *testing.T, f *managerFactory) {
 // later skipped one — to its finalizer, in its durable record, and as its Wait outcome.
 func TestCancelRecordsStoppingState(t *testing.T) { runBackends(t, testCancelRecordsStoppingState) }
 
-func testCancelRecordsStoppingState(t *testing.T, f *managerFactory) {
+func testCancelRecordsStoppingState(t *testing.T, b *backend) {
 	ctx := context.Background()
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 
 	entered := make(chan struct{}, 1)
 	finalized := make(chan RunErr, 1)
@@ -143,9 +144,9 @@ func testCancelRecordsStoppingState(t *testing.T, f *managerFactory) {
 // its resource lock — until the child finishes.
 func TestFinalizerOutlivesCancel(t *testing.T) { runBackends(t, testFinalizerOutlivesCancel) }
 
-func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
+func testFinalizerOutlivesCancel(t *testing.T, b *backend) {
 	ctx := context.Background()
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 
 	release := make(chan struct{})
 	startChild, _, err := m.Register[orderReq, orderResp]("finalizer-child").
@@ -246,7 +247,7 @@ func testFinalizerOutlivesCancel(t *testing.T, f *managerFactory) {
 // redeploy to the shutdown timeout, and the unfinished run resumes elsewhere.
 func TestShutdownReleasesFinalizer(t *testing.T) { runBackends(t, testShutdownReleasesFinalizer) }
 
-func testShutdownReleasesFinalizer(t *testing.T, f *managerFactory) {
+func testShutdownReleasesFinalizer(t *testing.T, b *backend) {
 	ctx := context.Background()
 
 	var resumed atomic.Bool
@@ -271,7 +272,7 @@ func testShutdownReleasesFinalizer(t *testing.T, f *managerFactory) {
 			Build(ctx)
 	}
 
-	m1, stop1 := f.newManager(nil)
+	m1, stop1 := b.newManager(nil)
 	start, _, err := register(m1)
 	if err != nil {
 		t.Fatalf("failed to build FSM: %v", err)
@@ -296,7 +297,7 @@ func testShutdownReleasesFinalizer(t *testing.T, f *managerFactory) {
 	}
 
 	resumed.Store(true)
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	_, resume, err := register(m2)
 	if err != nil {
 		t.Fatalf("failed to rebuild FSM: %v", err)
@@ -318,9 +319,9 @@ func TestCancelLandingOnCompletedHandler(t *testing.T) {
 	runBackends(t, testCancelLandingOnCompletedHandler)
 }
 
-func testCancelLandingOnCompletedHandler(t *testing.T, f *managerFactory) {
+func testCancelLandingOnCompletedHandler(t *testing.T, b *backend) {
 	ctx := context.Background()
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 
 	running := make(chan context.Context, 1)
 	release := make(chan struct{})
@@ -365,9 +366,9 @@ func testCancelLandingOnCompletedHandler(t *testing.T, f *managerFactory) {
 // derived, while the run's is live — is an ordinary failure, not a completed transition.
 func TestStrayCanceledIsRetried(t *testing.T) { runBackends(t, testStrayCanceledIsRetried) }
 
-func testStrayCanceledIsRetried(t *testing.T, f *managerFactory) {
+func testStrayCanceledIsRetried(t *testing.T, b *backend) {
 	ctx := context.Background()
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 
 	var attempts atomic.Int32
 	start, _, err := m.Register[orderReq, orderResp]("stray").
@@ -401,11 +402,11 @@ func testStrayCanceledIsRetried(t *testing.T, f *managerFactory) {
 // does not own a run issues the cancel, the durable sentinel + broadcast reach the owning node,
 // and its cancel sweep stops the executing run with the recorded cause.
 func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
-	bus := newTestBus()
-	f := newObjectFactoryWithBus(t, bus, nil)
+	bus := fake.NewBus()
+	b := newObjectBackendWithBus(t, bus, nil)
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	entered := make(chan struct{}, 1)
 	canceled := make(chan error, 1)
 	start, _, err := m1.Register[orderReq, orderResp]("xcancel").
@@ -429,7 +430,7 @@ func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
 
 	// A second node — which owns nothing and never registered the FSM — issues the cancel. With
 	// the periodic heartbeat sweep 10s out by default, only the broadcast can deliver in time.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	if err := m2.Cancel(ctx, version, "stop from another node"); err != nil {
 		t.Fatalf("cancel failed: %v", err)
 	}
@@ -454,13 +455,13 @@ func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
 // rides the durable sentinel alone, and the owning node's heartbeat sweep discovers it and stops
 // the run — no broadcast involved.
 func TestCancelViaSweepFloorNoBus(t *testing.T) {
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		cfg.HeartbeatPeriod = 200 * time.Millisecond
 		cfg.LeaseTimeout = 2 * time.Second
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	entered := make(chan struct{}, 1)
 	canceled := make(chan error, 1)
 	start, _, err := m1.Register[orderReq, orderResp]("sweepcancel").
@@ -482,7 +483,7 @@ func TestCancelViaSweepFloorNoBus(t *testing.T) {
 	}
 	<-entered
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	if err := m2.Cancel(ctx, version, "stop via the sweep floor"); err != nil {
 		t.Fatalf("cancel failed: %v", err)
 	}
@@ -501,11 +502,11 @@ func TestCancelViaSweepFloorNoBus(t *testing.T) {
 // this node owns but has not begun executing is driven to a terminal canceled manifest, so its
 // waiters resolve with the cause instead of blocking to the delay, and its transition never runs.
 func TestCancelDelayedRunBeforeExecution(t *testing.T) {
-	bus := newTestBus()
-	f := newObjectFactoryWithBus(t, bus, nil)
+	bus := fake.NewBus()
+	b := newObjectBackendWithBus(t, bus, nil)
 	ctx := context.Background()
 
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 	var ran atomic.Bool
 	start, _, err := m.Register[orderReq, orderResp]("delaycancel").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {

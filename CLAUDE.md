@@ -59,6 +59,10 @@ backend's distributed-execution design is the active work.
   `proto/fsm/v1/`; generated code in `gen/`.
 - `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like
   the tracer (`Manager`, `retry`, `objectStore`); attribute keys and bucket advice live there.
+- `fsmtest/fake` — the in-memory S3 (`fake.S3`, with fault hooks and counters) and EventBus
+  (`fake.Bus`); a leaf package that never imports `fsm`. `fsmtest` — the consumer-facing harness
+  over it: `Backend`, `RunBackends`, `NewObjectBackend` options, `AsymmetricTimings`,
+  `Eventually`.
 
 ## Build, test, verify
 - **Toolchain: Go 1.27** — the builder API uses generic methods, which need it. Plain `go`.
@@ -76,8 +80,14 @@ backend's distributed-execution design is the active work.
 
 ## Testing conventions
 - New behavior tests run against **both backends**: `func TestX(t){ runBackends(t, testX) }`. The
-  object backend uses an in-process fake S3 (`fakeS3`); timing tests set lease/poll intervals via
-  `newObjectFactoryWith` / `newObjectFactoryWithBus`.
+  object backend uses the in-process `fake.S3`; timing tests set lease/poll intervals via
+  `newObjectBackendWith` / `newObjectBackendWithBus`.
+- **The cycle rule:** `fsmtest` imports `fsm`, so in-package tests may import only
+  `fsmtest/fake`. The `backend` type, `asymmetricTimings` and `eventually` therefore exist
+  twice — once in-package (`backend_test.go`, `lease_test.go`, `eventbus_test.go`) and once
+  exported in `fsmtest`; keep the two in step.
+- Object-backend managers take the fake's client (`Client: s3.Client()`, static credentials), so
+  nothing calls `t.Setenv` except the one test of the `Endpoint`-built client.
 - **Prove a test catches its bug**: temporarily revert the fix with the editor and confirm the
   test fails — never `git checkout <file>`, which discards all uncommitted work in that file.
 

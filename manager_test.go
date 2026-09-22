@@ -39,8 +39,8 @@ func blockingFSM(t *testing.T, m *Manager, action string, entered chan<- struct{
 
 func TestAlreadyRunning(t *testing.T) { runBackends(t, testAlreadyRunning) }
 
-func testAlreadyRunning(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testAlreadyRunning(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -72,8 +72,8 @@ func testAlreadyRunning(t *testing.T, f *managerFactory) {
 
 func TestCancel(t *testing.T) { runBackends(t, testCancel) }
 
-func testCancel(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testCancel(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -118,8 +118,8 @@ func testCancel(t *testing.T, f *managerFactory) {
 
 func TestQueueLimitsConcurrency(t *testing.T) { runBackends(t, testQueueLimitsConcurrency) }
 
-func testQueueLimitsConcurrency(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(map[string]int{"deploys": 1})
+func testQueueLimitsConcurrency(t *testing.T, b *backend) {
+	m, _ := b.newManager(map[string]int{"deploys": 1})
 	ctx := context.Background()
 
 	var (
@@ -164,8 +164,8 @@ func testQueueLimitsConcurrency(t *testing.T, f *managerFactory) {
 
 func TestRunAfter(t *testing.T) { runBackends(t, testRunAfter) }
 
-func testRunAfter(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testRunAfter(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -213,8 +213,8 @@ func testRunAfter(t *testing.T, f *managerFactory) {
 
 func TestChildren(t *testing.T) { runBackends(t, testChildren) }
 
-func testChildren(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testChildren(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	parentStart, _, err := m.Register[orderReq, orderResp]("parent").
@@ -288,8 +288,8 @@ func testChildren(t *testing.T, f *managerFactory) {
 
 func TestDelayedStart(t *testing.T) { runBackends(t, testDelayedStart) }
 
-func testDelayedStart(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testDelayedStart(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	ranAt := make(chan time.Time, 1)
@@ -325,8 +325,8 @@ func testDelayedStart(t *testing.T, f *managerFactory) {
 // resumes one FSM's runs under the other's transitions.
 func TestStoreActiveIsolatesActions(t *testing.T) { runBackends(t, testStoreActiveIsolatesActions) }
 
-func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testStoreActiveIsolatesActions(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -369,8 +369,8 @@ func testStoreActiveIsolatesActions(t *testing.T, f *managerFactory) {
 // still executing. A consumer treating PENDING as "not picked up yet" would re-dispatch it.
 func TestRunningBeforeFirstTransition(t *testing.T) { runBackends(t, testRunningBeforeFirstTransition) }
 
-func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testRunningBeforeFirstTransition(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	entered := make(chan struct{}, 1)
@@ -402,8 +402,8 @@ func testRunningBeforeFirstTransition(t *testing.T, f *managerFactory) {
 // an id, deduplicated by run — the Manager queries the store once per distinct type.
 func TestActiveAcrossTypes(t *testing.T) { runBackends(t, testActiveAcrossTypes) }
 
-func testActiveAcrossTypes(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testActiveAcrossTypes(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
@@ -480,8 +480,8 @@ func testActiveAcrossTypes(t *testing.T, f *managerFactory) {
 // runAfter runner depends on this to start dependents whose predecessor is unknown.
 func TestWaitUnknownRun(t *testing.T) { runBackends(t, testWaitUnknownRun) }
 
-func testWaitUnknownRun(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testWaitUnknownRun(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	completingFSM(t, m, "unknown-wait")
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -498,8 +498,8 @@ func testWaitUnknownRun(t *testing.T, f *managerFactory) {
 // store's run state.
 func TestAdminListActive(t *testing.T) { runBackends(t, testAdminListActive) }
 
-func testAdminListActive(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testAdminListActive(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
