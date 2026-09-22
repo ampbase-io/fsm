@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 
 	"github.com/benbjohnson/immutable"
 	"github.com/iancoleman/strcase"
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -202,7 +202,7 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 		name:     name,
 	}
 	if _, ok := s.f.registeredTransitions[tk]; ok {
-		s.m.logger.WithField("transition", name).Error("transition already registered")
+		s.m.logger.Error("transition already registered", "transition", name)
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("transition %s already registered", name))
 		return &fsmTransition[R, W]{s.transitionStep}
 	}
@@ -238,7 +238,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	defer s.m.mu.Unlock()
 
 	if _, ok := s.m.fsms[fk]; ok {
-		s.m.logger.WithField("fsm", s.f.typeName).Error("fsm already registered")
+		s.m.logger.Error("fsm already registered", "fsm", s.f.typeName)
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("fsm %s:%s already registered", s.f.typeName, s.f.action))
 		return &fsmEnd[R, W]{s.transitionStep}
 	}
@@ -249,7 +249,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		name:     name,
 	}
 	if _, ok := s.f.registeredTransitions[tk]; ok {
-		s.m.logger.WithField("transition", name).Error("transition already registered")
+		s.m.logger.Error("transition already registered", "transition", name)
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("transition %s already registered", name))
 		return &fsmEnd[R, W]{s.transitionStep}
 	}
@@ -301,14 +301,14 @@ func (s *fsmEnd[R, W]) Build(ctx context.Context) (Start[R, W], Resume, error) {
 	return s.m.start[R, W](s.f), wrappedResume, nil
 }
 
-func determineCodec(logger logrus.FieldLogger, req any) (Codec, error) {
+func determineCodec(logger *slog.Logger, req any) (Codec, error) {
 	if codec, ok := req.(Codec); ok {
-		logger.Info("using provided codec")
+		logger.Debug("using provided codec")
 		return codec, nil
 	}
 
 	if _, ok := req.(proto.Message); ok {
-		logger.Info("using proto codec")
+		logger.Debug("using proto codec")
 		return &protoBinaryCodec{}, nil
 	}
 
@@ -322,7 +322,7 @@ func determineCodec(logger logrus.FieldLogger, req any) (Codec, error) {
 	if err := codec.Unmarshal(b, &req2); err != nil {
 		return nil, fmt.Errorf("no codec provided and could not use json codec for %T: %w", req, err)
 	}
-	logger.Info("using json codec")
+	logger.Debug("using json codec")
 
 	return &jsonCodec{}, nil
 }

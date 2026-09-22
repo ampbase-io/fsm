@@ -14,7 +14,6 @@ require (
 	github.com/iancoleman/strcase v0.3.0
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/prometheus/client_golang v1.21.1
-	github.com/sirupsen/logrus v1.9.3
 	go.etcd.io/bbolt v1.4.0
 	go.opentelemetry.io/otel v1.35.0
 	go.opentelemetry.io/otel/trace v1.35.0

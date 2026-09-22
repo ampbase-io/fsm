@@ -116,3 +116,23 @@ m, err := fsm.New(fsm.Config{
   finalizers run at least once, so a parent re-enters the code that starts its children.
   `AlreadyRunningError` covers only a child still running: a finished child's id can be started
   again, and queued starts stack. Check `Runs(id)` before starting.
+
+## Observability
+
+### Logging
+
+The library logs through `log/slog`. Pass a `*slog.Logger` as `Config.Logger`; the default is
+`slog.Default()`. Handlers get a logger through `req.Log()`, carrying the run's attributes.
+
+```go
+m, err := fsm.New(fsm.Config{
+    DBPath: "/var/lib/myapp/fsm",
+    Logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+})
+```
+
+Levels: a run's start and stop, a claim, and shutdown are Info; each transition, each wait, and
+each queued dispatch are Debug; a retry is Warn; a halt or a storage failure is Error. Attributes
+a run carries: `sys` (`fsm` or `fsm-store`), `run_id`, `run_type`, `run_alias`, `run_version`,
+then `transition` and `transition_version` on each transition's lines, and `retry_count` on a
+retry's.

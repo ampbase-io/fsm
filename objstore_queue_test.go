@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,14 +12,13 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 // queueStore builds an objectStore over the harness' shared fake S3 with the given queue
 // capacities configured, so the admission helpers can be exercised directly.
 func (h *leaseHarness) queueStore(nodeID string, leaseTimeout time.Duration, queues map[string]int) *objectStore {
 	h.t.Helper()
-	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
 		Bucket:       h.bucket,
 		Endpoint:     h.url,
 		Region:       "auto",

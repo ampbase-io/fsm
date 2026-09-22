@@ -16,6 +16,20 @@ import (
 type managerFactory struct {
 	name       string
 	newManager func(queues map[string]int) (*Manager, func())
+
+	// configureManager, when set before a newManager call, adjusts the Config a manager is
+	// created with — the logger, say — on top of the backend the factory wires.
+	configureManager func(*Config)
+}
+
+// newManagerFrom applies the factory's Config hook and creates the manager.
+func (f *managerFactory) newManagerFrom(t *testing.T, cfg Config) (*Manager, func()) {
+	t.Helper()
+	if f.configureManager != nil {
+		f.configureManager(&cfg)
+	}
+	m, err := New(cfg)
+	return f.manage(t, m, err)
 }
 
 // runBackends runs the given scenario against both storage backends.
@@ -48,8 +62,7 @@ func newBoltFactory(t *testing.T) *managerFactory {
 
 	f := &managerFactory{name: "bolt"}
 	f.newManager = func(queues map[string]int) (*Manager, func()) {
-		m, err := New(Config{DBPath: dir, Queues: queues})
-		return f.manage(t, m, err)
+		return f.newManagerFrom(t, Config{DBPath: dir, Queues: queues})
 	}
 	return f
 }
@@ -105,13 +118,12 @@ func newObjectFactoryWithBus(t *testing.T, bus EventBus, configure func(*ObjectS
 			configure(cfg)
 		}
 		nodes++
-		m, err := New(Config{
+		return f.newManagerFrom(t, Config{
 			ObjectStorage: cfg,
 			NodeID:        fmt.Sprintf("node-%d", nodes),
 			Queues:        queues,
 			EventBus:      bus,
 		})
-		return f.manage(t, m, err)
 	}
 	return f
 }

@@ -3,19 +3,19 @@ package fsm
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 type runner interface {
-	Run(ctx context.Context, logger logrus.FieldLogger, ack chan struct{}, fn func())
+	Run(ctx context.Context, logger *slog.Logger, ack chan struct{}, fn func())
 }
 
-type runnerFn func(ctx context.Context, logger logrus.FieldLogger, fn func())
+type runnerFn func(ctx context.Context, logger *slog.Logger, fn func())
 
-func (r runnerFn) Run(ctx context.Context, logger logrus.FieldLogger, ack chan struct{}, fn func()) {
+func (r runnerFn) Run(ctx context.Context, logger *slog.Logger, ack chan struct{}, fn func()) {
 	close(ack)
 	r(ctx, logger, fn)
 }
@@ -49,7 +49,7 @@ func runnerFromOpts(opts *startOptions, m *Manager) runner {
 		}
 		q, ok := m.queues[opts.queue]
 		if !ok {
-			m.logger.WithField("queue", opts.queue).Warn("queue not found, using default runner")
+			m.logger.Warn("queue not found, using default runner", "queue", opts.queue)
 			return defaultRunner()
 		}
 		return q
@@ -59,15 +59,15 @@ func runnerFromOpts(opts *startOptions, m *Manager) runner {
 }
 
 func defaultRunner() runner {
-	return runnerFn(func(ctx context.Context, logger logrus.FieldLogger, fn func()) {
+	return runnerFn(func(ctx context.Context, logger *slog.Logger, fn func()) {
 		fn()
 	})
 }
 
 func delayedRunner(delayUntil time.Time) runner {
-	return runnerFn(func(ctx context.Context, logger logrus.FieldLogger, fn func()) {
+	return runnerFn(func(ctx context.Context, logger *slog.Logger, fn func()) {
 		delay := delayUntil.Sub(time.Now())
-		logger.WithField("delay", delay).Info("delaying start")
+		logger.Debug("delaying start", "delay", delay)
 		t := time.NewTimer(delay)
 		select {
 		case <-t.C:
@@ -83,16 +83,16 @@ type waiter interface {
 }
 
 func runAfter(w waiter, after ulid.ULID) runner {
-	return runnerFn(func(ctx context.Context, logger logrus.FieldLogger, fn func()) {
+	return runnerFn(func(ctx context.Context, logger *slog.Logger, fn func()) {
 		err := w.Wait(ctx, after)
 		switch {
 		case errors.Is(err, context.Canceled):
 			logger.Info("context canceled, fsm shutting down")
 			return
 		case errors.Is(err, ErrFsmNotFound):
-			logger.WithField("run_after_version", after.String()).Warn("FSM not found, immediately starting")
+			logger.Warn("FSM not found, immediately starting", "run_after_version", after.String())
 		case err != nil:
-			logger.WithError(err).Error("failed to wait for FSM to complete, immediately starting")
+			logger.Error("failed to wait for FSM to complete, immediately starting", "error", err)
 		}
 		fn()
 	})
@@ -114,17 +114,15 @@ type queueItem struct {
 	ack chan struct{}
 }
 
-func (r *queuedRunner) withFields() logrus.Fields {
-	return logrus.Fields{
-		"inflight": r.inflight,
-		"queued":   len(r.queued),
-	}
+// occupancy logs a queue state change with the runner's current load.
+func (r *queuedRunner) occupancy(logger *slog.Logger, msg string) {
+	logger.Debug(msg, "inflight", r.inflight, "queued", len(r.queued))
 }
 
-func (r *queuedRunner) Run(ctx context.Context, logger logrus.FieldLogger, ack chan struct{}, fn func()) {
+func (r *queuedRunner) Run(ctx context.Context, logger *slog.Logger, ack chan struct{}, fn func()) {
 	item := queueItem{
 		fn: func() {
-			logger.Info("running queued function")
+			logger.Debug("running queued function")
 			fn()
 		},
 		ack: ack,
@@ -133,8 +131,8 @@ func (r *queuedRunner) Run(ctx context.Context, logger logrus.FieldLogger, ack c
 	<-item.ack
 }
 
-func (r *queuedRunner) run(quit <-chan struct{}, logger logrus.FieldLogger) {
-	logger = logger.WithFields(logrus.Fields{"queue": r.name, "size": r.size})
+// run drives the queue. Its logger already carries the queue's name and size.
+func (r *queuedRunner) run(quit <-chan struct{}, logger *slog.Logger) {
 	logger.Info("started")
 
 	done := make(chan struct{}, r.size)
@@ -145,7 +143,7 @@ func (r *queuedRunner) run(quit <-chan struct{}, logger logrus.FieldLogger) {
 			return
 		case <-done:
 			r.inflight--
-			logger.WithFields(r.withFields()).Info("done")
+			r.occupancy(logger, "done")
 			switch len(r.queued) {
 			case 0:
 				continue
@@ -153,7 +151,7 @@ func (r *queuedRunner) run(quit <-chan struct{}, logger logrus.FieldLogger) {
 				f := r.queued[0]
 				r.queued = r.queued[1:]
 				r.inflight++
-				logger.WithFields(r.withFields()).Info("executing")
+				r.occupancy(logger, "executing")
 				go func() {
 					f()
 					done <- struct{}{}
@@ -163,10 +161,10 @@ func (r *queuedRunner) run(quit <-chan struct{}, logger logrus.FieldLogger) {
 			switch {
 			case r.inflight >= r.size:
 				r.queued = append(r.queued, item.fn)
-				logger.WithFields(r.withFields()).Info("queued")
+				r.occupancy(logger, "queued")
 			default:
 				r.inflight++
-				logger.WithFields(r.withFields()).Info("executing")
+				r.occupancy(logger, "executing")
 				go func() {
 					item.fn()
 					done <- struct{}{}

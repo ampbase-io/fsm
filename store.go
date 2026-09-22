@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"time"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/hashicorp/go-memdb"
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 	"go.etcd.io/bbolt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -104,7 +104,7 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 var _ Store = (*boltStore)(nil)
 
 type boltStore struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	tracer trace.Tracer
 
@@ -120,7 +120,7 @@ type boltStore struct {
 	archiveCh chan struct{}
 }
 
-func newStore(logger logrus.FieldLogger, tracer trace.Tracer, path string) (*boltStore, error) {
+func newStore(logger *slog.Logger, tracer trace.Tracer, path string) (*boltStore, error) {
 	memDB, err := memdb.NewMemDB(fsmSchema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memdb, %w", err)
@@ -214,14 +214,14 @@ func (s *boltStore) archive(ctx context.Context) {
 			return tx.Bucket(archiveBucket).ForEach(func(k, v []byte) error {
 				var ae fsmv1.ActiveEvent
 				if err := proto.Unmarshal(v, &ae); err != nil {
-					s.logger.WithError(err).Error("failed to unmarshal active event")
+					s.logger.Error("failed to unmarshal active event", "error", err)
 					gatherSpan.RecordError(err)
 					return nil
 				}
 
 				var version ulid.ULID
 				if err := version.UnmarshalText(ae.StartVersion); err != nil {
-					s.logger.WithError(err).Error("failed to unmarshal version")
+					s.logger.Error("failed to unmarshal version", "error", err)
 					gatherSpan.RecordError(err)
 					// TODO: delete active event
 					return nil
@@ -230,7 +230,7 @@ func (s *boltStore) archive(ctx context.Context) {
 				var se fsmv1.StateEvent
 				err := proto.Unmarshal(tx.Bucket(eventsBucket).Get(ae.EndEvent), &se)
 				if err != nil {
-					s.logger.WithError(err).Error("failed to unmarshal end event")
+					s.logger.Error("failed to unmarshal end event", "error", err)
 					gatherSpan.RecordError(err)
 					// TODO: delete archive event
 					return nil
@@ -256,7 +256,7 @@ func (s *boltStore) archive(ctx context.Context) {
 		gatherSpan.End()
 		switch {
 		case ctx.Err() != nil:
-			s.logger.Info("context canceled, exiting archive loop")
+			s.logger.Debug("context canceled, exiting archive loop")
 			return
 		case len(archiveEvents) == 0:
 			s.logger.Debug("no active events to archive")
@@ -270,18 +270,18 @@ func (s *boltStore) archive(ctx context.Context) {
 		defer processSpan.End()
 		for date, events := range archiveEvents {
 			if ctx.Err() != nil {
-				s.logger.Info("context canceled, exiting archive loop")
+				s.logger.Debug("context canceled, exiting archive loop")
 				return
 			}
 
 			todayBucket := bytes.Join([][]byte{historyBucket, []byte(date)}, keySeparator)
-			s.logger.WithField("date", date).WithField("count", len(events)).Info("archiving events")
+			s.logger.Debug("archiving events", "date", date, "count", len(events))
 
 			// NOTE: we don't care about the error here
 			s.history.Update(func(tx *bbolt.Tx) error {
 				historyB, err := tx.CreateBucketIfNotExists(todayBucket)
 				if err != nil {
-					s.logger.WithError(err).Error("failed to create history bucket")
+					s.logger.Error("failed to create history bucket", "error", err)
 					return err
 				}
 
@@ -289,7 +289,7 @@ func (s *boltStore) archive(ctx context.Context) {
 					historyEvent := event.historyEvent
 					historyBytes, err := proto.Marshal(historyEvent)
 					if err != nil {
-						s.logger.WithError(err).Error("failed to marshal history event")
+						s.logger.Error("failed to marshal history event", "error", err)
 						processSpan.RecordError(err)
 						continue
 					}
@@ -301,7 +301,7 @@ func (s *boltStore) archive(ctx context.Context) {
 
 			for _, event := range events {
 				if ctx.Err() != nil {
-					s.logger.Info("context canceled, exiting archive loop")
+					s.logger.Debug("context canceled, exiting archive loop")
 					return
 				}
 
@@ -316,7 +316,7 @@ func (s *boltStore) archive(ctx context.Context) {
 				})
 
 				if ctx.Err() != nil {
-					s.logger.Info("context canceled, exiting archive loop")
+					s.logger.Debug("context canceled, exiting archive loop")
 					return
 				}
 
@@ -333,14 +333,14 @@ func (s *boltStore) archive(ctx context.Context) {
 				})
 
 				if ctx.Err() != nil {
-					s.logger.Info("context canceled, exiting archive loop")
+					s.logger.Debug("context canceled, exiting archive loop")
 					return
 				}
 				s.db.Update(func(tx *bbolt.Tx) error {
 					eventsB := tx.Bucket(eventsBucket)
 					for _, k := range eventsToDelete {
 						if err := eventsB.Delete(k); err != nil {
-							s.logger.WithError(err).Error("failed to delete event")
+							s.logger.Error("failed to delete event", "error", err)
 							processSpan.RecordError(err)
 						}
 					}
@@ -348,13 +348,13 @@ func (s *boltStore) archive(ctx context.Context) {
 					childrenB := tx.Bucket(childrenBucket)
 					for _, k := range childrenToDelete {
 						if err := childrenB.Delete(k); err != nil {
-							s.logger.WithError(err).Error("failed to delete child")
+							s.logger.Error("failed to delete child", "error", err)
 							processSpan.RecordError(err)
 						}
 					}
 
 					if err := tx.Bucket(archiveBucket).Delete(event.archiveKey); err != nil {
-						s.logger.WithError(err).Error("failed to delete archive event")
+						s.logger.Error("failed to delete archive event", "error", err)
 						processSpan.RecordError(err)
 					}
 
@@ -369,12 +369,12 @@ func (s *boltStore) archive(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("context canceled, exiting archive loop")
+			s.logger.Debug("context canceled, exiting archive loop")
 			return
 		case <-s.archiveCh:
-			s.logger.Info("archive loop signaled to run")
+			s.logger.Debug("archive loop signaled to run")
 		case <-time.After(1 * time.Minute):
-			s.logger.Info("running event archive")
+			s.logger.Debug("running event archive")
 		}
 		runArchive(ctx)
 	}
@@ -408,15 +408,15 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 
 		cursor := b.Cursor()
 		for k, v := cursor.Seek(resourcePrefixKey); k != nil && bytes.HasPrefix(k, resourcePrefixKey); k, v = cursor.Next() {
-			logger := s.logger.WithField("key", string(k))
+			logger := s.logger.With("key", string(k))
 			var ae fsmv1.ActiveEvent
 			if err := proto.Unmarshal(v, &ae); err != nil {
-				logger.WithError(err).Error("failed to unmarshal active event")
+				logger.Error("failed to unmarshal active event", "error", err)
 				continue
 			}
 
 			if ae.EndEvent != nil {
-				logger.Info("active event has end event, skipping")
+				logger.Debug("active event has end event, skipping")
 				continue
 			}
 
@@ -429,7 +429,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 
 			var version ulid.ULID
 			if err := version.UnmarshalText(ae.StartVersion); err != nil {
-				logger.WithError(err).Error("failed to unmarshal version")
+				logger.Error("failed to unmarshal version", "error", err)
 				continue
 			}
 
@@ -437,7 +437,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 			// <resource_id>#<action>#<run_version>
 			eventPrefix := bytes.Join([][]byte{[]byte(ae.GetResourceId()), []byte(ae.GetAction()), ae.StartVersion, emptyPrefix}, keySeparator)
 			eventCursor := eventB.Cursor()
-			logger.WithField("start_event", string(ae.StartEvent)).WithField("event_prefix", string(eventPrefix)).Info("iterating events")
+			logger.Debug("iterating events", "start_event", string(ae.StartEvent), "event_prefix", string(eventPrefix))
 			var (
 				completedTransitions []string
 				response             []byte
@@ -447,7 +447,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 			for eventKey, eventValue := eventCursor.Seek(ae.StartEvent); eventKey != nil && bytes.HasPrefix(eventKey, eventPrefix); eventKey, eventValue = eventCursor.Next() {
 				var event fsmv1.StateEvent
 				if err := proto.Unmarshal(eventValue, &event); err != nil {
-					logger.WithError(err).Error("failed to unmarshal event")
+					logger.Error("failed to unmarshal event", "error", err)
 					continue
 				}
 
@@ -492,7 +492,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 		var parent ulid.ULID
 		if parentBytes := ae.active.GetOptions().GetParent(); parentBytes != nil {
 			if err := parent.UnmarshalText(parentBytes); err != nil {
-				s.logger.WithError(err).Error("failed to unmarshal parent")
+				s.logger.Error("failed to unmarshal parent", "error", err)
 			}
 		}
 		rs := runSnapshot{
@@ -575,7 +575,7 @@ func (s *boltStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		txn.Abort()
 		switch {
 		case err != nil:
-			s.logger.WithError(err).Error("failed to wait for FSM")
+			s.logger.Error("failed to wait for FSM", "error", err)
 			return err
 		case item == nil:
 			return historyOutcome(ctx, s, runVersion)
@@ -825,7 +825,7 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 					deleted++
 				}
 				if deleted > 0 {
-					s.logger.WithField("id", run.ID).Info("deleted completed runs")
+					s.logger.Debug("deleted completed runs", "id", run.ID)
 				}
 			}
 
@@ -850,7 +850,7 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 
 			activeResource := activeB.Get(aeEventKey)
 			if activeResource == nil {
-				s.logger.WithField("key", string(aeEventKey)).Warn("active event not found")
+				s.logger.Warn("active event not found", "key", string(aeEventKey))
 				return nil
 			}
 
@@ -887,7 +887,7 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 		}
 	})
 	if err != nil {
-		s.logger.WithError(err).Error("failed to append event")
+		s.logger.Error("failed to append event", "error", err)
 		return ulid.ULID{}, err
 	}
 	txn.Commit()
@@ -922,7 +922,7 @@ func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.H
 				}
 
 				if err := proto.Unmarshal(historyBytes, &historyEvent); err != nil {
-					s.logger.WithError(err).Error("failed to unmarshal history event")
+					s.logger.Error("failed to unmarshal history event", "error", err)
 					return err
 				}
 
@@ -932,7 +932,7 @@ func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.H
 
 		var ae fsmv1.ActiveEvent
 		if err := proto.Unmarshal(aeBytes, &ae); err != nil {
-			s.logger.WithError(err).Error("failed to unmarshal active event")
+			s.logger.Error("failed to unmarshal active event", "error", err)
 			return err
 		}
 		historyEvent.ActiveEvent = &ae
@@ -940,7 +940,7 @@ func (s *boltStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.H
 		var se fsmv1.StateEvent
 		err := proto.Unmarshal(tx.Bucket(eventsBucket).Get(ae.EndEvent), &se)
 		if err != nil {
-			s.logger.WithError(err).Error("failed to unmarshal end event")
+			s.logger.Error("failed to unmarshal end event", "error", err)
 			return err
 		}
 		historyEvent.LastEvent = &se
@@ -991,7 +991,7 @@ func (s *boltStore) Runs(ctx context.Context, resourceType, resourceID string) (
 
 			var version ulid.ULID
 			if err := version.UnmarshalText(parts[len(parts)-2]); err != nil {
-				s.logger.WithError(err).WithField("key", string(k)).Error("failed to parse run version from event key")
+				s.logger.Error("failed to parse run version from event key", "error", err, "key", string(k))
 				continue
 			}
 			if _, ok := seen[version]; ok {

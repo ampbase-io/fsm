@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -405,7 +405,7 @@ func TestArchiveLoopConsumesSignal(t *testing.T) {
 
 func TestArchiveDisabledStartsNoLoop(t *testing.T) {
 	bucket, url, _ := startFakeS3(t)
-	s, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
+	s, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
 		Bucket:          bucket,
 		Endpoint:        url,
 		Region:          "auto",

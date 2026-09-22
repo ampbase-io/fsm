@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 
@@ -16,7 +17,6 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -45,8 +45,11 @@ type Request[R, W any] struct {
 	Msg *R
 	W   Response[W]
 
-	logger logrus.FieldLogger
-	run    Run
+	// runLogger carries the run's attributes; logger adds the current transition's. Each
+	// transition derives from runLogger, never from the previous transition's logger, or the
+	// transition attributes would accumulate (slog's With appends).
+	runLogger, logger *slog.Logger
+	run               Run
 
 	// leaseEpoch is the epoch this node holds the run's lease at, surfaced to handlers through
 	// FencingToken. Zero under a single-process backend, which has no leases.
@@ -65,7 +68,8 @@ func (r *Request[_, _]) Any() any {
 	return r.Msg
 }
 
-func (r *Request[_, _]) Log() logrus.FieldLogger {
+// Log returns the run's logger, carrying the run's and the current transition's attributes.
+func (r *Request[_, _]) Log() *slog.Logger {
 	return r.logger
 }
 
@@ -88,15 +92,13 @@ func (r *Request[_, _]) FencingToken() FencingToken {
 	return FencingToken{RunVersion: r.run.StartVersion, LeaseEpoch: r.leaseEpoch}
 }
 
-func (r *Request[_, _]) withLogger(logger logrus.FieldLogger) {
+func (r *Request[_, _]) withLogger(logger *slog.Logger) {
+	r.runLogger = logger
 	r.logger = logger
 }
 
 func (r *Request[_, _]) withTransition(name string, version ulid.ULID) {
-	r.logger = r.logger.WithFields(logrus.Fields{
-		"transition":         name,
-		"transition_version": version,
-	})
+	r.logger = r.runLogger.With("transition", name, "transition_version", version)
 	r.run.TransitionVersion = version
 	r.run.CurrentState = name
 }
@@ -124,11 +126,11 @@ func NewRequest[R, W any](msg *R, w *W) *Request[R, W] {
 type AnyRequest interface {
 	Any() any
 
-	Log() logrus.FieldLogger
+	Log() *slog.Logger
 
 	Run() Run
 
-	withLogger(logrus.FieldLogger)
+	withLogger(*slog.Logger)
 
 	withTransition(string, ulid.ULID)
 
@@ -143,12 +145,13 @@ type AnyRequest interface {
 // objects provided by the caller.
 // Note: this should probably be deprecated once better test helpers for
 // executing a transition are introduced
-func MockRequest[R, W any](req *Request[R, W], logger logrus.FieldLogger, run Run) *Request[R, W] {
+func MockRequest[R, W any](req *Request[R, W], logger *slog.Logger, run Run) *Request[R, W] {
 	return &Request[R, W]{
-		Msg:    req.Msg,
-		W:      req.W,
-		logger: logger,
-		run:    run,
+		Msg:       req.Msg,
+		W:         req.W,
+		runLogger: logger,
+		logger:    logger,
+		run:       run,
 	}
 }
 
@@ -379,7 +382,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 	return func(ctx context.Context, resource *activeResource) error {
 		clearRun := func(run Run) {
 			if err := m.store.ForgetRun(run); err != nil {
-				m.logger.WithError(err).Error("failed to update fsm state store")
+				m.logger.Error("failed to update fsm state store", "error", err)
 			}
 		}
 
@@ -392,7 +395,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
 			if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
-				m.logger.WithError(err).Error("failed to unmarshal run_after")
+				m.logger.Error("failed to unmarshal run_after", "error", err)
 			}
 		}
 
@@ -400,7 +403,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
 			if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
-				m.logger.WithError(err).Error("failed to unmarshal parent")
+				m.logger.Error("failed to unmarshal parent", "error", err)
 			}
 		}
 
@@ -417,7 +420,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		var req R
 		if err := f.rCodec.Unmarshal(resource.active.Resource, &req); err != nil {
-			m.logger.WithError(err).Error("failed to unmarshal resource, unable to resume")
+			m.logger.Error("failed to unmarshal resource, unable to resume", "error", err)
 			clearRun(r)
 			return err
 		}
@@ -425,12 +428,12 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		var w W
 		if resource.response != nil {
 			if err := f.wCodec.Unmarshal(resource.response, &w); err != nil {
-				m.logger.WithField("response_bytes", string(resource.response)).WithError(err).Error("failed to unmarshal response, unable to resume")
+				m.logger.Error("failed to unmarshal response, unable to resume", "error", err, "response_bytes", string(resource.response))
 				clearRun(r)
 				return err
 			}
 		}
-		m.logger.WithField("completed", resource.completedTransitions).Debug("pruning completed transitions")
+		m.logger.Debug("pruning completed transitions", "completed", resource.completedTransitions)
 
 		remainingTransitions := immutable.NewList[*transition]()
 		for _, name := range resource.active.Transitions {
@@ -441,7 +444,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 					name:     name,
 				}]
 				if !ok {
-					m.logger.Warn("transition did not exist")
+					m.logger.Warn("transition did not exist", "transition", name)
 					transition = newTransition(name, noOp, TransitionConfig[R, W]{
 						interceptors: []TransitionInterceptorFunc{
 							skipper(),
@@ -523,15 +526,11 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 			opt(&startOpt)
 		}
 
-		logger := m.logger.WithFields(logrus.Fields{
-			"run_id":    id,
-			"run_type":  f.typeName,
-			"run_alias": f.alias,
-		})
+		logger := m.logger.With("run_id", id, "run_type", f.typeName, "run_alias", f.alias)
 
 		resource, err := f.rCodec.Marshal(request.Msg)
 		if err != nil {
-			logger.WithError(err).Error("failed to marshal request")
+			logger.Error("failed to marshal request", "error", err)
 			return ulid.ULID{}, fmt.Errorf("failed to marshal request: %w", err)
 		}
 
@@ -544,7 +543,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		// keep executing locally (matching runnerFromOpts precedence).
 		if _, ok := m.store.(runClaimer); ok && admissionControlled(&startOpt) {
 			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
-				logger.WithError(err).Error("failed to append start event")
+				logger.Error("failed to append start event", "error", err)
 				return ulid.ULID{}, err
 			}
 			m.nudgeClaim()
@@ -568,7 +567,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, false)
 		if err != nil {
-			m.logger.WithError(err).Error("failed to append start event")
+			logger.Error("failed to append start event", "error", err)
 			return ulid.ULID{}, err
 		}
 		request.run = startedRun
@@ -695,12 +694,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 	ctx, span := m.tracer.Start(ctx, fmt.Sprintf("%s.%s", alias, action), startOpts...)
 
-	logger := m.logger.WithFields(logrus.Fields{
-		"run_id":      id,
-		"run_type":    typeName,
-		"run_alias":   alias,
-		"run_version": runVersion.String(),
-	})
+	logger := m.logger.With("run_id", id, "run_type", typeName, "run_alias", alias, "run_version", runVersion.String())
 
 	runFn := func() {
 		// What stops the run and what halts its transitions are different events: runCtx ends on
@@ -761,17 +755,14 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			idx, transition := iter.Next()
 			transitionName := transition.name
 			transitionVersion := ulid.Make()
-			logger = logger.WithFields(logrus.Fields{
-				"transition":         transitionName,
-				"transition_version": transitionVersion,
-			})
+			transitionLogger := logger.With("transition", transitionName, "transition_version", transitionVersion)
 			request.withTransition(transitionName, transitionVersion)
 
-			if stopped(runCtx, logger) {
+			if stopped(runCtx, transitionLogger) {
 				return
 			}
 
-			logger.Info("running transition")
+			transitionLogger.Debug("running transition")
 
 			transitionCtx := ctx
 			if idx == finisher {
@@ -779,7 +770,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			}
 			_, err := transition.impl(transitionCtx, request)
 
-			if stopped(runCtx, logger) {
+			if stopped(runCtx, transitionLogger) {
 				return
 			}
 
@@ -795,7 +786,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			if errors.Is(err, ErrLeaseLost) {
 				// Halt without finalizers or FINISH: this node may no longer write to the run,
 				// and the new owner runs them at its own finish.
-				logger.Warn("run lease lost, halting")
+				transitionLogger.Warn("run lease lost, halting")
 				return
 			}
 
@@ -820,7 +811,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				localActionCounterVec.WithLabelValues("unrecoverable", kind).Inc()
 				localActionDurationVec.WithLabelValues("unrecoverable", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", kind))
-				logger.WithError(err).Error("reached unrecoverable error, canceling FSM")
+				transitionLogger.Error("reached unrecoverable error, canceling FSM", "error", err)
 			case isHandoff:
 				localActionCounterVec.WithLabelValues("fsm_handoff_error", "").Inc()
 				localActionDurationVec.WithLabelValues("fsm_handoff_error", "").Observe(time.Since(actionStartTime).Seconds())
@@ -857,12 +848,12 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 // stopped reports whether the run was ended short of an outcome by a shutdown or a lost lease.
 // Nothing more may be recorded; the run resumes where it left off.
-func stopped(runCtx context.Context, logger logrus.FieldLogger) bool {
+func stopped(runCtx context.Context, logger *slog.Logger) bool {
 	cause := context.Cause(runCtx)
 	if cause == nil {
 		return false
 	}
-	logger.WithError(cause).Info("run stopped")
+	logger.Info("run stopped", "error", cause)
 	return true
 }
 

@@ -155,7 +155,7 @@ func (s *objectStore) extendLeases(ctx context.Context) {
 		case errors.Is(err, context.Canceled):
 			// Shutdown mid-pass; Close releases the leases.
 		default:
-			s.logger.WithError(err).WithField("run_version", version.String()).Error("failed to extend lease")
+			s.logger.Error("failed to extend lease", "error", err, "run_version", version.String())
 		}
 	})
 
@@ -312,7 +312,7 @@ func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry) (
 	case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
 		return claimedRun{}, false
 	case err != nil:
-		s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim run")
+		s.logger.Error("failed to claim run", "error", err, "run_version", e.version.String())
 		return claimedRun{}, false
 	}
 
@@ -333,7 +333,7 @@ func (s *objectStore) claimQueued(ctx context.Context, key fsmKey, e lockEntry, 
 	switch admitted, err := s.admitQueued(ctx, queue, e.version); {
 	case err != nil:
 		s.dropLease(e.version)
-		s.logger.WithError(err).WithField("run_version", e.version.String()).WithField("queue", queue).Error("failed to admit queued run")
+		s.logger.Error("failed to admit queued run", "error", err, "run_version", e.version.String(), "queue", queue)
 		return claimedRun{}, false
 	case !admitted:
 		s.dropLease(e.version)
@@ -350,7 +350,7 @@ func (s *objectStore) claimQueued(ctx context.Context, key fsmKey, e lockEntry, 
 		s.releaseQueued(releaseCtx, queue, e.version)
 		cancel()
 		if !errors.Is(err, errClaimLost) && !errors.Is(err, ErrFsmNotFound) {
-			s.logger.WithError(err).WithField("run_version", e.version.String()).Error("failed to claim queued run")
+			s.logger.Error("failed to claim queued run", "error", err, "run_version", e.version.String())
 		}
 		return claimedRun{}, false
 	}
@@ -373,7 +373,7 @@ func (s *objectStore) releaseLease(ctx context.Context, version ulid.ULID, epoch
 		return nil
 	})
 	if err != nil && !errors.Is(err, ErrLeaseLost) && !errors.Is(err, ErrFsmNotFound) {
-		s.logger.WithError(err).WithField("run_version", version.String()).Error("failed to release lease")
+		s.logger.Error("failed to release lease", "error", err, "run_version", version.String())
 	}
 
 	// Free the queue slot alongside the lease so a peer re-admits immediately rather than waiting
@@ -381,7 +381,7 @@ func (s *objectStore) releaseLease(ctx context.Context, version ulid.ULID, epoch
 	// (ForgetRun) paths, where the released job's heartbeat is otherwise still fresh.
 	if queue != "" {
 		if rerr := s.releaseQueued(ctx, queue, version); rerr != nil {
-			s.logger.WithError(rerr).WithField("run_version", version.String()).WithField("queue", queue).Error("failed to release queue slot")
+			s.logger.Error("failed to release queue slot", "error", rerr, "run_version", version.String(), "queue", queue)
 		}
 	}
 }

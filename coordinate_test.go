@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,7 +11,6 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 func TestWithJitter(t *testing.T) {
@@ -94,7 +94,7 @@ func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
 	bus := newTestBus()
 	lc := &wakeCoordinator{}
 	m := &Manager{
-		logger:  logrus.New(),
+		logger:  slog.Default(),
 		bus:     bus,
 		done:    make(chan struct{}),
 		fsms:    map[fsmKey]*fsm{},
@@ -161,7 +161,7 @@ func TestClaimWakeRearmsAfterFiring(t *testing.T) {
 // is gone are canceled, with cause ErrLeaseLost.
 func TestCancelUnleased(t *testing.T) {
 	m := &Manager{
-		logger:  logrus.New(),
+		logger:  slog.Default(),
 		running: map[ulid.ULID]runHandle{},
 	}
 
@@ -217,7 +217,7 @@ func TestSweepCancellationsRoutesByExecution(t *testing.T) {
 	defer execCancel(nil)
 
 	m := &Manager{
-		logger:  logrus.New(),
+		logger:  slog.Default(),
 		running: map[ulid.ULID]runHandle{executing: {cancel: execCancel}},
 	}
 	stub := &cancelStub{pending: map[ulid.ULID]error{
@@ -244,7 +244,7 @@ func TestSweepCancellationsRoutesByExecution(t *testing.T) {
 func TestSweepCancellationsContinuesPastFailure(t *testing.T) {
 	first, second := ulid.Make(), ulid.Make()
 	m := &Manager{
-		logger:  logrus.New(),
+		logger:  slog.Default(),
 		running: map[ulid.ULID]runHandle{}, // neither is executing → both go through cancelOwnedRun
 	}
 	stub := &cancelStub{

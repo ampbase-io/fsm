@@ -107,7 +107,7 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 	// failure the wait's poll surfaced, not the run's result. Report it retryable and sanitized so
 	// a caller neither records the run as failed nor receives internal storage detail.
 	if !isRunOutcome(waitErr) {
-		s.m.logger.WithError(waitErr).WithField("run_version", version.String()).Warn("wait poll failed")
+		s.m.logger.Warn("wait poll failed", "error", waitErr, "run_version", version.String())
 		return nil, connect.NewError(connect.CodeUnavailable, errors.New("run status temporarily unavailable"))
 	}
 
