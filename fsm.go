@@ -226,6 +226,10 @@ type fsm struct {
 	// transitions is used to lookup a transition by key in order to execute it.
 	registeredTransitions map[transitionKey]*transition
 
+	// strictResume refuses to resume a run whose remaining recorded transitions include one this
+	// definition lacks, instead of skipping it as a completed no-op.
+	strictResume bool
+
 	// resumeOne dispatches a single persisted resource through the typed resume path. It is
 	// registered at End() so the claim loop can resume runs of this FSM without knowing its
 	// R/W types.
@@ -251,6 +255,30 @@ func (f *fsm) startEvent(id string) *fsmv1.StateEvent {
 		Action:       f.action,
 		State:        f.startState,
 	}
+}
+
+// unknownTransition returns the first recorded transition still to run that this definition does
+// not register, or "" when every remaining one is known. Completed transitions are not checked:
+// a definition that dropped an already-finished step can still drive the run to its end.
+func (f *fsm) unknownTransition(recorded, completed []string) string {
+	for _, name := range recorded {
+		if slices.Contains(completed, name) {
+			continue
+		}
+		if _, ok := f.registeredTransitions[transitionKey{action: f.action, typeName: f.typeName, name: name}]; !ok {
+			return name
+		}
+	}
+	return ""
+}
+
+// refusedTransition returns the remaining recorded transition this definition refuses to resume
+// a run over, or "" when it may drive the run: a lenient definition refuses nothing.
+func (f *fsm) refusedTransition(recorded, completed []string) string {
+	if !f.strictResume {
+		return ""
+	}
+	return f.unknownTransition(recorded, completed)
 }
 
 func (f *fsm) transitionSlice() []string {
@@ -434,6 +462,14 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 			}
 		}
 		m.logger.DebugContext(ctx, "pruning completed transitions", "completed", resource.completedTransitions)
+
+		// A lease-coordinated backend refuses a strict run before claiming it; here the check is
+		// the mechanism for the single-process backend and a guard for the rest.
+		if unknown := f.refusedTransition(resource.active.Transitions, resource.completedTransitions); unknown != "" {
+			m.logger.WarnContext(ctx, "refusing to resume run: transition not defined", slog.Group("fsm", "version", resource.version.String(), "state", unknown))
+			clearRun(r)
+			return fmt.Errorf("run %s at %s: %w", resource.version, unknown, ErrUnknownTransition)
+		}
 
 		remainingTransitions := immutable.NewList[*transition]()
 		for _, name := range resource.active.Transitions {

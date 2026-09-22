@@ -50,6 +50,10 @@ backend's distributed-execution design is the active work.
   S3 client, key helpers, and conditional writes.
 - `coordinate.go` — the lease-coordinated background loop (`leaseCoordinator`): heartbeat
   (extend leases, sweep for lost leases and cancels), jittered claim pass, event-driven wakeups.
+  `resumeCheck` is the claim filter's hook into the registry: `fsm.strictResume` refuses a run
+  with an undefined remaining transition in `claimEntry`, before the lease CAS (refusing after
+  the claim would churn claim → release every pass); `resumeOne` repeats the check as BoltDB's
+  mechanism and the object backend's guard.
 - `eventbus.go` — `EventPublisher`/`EventSubscriber`/`EventBus`, the protobuf `fsmv1.RunEvent`
   payload, run-addressed subjects, no-op default.
 - `manager.go` / `fsm.go` / `builder.go` / `runner.go` / `interceptor.go` — the `Manager` API,

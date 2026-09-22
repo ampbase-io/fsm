@@ -184,6 +184,8 @@ In the distributed topology the Phase 4 claim loop becomes the **primary work-di
 
 A broadcast wakeup stampedes by construction: every idle worker hears `fsm.run.pending` and races the claim CAS. That is *safe* — the lease epoch CAS picks exactly one winner — but it costs N lock-scans per wakeup. Workers should therefore apply a small random delay before scanning on a wakeup (jitter), which composes naturally with the claim tick they already run; the winner is simply whoever wakes first.
 
+A worker claims only runs its registered definitions can drive. Under `StrictResume`, a run whose remaining recorded transitions include one the worker's definition lacks is refused *before* the claim CAS — from the manifest the lock scan already read — so it stays unowned for a worker that has the transition. Refusing after the claim would release and re-claim on every pass; refusing before it keeps "the claimant owns the run" intact.
+
 ## Dependency invariant
 
 Object storage remains the only required dependency of the library. The RPC ingress uses the already-present Connect module. The event bus is an injected interface pair (EventPublisher/EventSubscriber) whose default is a no-op. No message broker, queue, or database is introduced. Any pub/sub system a deployment wishes to use for low-latency notification is supplied at the edge as an `EventBus` implementation, exactly as the storage endpoint is supplied as configuration.

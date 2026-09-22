@@ -50,6 +50,26 @@ if err := m.Wait(ctx, version); err != nil {
 Request/response types are persisted with a protobuf codec when they implement `proto.Message`,
 with a custom codec when they implement `fsm.Codec`, and with JSON otherwise.
 
+### Definition drift
+
+A run records its transition list at start. If the definition changes while the run is in
+flight and a resuming node's definition lacks a transition the run still has to make, the
+default is lenient: that transition is recorded complete and skipped, with a warning. A
+definition registered with `StrictResume()` refuses such a run instead:
+
+```go
+start, resume, err := m.Register[CreateReq, CreateResp]("create").StrictResume().
+    Start("created", ...).
+    End("done").
+    Build(ctx)
+```
+
+On the object storage backend the refusal happens before the lease is taken, so the run stays
+unowned for a node whose definition has the transition; the refusing node logs a warning and
+counts `fsm.resume.refused`. On BoltDB `resume` returns `ErrUnknownTransition`. Only transitions
+still to run are checked, so a step every in-flight run has already completed can be dropped
+under either mode.
+
 ## Cancellation
 
 A transition's context ends for one of three reasons, and `context.Cause(ctx)` names which:
@@ -173,6 +193,7 @@ come from the global tracer provider.
 | `fsm.lease.renewals` | counter | `fsm.lease.result` |
 | `fsm.queue.depth` | gauge | `fsm.queue` |
 | `fsm.queue.commits` | counter | `fsm.queue` |
+| `fsm.resume.refused` | counter | `fsm.action`, `fsm.state` |
 
 A transition can run for hours, so the duration histograms carry explicit bucket advice up to
 4 h for an SDK with no View. The recommended configuration is a base-2 exponential histogram,

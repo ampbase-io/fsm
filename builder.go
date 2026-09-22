@@ -181,6 +181,18 @@ func WithFinalizers[R, W any](f ...Finalizer[R, W]) EndOption[R, W] {
 
 type Transition[R, W any] func(context.Context, *Request[R, W]) (*Response[W], error)
 
+// StrictResume makes this definition refuse a run it cannot drive to the end. By default a
+// resumed run whose recorded transitions include one this definition lacks — a definition that
+// changed while the run was in flight — has that transition recorded complete and skipped. Under
+// StrictResume the run is refused instead: on the object storage backend it is left unclaimed
+// for a node whose definition has the transition, and on BoltDB Resume returns
+// ErrUnknownTransition. Only transitions still to run are checked, so dropping a step every
+// in-flight run has already completed stays safe.
+func (s *fsmStart[R, W]) StrictResume() *fsmStart[R, W] {
+	s.f.strictResume = true
+	return s
+}
+
 // Starts sets the initial state of the FSM and applies any options to the transition.
 func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOpts ...StartOption[R, W]) *fsmTransition[R, W] {
 	s.f.startState = name

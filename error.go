@@ -18,6 +18,11 @@ var (
 	// run records nothing and resumes where it left off on the next start or claim.
 	ErrShutdown = errors.New("manager shutting down")
 
+	// ErrUnknownTransition reports that a run under StrictResume recorded a transition its
+	// registered definition does not have. The run is refused, not skipped: it stays unowned for
+	// a node whose definition includes the transition.
+	ErrUnknownTransition = errors.New("run recorded a transition the FSM does not define")
+
 	// errFSMNotRegistered reports that no FSM matches the (type, action) an opaque Start named.
 	errFSMNotRegistered = errors.New("no FSM registered")
 

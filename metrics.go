@@ -45,6 +45,7 @@ type instruments struct {
 	leaseRenewals   metric.Int64Counter
 	depth           metric.Int64Gauge
 	queueCommits    metric.Int64Counter
+	resumeRefusals  metric.Int64Counter
 }
 
 func newInstruments(meter metric.Meter) (*instruments, error) {
@@ -72,6 +73,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		leaseRenewals:      counter("fsm.lease.renewals", "{renewal}", "Lease renewal outcomes, by result."),
 		depth:              depth,
 		queueCommits:       counter("fsm.queue.commits", "{commit}", "Successful queue-roster CAS writes, by queue."),
+		resumeRefusals:     counter("fsm.resume.refused", "{run}", "Claims refused under StrictResume, by action and the undefined transition."),
 	}
 	return i, errors.Join(errs...)
 }
@@ -120,6 +122,10 @@ func (i *instruments) queueDepth(ctx context.Context, queue string, n int) {
 
 func (i *instruments) queueCommit(ctx context.Context, queue string) {
 	i.queueCommits.Add(ctx, 1, metric.WithAttributes(attrQueue.String(queue)))
+}
+
+func (i *instruments) resumeRefused(ctx context.Context, action, state string) {
+	i.resumeRefusals.Add(ctx, 1, metric.WithAttributes(attrAction.String(action), attrState.String(state)))
 }
 
 // storageOutcome classifies a raw object storage error into the operation histogram's outcome

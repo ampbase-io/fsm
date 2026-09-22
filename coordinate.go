@@ -28,9 +28,26 @@ type leaseCoordinator interface {
 // resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
 // execution-placement sites (an unowned Start the loop picks up, rather than local execution).
 type runClaimer interface {
-	// claimRuns claims every eligible run of the given FSMs, each paired with the key of the
-	// FSM that will resume it. Keys, not fsms: a backend selects runs but never executes one.
-	claimRuns(ctx context.Context, keys []fsmKey) ([]claimedRun, error)
+	// claimRuns claims every eligible run of the given FSMs that resumable admits, each paired
+	// with the key of the FSM that will resume it. Keys, not fsms: a backend selects runs but
+	// never executes one.
+	claimRuns(ctx context.Context, keys []fsmKey, resumable resumeCheck) ([]claimedRun, error)
+}
+
+// resumeCheck returns the recorded transition over which the FSM registered under key refuses
+// to resume a run, or "" when it may drive the run. A claimer consults it before taking a run's
+// lease, so a definition that cannot finish the run leaves it for one that can rather than
+// claiming and releasing it on every pass.
+type resumeCheck func(key fsmKey, recorded, completed []string) string
+
+// refusedTransition is the Manager's resumeCheck: it defers to the registered definition. An
+// unregistered key refuses nothing, so the claim's existing "unregistered FSM" path reports it.
+func (m *Manager) refusedTransition(key fsmKey, recorded, completed []string) string {
+	f, ok := m.registeredFSM(key)
+	if !ok {
+		return ""
+	}
+	return f.refusedTransition(recorded, completed)
 }
 
 // fencer is a backend that fences runs by lease epoch.
@@ -73,7 +90,7 @@ func (m *Manager) resumable(ctx context.Context, f *fsm) ([]*activeResource, err
 		return m.store.Active(ctx, f.key())
 	}
 
-	claimed, err := claimer.claimRuns(ctx, []fsmKey{f.key()})
+	claimed, err := claimer.claimRuns(ctx, []fsmKey{f.key()}, m.refusedTransition)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +248,7 @@ func (m *Manager) runningVersions() []ulid.ULID {
 
 // claimPass claims and dispatches eligible runs across every registered FSM.
 func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
-	claimed, err := claimer.claimRuns(ctx, m.registeredKeys())
+	claimed, err := claimer.claimRuns(ctx, m.registeredKeys(), m.refusedTransition)
 	if err != nil {
 		m.logger.ErrorContext(ctx, "claim pass failed", "error", err)
 		return

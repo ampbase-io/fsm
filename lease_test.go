@@ -26,6 +26,9 @@ func newLeaseHarness(t *testing.T) *leaseHarness {
 	return &leaseHarness{t: t, s3: fake.NewS3(t)}
 }
 
+// claimAny is the resumeCheck for tests with nothing to refuse.
+func claimAny(fsmKey, []string, []string) string { return "" }
+
 // owns reports whether the store currently holds the run's lease. The production owns method was
 // folded into ownedEpoch; tests keep this thin wrapper for readability.
 func owns(s *objectStore, version ulid.ULID) bool {
@@ -177,7 +180,7 @@ func TestFencedAppendAfterSteal(t *testing.T) {
 	run := startRun(t, a, "steal-1")
 	time.Sleep(120 * time.Millisecond)
 
-	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected node-b to claim the expired run, got %v (err=%v)", claimed, err)
 	}
@@ -232,7 +235,7 @@ func TestExtendLeases(t *testing.T) {
 
 	// A steal discovered during the heartbeat drops the lease from the local set.
 	time.Sleep(120 * time.Millisecond)
-	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 1 {
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny); err != nil || len(claimed) != 1 {
 		t.Fatalf("expected node-b to claim the expired run, got %v (err=%v)", claimed, err)
 	}
 	a.extendLeases(ctx)
@@ -249,7 +252,7 @@ func TestClaimEligibility(t *testing.T) {
 	a := h.store("node-a", 10*time.Second)
 	live := startRun(t, a, "held-1")
 	b := h.store("node-b", 10*time.Second)
-	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 0 {
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny); err != nil || len(claimed) != 0 {
 		t.Fatalf("expected no claims against a live lease, got %v (err=%v)", claimed, err)
 	}
 
@@ -257,12 +260,12 @@ func TestClaimEligibility(t *testing.T) {
 	c := h.store("node-c", 50*time.Millisecond)
 	startRun(t, c, "self-1")
 	time.Sleep(120 * time.Millisecond)
-	if claimed, err := c.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 0 {
+	if claimed, err := c.claimRuns(ctx, []fsmKey{deployKey}, claimAny); err != nil || len(claimed) != 0 {
 		t.Fatalf("expected no self-claims of tracked runs, got %v (err=%v)", claimed, err)
 	}
 
 	// The expired run is claimable by a peer; the live one stays with its owner.
-	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected exactly the expired run claimed, got %v (err=%v)", claimed, err)
 	}
@@ -306,7 +309,7 @@ func TestUnownedStartClaimableByPeer(t *testing.T) {
 	}
 
 	worker := h.store("node-worker", 10*time.Second)
-	claimed, err := worker.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := worker.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the peer to claim the unowned run immediately, got %v (err=%v)", claimed, err)
 	}
@@ -331,7 +334,7 @@ func TestClaimCarriesResumeState(t *testing.T) {
 	}
 	time.Sleep(120 * time.Millisecond)
 
-	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected one claimed run, got %v (err=%v)", claimed, err)
 	}
@@ -357,7 +360,7 @@ func TestClaimRace(t *testing.T) {
 	results := make(chan int, 2)
 	for _, s := range []*objectStore{b, c} {
 		go func() {
-			claimed, err := s.claimRuns(ctx, []fsmKey{deployKey})
+			claimed, err := s.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 			if err != nil {
 				t.Errorf("claimRuns failed: %v", err)
 			}
@@ -383,7 +386,7 @@ func TestClaimRaceSameStore(t *testing.T) {
 	results := make(chan int, 2)
 	for range 2 {
 		go func() {
-			claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+			claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 			if err != nil {
 				t.Errorf("claimRuns failed: %v", err)
 			}
@@ -412,7 +415,7 @@ func TestClaimSurvivesLostResponse(t *testing.T) {
 
 	b := h.store("node-b", 10*time.Second)
 	h.s3.LostPuts = 1 // the next conditional PUT is b's claim CAS
-	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the claim to survive a lost response, got %v (err=%v)", claimed, err)
 	}
@@ -447,7 +450,7 @@ func TestForgetRunReleasesLease(t *testing.T) {
 	if owner := mustManifest(t, b, run.StartVersion).GetOwnerNode(); owner != "" {
 		t.Fatalf("expected ownership released, still owned by %q", owner)
 	}
-	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 1 {
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny); err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the released run claimable, got %v (err=%v)", claimed, err)
 	}
 }
@@ -610,7 +613,7 @@ func TestZombieNodeFencedAfterRestart(t *testing.T) {
 	// A restarted incarnation of the same node finds its own stale lease and re-claims it;
 	// the epoch bump fences the old incarnation even though the NodeID matches.
 	a2 := h.store("node-a", 10*time.Second)
-	claimed, err := a2.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := a2.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the restarted node to reclaim its stale self-lease, got %v (err=%v)", claimed, err)
 	}
@@ -634,7 +637,7 @@ func TestFinishDropsLease(t *testing.T) {
 	if _, tracked := a.ownedEpoch(run.StartVersion); tracked {
 		t.Fatal("expected the lease dropped at finish")
 	}
-	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 0 {
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny); err != nil || len(claimed) != 0 {
 		t.Fatalf("expected nothing claimable after finish, got %v (err=%v)", claimed, err)
 	}
 }
@@ -655,7 +658,7 @@ func TestCloseReleasesLeases(t *testing.T) {
 	}
 
 	// Peers claim immediately instead of waiting out the lease timeout.
-	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
+	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}, claimAny)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the released run claimable, got %v (err=%v)", claimed, err)
 	}
