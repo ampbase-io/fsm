@@ -457,6 +457,7 @@ type ObjectStorageConfig struct {
     Endpoint string // e.g., "https://fly.storage.tigris.dev"
     Region   string // e.g., "auto" for Tigris
     Prefix   string // Key namespace prefix, default "fsm/"
+    Client   *s3.Client // Optional: a consumer-built client used as is; Endpoint/Region ignored
 
     LeaseTimeout    time.Duration // Default 30s
     HeartbeatPeriod time.Duration // Default 10s

@@ -16,6 +16,8 @@ import (
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -221,6 +223,36 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 func TestObjectStoreRequiresBucket(t *testing.T) {
 	if _, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{}, "node-test", nil, nil); err == nil {
 		t.Fatal("expected error for missing bucket")
+	}
+}
+
+// TestObjectStoreUsesInjectedClient proves a consumer's client is used as is: the store reaches
+// the fake through it with no Endpoint configured, so a client carrying the consumer's retryer
+// and middleware carries every operation.
+func TestObjectStoreUsesInjectedClient(t *testing.T) {
+	ctx := context.Background()
+	bucket, url, fake := startFakeS3(t)
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion("auto"))
+	if err != nil {
+		t.Fatalf("failed to load AWS config: %v", err)
+	}
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = &url
+		o.UsePathStyle = true
+	})
+
+	store, err := newObjectStore(ctx, slog.Default(), testInstruments(t), &ObjectStorageConfig{Bucket: bucket, Client: client}, "node-test", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create object store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	if err := store.putIfAbsent(ctx, "fsm/injected/key", []byte("a")); err != nil {
+		t.Fatalf("write through the injected client failed: %v", err)
+	}
+	if fake.puts == 0 {
+		t.Fatal("the write did not reach the fake through the injected client")
 	}
 }
 
