@@ -101,6 +101,20 @@ m, err := fsm.New(fsm.Config{
 })
 ```
 
+A consumer that already operates an S3 client — with its own credentials, retryer, timeouts or
+middleware — passes it as `ObjectStorageConfig.Client` and the library uses it as is; `Endpoint`
+and `Region` are then the client's. The client must address the bucket path-style.
+
+### Event bus on a shared NATS hub
+
+The library names its subjects `fsm.run.*`. On a hub whose grants are subject-scoped, give the
+NATS adapter the tenant's prefix and every subject travels under it — `org.acme.fsm.run.pending`
+— in both directions, so one tenant's managers never hear another's signals:
+
+```go
+bus := natsbus.New(nc, logger, natsbus.WithSubjectPrefix("org.acme"))
+```
+
 ## Parent and child runs
 
 `fsm.WithParent(version)` records a run as a child of another, so `Children` and

@@ -95,6 +95,8 @@ Messages are addressed by **subject keyed on the run**, not by node address (ill
 
 Because addressing is by subject, **no component ever needs another node's network address**: not the manifest, not object storage, not the library configuration. Network topology stays out of domain objects entirely.
 
+The subjects above are the library's logical names; what travels on the wire is the adapter's concern. On a shared hub whose grants are subject-scoped (`org.<id>.>`), the NATS adapter's `WithSubjectPrefix` moves every subject under the tenant's prefix in both directions, so a tenant's grant covers its traffic and no tenant hears another's `pending` or `cancel` broadcasts. The core is unaware; a wider grant would not do, since the subjects carry no tenant.
+
 ### Invariants
 
 These are load-bearing; the event system is easy to get subtly wrong, and the invariants are what preserve reliability and the object-storage-only guarantee.

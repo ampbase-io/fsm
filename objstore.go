@@ -32,6 +32,12 @@ type ObjectStorageConfig struct {
 	Region   string // e.g., "auto" for Tigris
 	Prefix   string // Key namespace prefix, default "fsm/"
 
+	// Client, when set, is the S3 client used as is — its endpoint, credentials, retryer and
+	// middleware are the consumer's, and Endpoint and Region above are ignored. It must address
+	// the bucket path-style. When nil, one is built from Endpoint and Region with the SDK's
+	// default credential chain and retryer.
+	Client *s3.Client
+
 	LeaseTimeout    time.Duration // Default 30s
 	HeartbeatPeriod time.Duration // Default 10s
 
@@ -55,6 +61,25 @@ type ObjectStorageConfig struct {
 
 	// ArchiveInterval is how often the archive pass runs, jittered per node. Default 10m.
 	ArchiveInterval time.Duration // Default 10m
+}
+
+// client returns the injected S3 client, or builds one from the endpoint and region: the AWS SDK's
+// default credential chain, path-style addressing, and the SDK's default retryer.
+func (c *ObjectStorageConfig) client(ctx context.Context) (*s3.Client, error) {
+	if c.Client != nil {
+		return c.Client, nil
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(c.Region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if c.Endpoint != "" {
+			o.BaseEndpoint = &c.Endpoint
+		}
+		o.UsePathStyle = true
+	}), nil
 }
 
 func (c *ObjectStorageConfig) prefix() string {
@@ -160,19 +185,10 @@ func newObjectStore(ctx context.Context, logger *slog.Logger, instruments *instr
 		nodeID = host + "-" + ulid.Make().String()
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(cfg.Region),
-	)
+	client, err := cfg.client(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+		return nil, err
 	}
-
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		if cfg.Endpoint != "" {
-			o.BaseEndpoint = &cfg.Endpoint
-		}
-		o.UsePathStyle = true
-	})
 
 	s := &objectStore{
 		logger:      logger.With("node_id", nodeID),
