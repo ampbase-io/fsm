@@ -64,12 +64,12 @@ var durationView = sdkmetric.NewView(
 	sdkmetric.Stream{Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{MaxSize: 160, MaxScale: 20}},
 )
 
-// metricsReader injects a manual-read SDK provider into the factory's managers and returns the
+// metricsReader injects a manual-read SDK provider into the backend's managers and returns the
 // reader to collect from.
-func metricsReader(f *managerFactory) *sdkmetric.ManualReader {
+func metricsReader(b *backend) *sdkmetric.ManualReader {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithView(durationView))
-	f.configureManager = func(cfg *Config) { cfg.MeterProvider = provider }
+	b.configureManager = func(cfg *Config) { cfg.MeterProvider = provider }
 	return reader
 }
 
@@ -138,10 +138,10 @@ func histogramCount(t *testing.T, metrics map[string]metricdata.Metrics, name st
 // abort — with the duration histograms counting alongside under the exponential view.
 func TestRunMetrics(t *testing.T) { runBackends(t, testRunMetrics) }
 
-func testRunMetrics(t *testing.T, f *managerFactory) {
+func testRunMetrics(t *testing.T, b *backend) {
 	ctx := context.Background()
-	reader := metricsReader(f)
-	m, _ := f.newManager(nil)
+	reader := metricsReader(b)
+	m, _ := b.newManager(nil)
 
 	pass := func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 		return nil, nil
@@ -204,15 +204,15 @@ func testRunMetrics(t *testing.T, f *managerFactory) {
 // TestObjectStorageMetrics is the smoke test for the object-backend instrumentation: driving one
 // run past a heartbeat must record storage operations and lease extensions.
 func TestObjectStorageMetrics(t *testing.T) {
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = 200 * time.Millisecond
 		cfg.HeartbeatPeriod = 20 * time.Millisecond
 		cfg.ClaimInterval = time.Hour // suppress the periodic claim so only the heartbeat extends
 	})
 	ctx := context.Background()
-	reader := metricsReader(f)
+	reader := metricsReader(b)
 
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 1)
 		block   = make(chan struct{})

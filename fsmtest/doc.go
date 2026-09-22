@@ -1,15 +1,15 @@
 // Package fsmtest provides fixtures for testing code built on fsm against both storage backends
-// without external services: a manager factory over a temp BoltDB or an in-memory S3, helpers
+// without external services: a Backend over a temp BoltDB or an in-memory S3, helpers
 // for the lease timings that make a takeover deterministic, and a polling assertion.
 //
 // A restart-and-resume scenario runs the same way on either backend:
 //
 //	func TestDeployResumes(t *testing.T) {
-//		fsmtest.RunBackends(t, func(t *testing.T, f *fsmtest.Factory) {
-//			m1, stop1 := f.NewManager(nil)
+//		fsmtest.RunBackends(t, func(t *testing.T, b *fsmtest.Backend) {
+//			m1, stop1 := b.NewManager(nil)
 //			// register, start a run, let it block ...
 //			stop1()
-//			m2, _ := f.NewManager(nil)
+//			m2, _ := b.NewManager(nil)
 //			// register again, Resume, Wait ...
 //		})
 //	}

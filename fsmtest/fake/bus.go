@@ -23,10 +23,13 @@ type Event struct {
 	Event   *fsmv1.RunEvent
 }
 
+// NewBus returns an empty bus with no subscribers.
 func NewBus() *Bus {
 	return &Bus{subs: map[string]map[int]func(*fsmv1.RunEvent){}}
 }
 
+// Publish records the event and delivers it to the subject's current subscribers, each on its
+// own goroutine.
 func (b *Bus) Publish(subject string, e *fsmv1.RunEvent) {
 	b.mu.Lock()
 	b.published = append(b.published, Event{Subject: subject, Event: e})
@@ -41,6 +44,8 @@ func (b *Bus) Publish(subject string, e *fsmv1.RunEvent) {
 	}
 }
 
+// Subscribe registers fn for the subject's events and returns the function that removes it.
+// It never fails; the error is the fsm.EventSubscriber contract's.
 func (b *Bus) Subscribe(subject string, fn func(*fsmv1.RunEvent)) (func(), error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

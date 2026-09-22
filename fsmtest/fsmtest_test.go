@@ -42,13 +42,13 @@ func registerDeploy(t *testing.T, m *fsm.Manager, allowComplete *atomic.Bool, en
 // TestResumeAcrossRestart is the consumer's restart scenario on both backends: a run interrupted
 // by shutdown is picked back up by Resume on a fresh manager over the same storage.
 func TestResumeAcrossRestart(t *testing.T) {
-	fsmtest.RunBackends(t, func(t *testing.T, f *fsmtest.Factory) {
+	fsmtest.RunBackends(t, func(t *testing.T, b *fsmtest.Backend) {
 		ctx := context.Background()
 		var allowComplete atomic.Bool
 		entered := make(chan struct{}, 2)
 		canceled := make(chan error, 1)
 
-		m1, stop1 := f.NewManager(nil)
+		m1, stop1 := b.NewManager(nil)
 		start, _ := registerDeploy(t, m1, &allowComplete, entered, canceled)
 		version, err := start(ctx, "app-1", fsm.NewRequest(&deployReq{Name: "app"}, &deployResp{}))
 		if err != nil {
@@ -61,7 +61,7 @@ func TestResumeAcrossRestart(t *testing.T) {
 		}
 
 		allowComplete.Store(true)
-		m2, _ := f.NewManager(nil)
+		m2, _ := b.NewManager(nil)
 		_, resume := registerDeploy(t, m2, &allowComplete, entered, canceled)
 		if err := resume(ctx); err != nil {
 			t.Fatalf("failed to resume: %v", err)
@@ -79,7 +79,7 @@ func TestResumeAcrossRestart(t *testing.T) {
 // canceled with ErrLeaseLost, and the lifecycle shows up on the shared bus.
 func TestTakeoverOnLeaseLoss(t *testing.T) {
 	bus := fake.NewBus()
-	f := fsmtest.NewObjectFactory(t,
+	b := fsmtest.NewObjectBackend(t,
 		fsmtest.WithBus(bus),
 		fsmtest.WithObjectConfig(fsmtest.AsymmetricTimings(400*time.Millisecond)),
 	)
@@ -88,7 +88,7 @@ func TestTakeoverOnLeaseLoss(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	canceled := make(chan error, 1)
 
-	m1, _ := f.NewManager(nil)
+	m1, _ := b.NewManager(nil)
 	start, _ := registerDeploy(t, m1, &allowComplete, entered, canceled)
 	version, err := start(ctx, "app-1", fsm.NewRequest(&deployReq{Name: "app"}, &deployResp{}))
 	if err != nil {
@@ -98,7 +98,7 @@ func TestTakeoverOnLeaseLoss(t *testing.T) {
 
 	// The peer's claim loop takes the run once the owner's lease lapses; no Resume call is made.
 	allowComplete.Store(true)
-	m2, _ := f.NewManager(nil)
+	m2, _ := b.NewManager(nil)
 	registerDeploy(t, m2, &allowComplete, entered, canceled)
 
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)

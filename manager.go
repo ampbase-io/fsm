@@ -210,7 +210,7 @@ func New(cfg Config) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create metric instruments: %w", err)
 	}
 
-	store, err := newBackend(cfg, tracer, instruments, cfg.Logger.With("sys", "fsm-store"))
+	store, err := openStore(cfg, tracer, instruments, cfg.Logger.With("sys", "fsm-store"))
 	if err != nil {
 		return nil, err
 	}
@@ -280,9 +280,9 @@ func New(cfg Config) (*Manager, error) {
 	return man, nil
 }
 
-// newBackend constructs the storage backend selected by the config. Exactly one of DBPath or
+// openStore constructs the storage backend selected by the config. Exactly one of DBPath or
 // ObjectStorage is set; the caller validates that.
-func newBackend(cfg Config, tracer trace.Tracer, instruments *instruments, logger *slog.Logger) (Store, error) {
+func openStore(cfg Config, tracer trace.Tracer, instruments *instruments, logger *slog.Logger) (Store, error) {
 	if cfg.ObjectStorage != nil {
 		return newObjectStore(context.Background(), logger, instruments, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus, cfg.Queues)
 	}

@@ -219,7 +219,7 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 	)
 
 	bus := fake.NewBus()
-	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = 2 * time.Second
 		cfg.HeartbeatPeriod = 200 * time.Millisecond
 		cfg.ClaimInterval = 50 * time.Millisecond
@@ -250,10 +250,10 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 	}
 
 	var starter Start[orderReq, orderResp]
-	m0, _ := f.newManager(map[string]int{"deploys": capacity})
+	m0, _ := b.newManager(map[string]int{"deploys": capacity})
 	starter = register(m0)
 	for i := 1; i < nodes; i++ {
-		m, _ := f.newManager(map[string]int{"deploys": capacity})
+		m, _ := b.newManager(map[string]int{"deploys": capacity})
 		register(m)
 	}
 
@@ -291,7 +291,7 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 	bus := fake.NewBus()
 	nodes := 0
-	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		nodes++
 		cfg.LeaseTimeout = 150 * time.Millisecond
 		cfg.ClaimInterval = time.Hour // only the pending wakeup claims, for determinism
@@ -302,7 +302,7 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(map[string]int{"deploys": 1})
+	m1, _ := b.newManager(map[string]int{"deploys": 1})
 	entered := make(chan struct{}, 1)
 	block := make(chan struct{})
 	defer close(block)
@@ -316,7 +316,7 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond) // let node-1's undefended lease and queue slot lapse
 
-	m2, _ := f.newManager(map[string]int{"deploys": 1})
+	m2, _ := b.newManager(map[string]int{"deploys": 1})
 	completingFSM(t, m2, "reclaimq")
 
 	// Wake node-2 once its claim loop is subscribed; it must reclaim node-1's stale slot to admit

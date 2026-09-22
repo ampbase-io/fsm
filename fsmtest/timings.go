@@ -7,11 +7,11 @@ import (
 	"github.com/ampbase-io/fsm"
 )
 
-// AsymmetricTimings gives the first manager a factory creates a lapsing lease (a heartbeat of
+// AsymmetricTimings gives the first manager a Backend creates a lapsing lease (a heartbeat of
 // ownerHeartbeat against a 150ms lease, and no claim loop) and every later manager aggressive
 // claim timings, so a second manager deterministically takes over the first's runs. A heartbeat
 // longer than the lease leaves a takeover window on every extension; time.Hour never defends
-// the lease at all. Pass it to NewObjectFactory through WithObjectConfig.
+// the lease at all. Pass it to NewObjectBackend through WithObjectConfig.
 func AsymmetricTimings(ownerHeartbeat time.Duration) func(*fsm.ObjectStorageConfig) {
 	nodes := 0
 	return func(cfg *fsm.ObjectStorageConfig) {

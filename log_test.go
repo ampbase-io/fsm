@@ -32,15 +32,15 @@ func (c *logCapture) lines() []string {
 // runLogged drives a two-transition run on a manager whose logger writes to the capture at the
 // given level, and returns the captured lines once the manager has shut down, so no goroutine is
 // still writing.
-func runLogged(t *testing.T, f *managerFactory, level slog.Level) []string {
+func runLogged(t *testing.T, b *backend, level slog.Level) []string {
 	t.Helper()
 	ctx := context.Background()
 
 	capture := &logCapture{}
-	f.configureManager = func(cfg *Config) {
+	b.configureManager = func(cfg *Config) {
 		cfg.Logger = slog.New(slog.NewTextHandler(capture, &slog.HandlerOptions{Level: level}))
 	}
-	m, stop := f.newManager(nil)
+	m, stop := b.newManager(nil)
 
 	pass := func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 		return nil, nil
@@ -82,8 +82,8 @@ func linesWithMessage(lines []string, msg string) []string {
 // exactly once.
 func TestTransitionLogsAreDebug(t *testing.T) { runBackends(t, testTransitionLogsAreDebug) }
 
-func testTransitionLogsAreDebug(t *testing.T, f *managerFactory) {
-	info := runLogged(t, f, slog.LevelInfo)
+func testTransitionLogsAreDebug(t *testing.T, b *backend) {
+	info := runLogged(t, b, slog.LevelInfo)
 	if len(linesWithMessage(info, "starting fsm")) != 1 {
 		t.Fatalf("expected one 'starting fsm' line at Info, got:\n%s", strings.Join(info, "\n"))
 	}
@@ -93,7 +93,7 @@ func testTransitionLogsAreDebug(t *testing.T, f *managerFactory) {
 		}
 	}
 
-	debug := runLogged(t, f, slog.LevelDebug)
+	debug := runLogged(t, b, slog.LevelDebug)
 	running := linesWithMessage(debug, "running transition")
 	if len(running) != 3 { // first, second, done
 		t.Fatalf("expected a 'running transition' line per transition at Debug, got %d:\n%s", len(running), strings.Join(running, "\n"))

@@ -42,10 +42,10 @@ func eventually(t *testing.T, d time.Duration, cond func() bool, msg string) {
 // version.
 func TestEventBusPublishesLifecycle(t *testing.T) {
 	bus := fake.NewBus()
-	f := newObjectFactoryWithBus(t, bus, nil)
+	b := newObjectBackendWithBus(t, bus, nil)
 	ctx := context.Background()
 
-	m, _ := f.newManager(nil)
+	m, _ := b.newManager(nil)
 	start, _, err := m.Register[orderReq, orderResp]("bus-life").
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 			return NewResponse(&orderResp{Status: "ok"}), nil
@@ -78,14 +78,14 @@ func TestEventBusPublishesLifecycle(t *testing.T) {
 // finish cleanup lands.
 func TestWaitWakesOnBusDone(t *testing.T) {
 	bus := fake.NewBus()
-	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		// A poll floor far beyond the test window, so only the bus can deliver completion in time.
 		cfg.WaitPollInterval = 30 * time.Second
 		cfg.WaitPollMaxInterval = 30 * time.Second
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	entered := make(chan struct{}, 1)
 	block := make(chan struct{})
 	start := blockingFSM(t, m1, "waitwake", entered, block)
@@ -98,7 +98,7 @@ func TestWaitWakesOnBusDone(t *testing.T) {
 
 	// A second node waits on the still-blocked run: its first manifest read is non-terminal, so
 	// it parks on the 30s poll floor and only fsm.run.done can release it in time.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- m2.Wait(ctx, version) }()
 
@@ -133,7 +133,7 @@ func TestWaitWakesOnBusDone(t *testing.T) {
 func TestClaimWakesOnPending(t *testing.T) {
 	bus := fake.NewBus()
 	nodes := 0
-	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		nodes++
 		cfg.LeaseTimeout = 150 * time.Millisecond
 		cfg.ClaimInterval = time.Hour // the periodic scan is disabled; only the wakeup claims
@@ -144,7 +144,7 @@ func TestClaimWakesOnPending(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	entered := make(chan struct{}, 1)
 	block := make(chan struct{})
 	defer close(block)
@@ -158,7 +158,7 @@ func TestClaimWakesOnPending(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond) // let node-1's undefended lease lapse
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "claimwake")
 
 	// Both coordinate loops subscribe to pending; wait until node-2's is registered so its

@@ -192,16 +192,16 @@ m, err := fsm.New(fsm.Config{DBPath: "/var/lib/myapp/fsm", MeterProvider: provid
 ## Testing
 
 The `fsmtest` package runs a scenario against both backends without external services: a temp
-BoltDB and an in-memory S3. Managers from one `Factory` share storage, so a restart is a stopped
+BoltDB and an in-memory S3. Managers from one `Backend` share storage, so a restart is a stopped
 manager followed by a new one over the same state:
 
 ```go
 func TestDeployResumes(t *testing.T) {
-    fsmtest.RunBackends(t, func(t *testing.T, f *fsmtest.Factory) {
-        m1, stop1 := f.NewManager(nil)
+    fsmtest.RunBackends(t, func(t *testing.T, b *fsmtest.Backend) {
+        m1, stop1 := b.NewManager(nil)
         // register, start a run, let it block in its first transition ...
         stop1()
-        m2, _ := f.NewManager(nil)
+        m2, _ := b.NewManager(nil)
         // register again, Resume, Wait ...
     })
 }
@@ -211,7 +211,7 @@ A takeover needs the object backend, a lease the owner cannot defend, and option
 the peer claims on the event rather than the next scan:
 
 ```go
-f := fsmtest.NewObjectFactory(t,
+b := fsmtest.NewObjectBackend(t,
     fsmtest.WithBus(fake.NewBus()),
     fsmtest.WithObjectConfig(fsmtest.AsymmetricTimings(400*time.Millisecond)),
 )

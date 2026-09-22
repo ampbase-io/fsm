@@ -265,7 +265,7 @@ func TestSweepCancellationsContinuesPastFailure(t *testing.T) {
 // claim pass from completing the runs claimed after it.
 func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	nodes := 0
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		nodes++
 		cfg.LeaseTimeout = 150 * time.Millisecond
 		cfg.HeartbeatPeriod = 75 * time.Millisecond
@@ -277,7 +277,7 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 2)
 		block   = make(chan struct{})
@@ -307,7 +307,7 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	}
 
 	// No explicit Resume: only m2's claim loop can complete the healthy run.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "cpoison")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -320,12 +320,12 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 // TestCoordinateStopsPromptly pins that shutdown does not wait out heartbeat or claim ticks:
 // the coordinate goroutine exits as soon as done closes.
 func TestCoordinateStopsPromptly(t *testing.T) {
-	f := newObjectFactoryWith(t, func(cfg *ObjectStorageConfig) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = time.Second
 		cfg.HeartbeatPeriod = 20 * time.Millisecond
 		cfg.ClaimInterval = 20 * time.Millisecond
 	})
-	m, stop := f.newManager(nil)
+	m, stop := b.newManager(nil)
 	completingFSM(t, m, "tick")
 	time.Sleep(100 * time.Millisecond) // let a few heartbeat and claim ticks run
 

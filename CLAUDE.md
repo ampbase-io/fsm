@@ -61,7 +61,7 @@ backend's distributed-execution design is the active work.
   the tracer (`Manager`, `retry`, `objectStore`); attribute keys and bucket advice live there.
 - `fsmtest/fake` — the in-memory S3 (`fake.S3`, with fault hooks and counters) and EventBus
   (`fake.Bus`); a leaf package that never imports `fsm`. `fsmtest` — the consumer-facing harness
-  over it: `Factory`, `RunBackends`, `NewObjectFactory` options, `AsymmetricTimings`,
+  over it: `Backend`, `RunBackends`, `NewObjectBackend` options, `AsymmetricTimings`,
   `Eventually`.
 
 ## Build, test, verify
@@ -81,9 +81,9 @@ backend's distributed-execution design is the active work.
 ## Testing conventions
 - New behavior tests run against **both backends**: `func TestX(t){ runBackends(t, testX) }`. The
   object backend uses the in-process `fake.S3`; timing tests set lease/poll intervals via
-  `newObjectFactoryWith` / `newObjectFactoryWithBus`.
+  `newObjectBackendWith` / `newObjectBackendWithBus`.
 - **The cycle rule:** `fsmtest` imports `fsm`, so in-package tests may import only
-  `fsmtest/fake`. The manager factory, `asymmetricTimings` and `eventually` therefore exist
+  `fsmtest/fake`. The `backend` type, `asymmetricTimings` and `eventually` therefore exist
   twice — once in-package (`backend_test.go`, `lease_test.go`, `eventbus_test.go`) and once
   exported in `fsmtest`; keep the two in step.
 - Object-backend managers take the fake's client (`Client: s3.Client()`, static credentials), so

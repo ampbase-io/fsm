@@ -38,11 +38,11 @@ func crossManagerTimings(cfg *ObjectStorageConfig) {
 // takeOver starts a blocking run on a first manager, lets its lease expire, and completes the
 // run on a second manager via Resume. It returns the first manager, the run version, and the
 // releaser for that manager's still-blocked transition.
-func takeOver(t *testing.T, f *managerFactory, action, id string) (m1 *Manager, version ulid.ULID, release func()) {
+func takeOver(t *testing.T, b *backend, action, id string) (m1 *Manager, version ulid.ULID, release func()) {
 	t.Helper()
 	ctx := context.Background()
 
-	m1, _ = f.newManager(nil)
+	m1, _ = b.newManager(nil)
 	var (
 		entered = make(chan struct{}, 1)
 		block   = make(chan struct{})
@@ -58,7 +58,7 @@ func takeOver(t *testing.T, f *managerFactory, action, id string) (m1 *Manager, 
 	// Once the lease expires the run is claimable; the owner's heartbeat is suppressed.
 	time.Sleep(2 * 250 * time.Millisecond)
 
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	resume := completingFSM(t, m2, action)
 	if err := resume(ctx); err != nil {
 		t.Fatalf("failed to resume on second manager: %v", err)
@@ -77,9 +77,9 @@ func takeOver(t *testing.T, f *managerFactory, action, id string) (m1 *Manager, 
 // the first manager's Wait must observe the completion instead of parking on local state that
 // will never change.
 func TestObjectWaitCrossManager(t *testing.T) {
-	f := newObjectFactoryWith(t, crossManagerTimings)
+	b := newObjectBackendWith(t, crossManagerTimings)
 
-	m1, version, release := takeOver(t, f, "xwait", "cross-1")
+	m1, version, release := takeOver(t, b, "xwait", "cross-1")
 	defer release()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -92,9 +92,9 @@ func TestObjectWaitCrossManager(t *testing.T) {
 // TestObjectWaitByIDCrossManager covers id resolution once the resource lock is gone: the
 // completed run must be found through the index/ fallback and report its outcome.
 func TestObjectWaitByIDCrossManager(t *testing.T) {
-	f := newObjectFactoryWith(t, crossManagerTimings)
+	b := newObjectBackendWith(t, crossManagerTimings)
 
-	m1, _, release := takeOver(t, f, "xwaitid", "cross-2")
+	m1, _, release := takeOver(t, b, "xwaitid", "cross-2")
 	defer release()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -107,10 +107,10 @@ func TestObjectWaitByIDCrossManager(t *testing.T) {
 // TestObjectActiveCrossManager verifies a manager answers Active and ActiveChildren from
 // object storage for runs it did not start.
 func TestObjectActiveCrossManager(t *testing.T) {
-	f := newObjectFactory(t)
+	b := newObjectBackend(t)
 	ctx := context.Background()
 
-	m1, _ := f.newManager(nil)
+	m1, _ := b.newManager(nil)
 	var (
 		parentEntered = make(chan struct{}, 1)
 		parentBlock   = make(chan struct{})
@@ -133,7 +133,7 @@ func TestObjectActiveCrossManager(t *testing.T) {
 	<-childEntered
 
 	// A second manager with the same registrations but no local run state.
-	m2, _ := f.newManager(nil)
+	m2, _ := b.newManager(nil)
 	completingFSM(t, m2, "xparent")
 	completingFSM(t, m2, "xchild")
 
@@ -196,8 +196,8 @@ func TestObjectActiveCrossManager(t *testing.T) {
 
 func TestListActive(t *testing.T) { runBackends(t, testListActive) }
 
-func testListActive(t *testing.T, f *managerFactory) {
-	m, _ := f.newManager(nil)
+func testListActive(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
 	ctx := context.Background()
 
 	var (
