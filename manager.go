@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -18,7 +19,6 @@ import (
 	"github.com/ampbase-io/fsm/gen/fsm/v1/fsmv1connect"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
@@ -85,7 +85,7 @@ type cancelRecorder interface {
 }
 
 type Manager struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	tracer trace.Tracer
 
@@ -131,7 +131,9 @@ type fsmKey struct {
 }
 
 type Config struct {
-	Logger logrus.FieldLogger
+	// Logger receives the library's logs. Run start and stop, claims and shutdown are Info;
+	// per-transition and per-wait lines are Debug. Defaults to slog.Default().
+	Logger *slog.Logger
 
 	// DBPath is the directory to use for persisting FSM state with the BoltDB backend.
 	// Exactly one of DBPath or ObjectStorage must be set.
@@ -167,7 +169,7 @@ type Config struct {
 // New creates a new FSM manager to register and run FSMs.
 func New(cfg Config) (*Manager, error) {
 	if cfg.Logger == nil {
-		cfg.Logger = logrus.New()
+		cfg.Logger = slog.Default()
 	}
 
 	if cfg.DBPath == "" && cfg.ObjectStorage == nil {
@@ -182,7 +184,7 @@ func New(cfg Config) (*Manager, error) {
 		trace.WithSchemaURL(semconv.SchemaURL),
 	)
 
-	store, err := newBackend(cfg, tracer, cfg.Logger.WithField("sys", "fsm-store"))
+	store, err := newBackend(cfg, tracer, cfg.Logger.With("sys", "fsm-store"))
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +192,7 @@ func New(cfg Config) (*Manager, error) {
 	done := make(chan struct{})
 
 	man := &Manager{
-		logger:     cfg.Logger.WithField("sys", "fsm"),
+		logger:     cfg.Logger.With("sys", "fsm"),
 		tracer:     tracer,
 		store:      store,
 		bus:        busOrNoop(cfg.EventBus),
@@ -219,7 +221,7 @@ func New(cfg Config) (*Manager, error) {
 				queued: make([]func(), 0, size),
 			}
 			man.queues[name] = q
-			go q.run(done, cfg.Logger.WithField("queue", name))
+			go q.run(done, cfg.Logger.With("queue", name, "size", size))
 		}
 	}
 
@@ -253,7 +255,7 @@ func New(cfg Config) (*Manager, error) {
 
 // newBackend constructs the storage backend selected by the config. Exactly one of DBPath or
 // ObjectStorage is set; the caller validates that.
-func newBackend(cfg Config, tracer trace.Tracer, logger logrus.FieldLogger) (Store, error) {
+func newBackend(cfg Config, tracer trace.Tracer, logger *slog.Logger) (Store, error) {
 	if cfg.ObjectStorage != nil {
 		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus, cfg.Queues)
 	}
@@ -281,12 +283,12 @@ func (m *Manager) serveAdmin(socket string) error {
 		defer os.Remove(socket)
 		<-m.done
 		if err := listener.Close(); err != nil {
-			m.logger.WithError(err).Error("failed to close unix listener")
+			m.logger.Error("failed to close unix listener", "error", err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			m.logger.WithError(err).Error("failed to shutdown http server")
+			m.logger.Error("failed to shutdown http server", "error", err)
 		}
 	}()
 	return nil
@@ -296,11 +298,11 @@ func (m *Manager) serveAdmin(socket string) error {
 // stopped run's context — its finalizers' included — ends with cause ErrShutdown; the run
 // records nothing and resumes where it left off on the next start or claim.
 func (m *Manager) Shutdown(timeout time.Duration) {
-	m.logger.WithField("shutdown_timeout", timeout).Info("shutting down")
+	m.logger.Info("shutting down", "shutdown_timeout", timeout)
 
 	m.mu.RLock()
 	for id, run := range m.running {
-		m.logger.WithField("fsm_id", id.String()).Info("shutting down fsm")
+		m.logger.Info("shutting down fsm", versionAttr(id))
 		run.stop(ErrShutdown)
 	}
 	m.mu.RUnlock()
@@ -321,7 +323,7 @@ func (m *Manager) Shutdown(timeout time.Duration) {
 	}
 
 	if err := m.store.Close(); err != nil {
-		m.logger.WithError(err).Error("failed to close store")
+		m.logger.Error("failed to close store", "error", err)
 	}
 
 	m.logger.Info("shutdown complete")
@@ -506,19 +508,19 @@ func (m *Manager) executing(version ulid.ULID) (runHandle, bool) {
 
 // Wait blocks until the run with the given version completes.
 func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
-	logger := m.logger.WithField("start_version", version.String())
+	logger := m.logger.With(versionAttr(version))
 
-	logger.Info("waiting for FSM to finish")
-	defer logger.Info("done waiting for FSM to finish")
+	logger.DebugContext(ctx, "waiting for FSM to finish")
+	defer logger.DebugContext(ctx, "done waiting for FSM to finish")
 	return m.store.WaitRun(ctx, version)
 }
 
 // WaitByID blocks until the run with the given ID completes.
 func (m *Manager) WaitByID(ctx context.Context, id string) error {
-	logger := m.logger.WithField("fsm_run_id", id)
+	logger := m.logger.With(slog.Group("fsm", "id", id))
 
-	logger.Info("waiting for FSM to finish")
-	defer logger.Info("done waiting for FSM to finish")
+	logger.DebugContext(ctx, "waiting for FSM to finish")
+	defer logger.DebugContext(ctx, "done waiting for FSM to finish")
 
 	// Resolve the id to its run version. On a miss the version stays zero and WaitRun reports
 	// it via the store (completed) or as not found.
@@ -527,7 +529,7 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 		return err
 	}
 	if version.Compare(ulid.ULID{}) != 0 {
-		logger = logger.WithField("start_version", version.String())
+		logger = m.logger.With(slog.Group("fsm", "id", id, "version", version.String()))
 	}
 	return m.store.WaitRun(ctx, version)
 }

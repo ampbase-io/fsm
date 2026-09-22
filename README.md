@@ -116,3 +116,28 @@ m, err := fsm.New(fsm.Config{
   finalizers run at least once, so a parent re-enters the code that starts its children.
   `AlreadyRunningError` covers only a child still running: a finished child's id can be started
   again, and queued starts stack. Check `Runs(id)` before starting.
+
+## Observability
+
+### Logging
+
+The library logs through `log/slog`. Pass a `*slog.Logger` as `Config.Logger`; the default is
+`slog.Default()`. Handlers get a logger through `req.Log()`, carrying the run's attributes. Every
+log call that has a context passes it to the handler, so a handler that reads trace context —
+an OpenTelemetry slog bridge, say — attaches each line to the run's span.
+
+```go
+m, err := fsm.New(fsm.Config{
+    DBPath: "/var/lib/myapp/fsm",
+    Logger: slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+})
+```
+
+Levels: a run's start and stop, a claim, and shutdown are Info; each transition, each wait, and
+each queued dispatch are Debug; a retry is Warn; a halt or a storage failure is Error.
+
+A run's identity is one `fsm` group, keyed like its span and metric attributes so the three
+signals share a vocabulary: `fsm.action`, `fsm.type`, `fsm.alias`, `fsm.id`, `fsm.version`, and
+on a transition's lines `fsm.state` and `fsm.transition_version`. The JSON handler nests them
+under `"fsm"`; the text handler dots them. Outside the group: `sys` (`fsm` or `fsm-store`),
+`retry_count` on a retry's lines, and per-line keys such as `error`, `queue` and `key`.

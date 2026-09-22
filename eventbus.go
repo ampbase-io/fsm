@@ -4,7 +4,7 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
+	"log/slog"
 )
 
 // The bus payload is the protobuf fsmv1.RunEvent, so the live stream and the durable events/ log
@@ -82,7 +82,7 @@ func busIsLive(b EventBus) bool {
 // wakeup and never blocks the bus. A failed subscription logs and returns a no-op unsubscribe,
 // leaving the caller on its polling floor. The internal fast paths — WaitRun's done wait, the
 // claim wakeup, the cancel sweep — consume it and ignore the payload, routing on the subject.
-func subscribeSignal(bus EventSubscriber, subject string, logger logrus.FieldLogger) (<-chan struct{}, func()) {
+func subscribeSignal(bus EventSubscriber, subject string, logger *slog.Logger) (<-chan struct{}, func()) {
 	signal := make(chan struct{}, 1)
 	unsubscribe, err := bus.Subscribe(subject, func(*fsmv1.RunEvent) {
 		select {
@@ -91,7 +91,7 @@ func subscribeSignal(bus EventSubscriber, subject string, logger logrus.FieldLog
 		}
 	})
 	if err != nil {
-		logger.WithError(err).WithField("subject", subject).Warn("event subscribe failed, relying on the polling floor")
+		logger.Warn("event subscribe failed, relying on the polling floor", "error", err, "subject", subject)
 		return signal, func() {}
 	}
 	return signal, unsubscribe

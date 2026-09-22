@@ -12,11 +12,10 @@
 package natsbus
 
 import (
-	"io"
+	"log/slog"
 	"sync"
 
 	"github.com/nats-io/nats.go"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 
 	fsm "github.com/ampbase-io/fsm"
@@ -28,7 +27,7 @@ import (
 // goroutine.
 type Bus struct {
 	nc     *nats.Conn
-	logger logrus.FieldLogger
+	logger *slog.Logger
 }
 
 // The adapter must stay assignable to the interface the core injects.
@@ -40,11 +39,9 @@ var _ fsm.EventBus = (*Bus)(nil)
 const deliveryBuffer = 128
 
 // New wraps an established NATS connection as an fsm.EventBus. A nil logger discards.
-func New(nc *nats.Conn, logger logrus.FieldLogger) *Bus {
+func New(nc *nats.Conn, logger *slog.Logger) *Bus {
 	if logger == nil {
-		discard := logrus.New()
-		discard.SetOutput(io.Discard)
-		logger = discard
+		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Bus{nc: nc, logger: logger}
 }
@@ -55,11 +52,11 @@ func New(nc *nats.Conn, logger logrus.FieldLogger) *Bus {
 func (b *Bus) Publish(subject string, event *fsmv1.RunEvent) {
 	data, err := proto.Marshal(event)
 	if err != nil {
-		b.logger.WithError(err).WithField("subject", subject).Warn("failed to marshal run event, dropping")
+		b.logger.Warn("failed to marshal run event, dropping", "error", err, "subject", subject)
 		return
 	}
 	if err := b.nc.Publish(subject, data); err != nil {
-		b.logger.WithError(err).WithField("subject", subject).Warn("failed to publish run event")
+		b.logger.Warn("failed to publish run event", "error", err, "subject", subject)
 	}
 }
 
@@ -89,13 +86,13 @@ func (b *Bus) Subscribe(subject string, fn func(*fsmv1.RunEvent)) (func(), error
 	sub, err := b.nc.Subscribe(subject, func(msg *nats.Msg) {
 		var event fsmv1.RunEvent
 		if err := proto.Unmarshal(msg.Data, &event); err != nil {
-			b.logger.WithError(err).WithField("subject", subject).Warn("failed to unmarshal run event, dropping")
+			b.logger.Warn("failed to unmarshal run event, dropping", "error", err, "subject", subject)
 			return
 		}
 		select {
 		case events <- &event:
 		default:
-			b.logger.WithField("subject", subject).Warn("subscriber too slow, dropping run event")
+			b.logger.Warn("subscriber too slow, dropping run event", "subject", subject)
 		}
 	})
 	if err != nil {
@@ -105,7 +102,7 @@ func (b *Bus) Subscribe(subject string, fn func(*fsmv1.RunEvent)) (func(), error
 
 	return sync.OnceFunc(func() {
 		if err := sub.Unsubscribe(); err != nil {
-			b.logger.WithError(err).WithField("subject", subject).Warn("failed to unsubscribe")
+			b.logger.Warn("failed to unsubscribe", "error", err, "subject", subject)
 		}
 		close(done)
 	}), nil

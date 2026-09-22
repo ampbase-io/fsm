@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,7 +22,6 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -102,7 +102,7 @@ func (c *ObjectStorageConfig) archiveInterval() time.Duration {
 
 // objectStore implements the Store interface over S3-compatible object storage.
 type objectStore struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 	client *s3.Client
 	cfg    *ObjectStorageConfig
 
@@ -149,7 +149,7 @@ type objectStore struct {
 	archiveCh     chan struct{}
 }
 
-func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger *slog.Logger, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -173,7 +173,7 @@ func newObjectStore(ctx context.Context, logger logrus.FieldLogger, cfg *ObjectS
 	})
 
 	s := &objectStore{
-		logger:   logger.WithField("node_id", nodeID),
+		logger:   logger.With("node_id", nodeID),
 		client:   client,
 		cfg:      cfg,
 		node:     nodeID,
@@ -354,7 +354,7 @@ func (s *objectStore) putConditional(ctx context.Context, key string, body []byt
 			return nil
 		case isConditionalConflict(err):
 			casRetriesVec.WithLabelValues("conflict").Inc()
-			s.logger.WithField("key", key).Debug("conditional write conflict, retrying")
+			s.logger.DebugContext(ctx, "conditional write conflict, retrying", "key", key)
 			return err
 		default:
 			return backoff.Permanent(err)
@@ -604,7 +604,7 @@ func (s *objectStore) listChildren(ctx context.Context, parent ulid.ULID) ([]uli
 	for _, key := range keys {
 		child, err := versionFromKey(key)
 		if err != nil {
-			s.logger.WithError(err).WithField("key", key).Error("failed to parse child ULID from key")
+			s.logger.ErrorContext(ctx, "failed to parse child ULID from key", "error", err, "key", key)
 			continue
 		}
 		children = append(children, child)

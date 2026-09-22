@@ -2,9 +2,8 @@ package fsm
 
 import (
 	"context"
+	"log/slog"
 	"testing"
-
-	"github.com/sirupsen/logrus"
 )
 
 func okTransition(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -82,7 +81,7 @@ func (staticCodec) Marshal(any) ([]byte, error) { return []byte("static"), nil }
 func (staticCodec) Unmarshal([]byte, any) error { return nil }
 
 func TestDetermineCodec(t *testing.T) {
-	logger := logrus.New()
+	logger := slog.Default()
 
 	c, err := determineCodec(logger, struct{ A string }{})
 	if err != nil {

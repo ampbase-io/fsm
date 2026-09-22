@@ -50,13 +50,13 @@ func (s *objectStore) runArchive(ctx context.Context) {
 	case errors.Is(err, context.Canceled):
 		return
 	case err != nil:
-		s.logger.WithError(err).Error("archive: failed to scan for archivable runs")
+		s.logger.ErrorContext(ctx, "archive: failed to scan for archivable runs", "error", err)
 		return
 	case len(entries) == 0:
 		return
 	}
 
-	s.logger.WithField("count", len(entries)).Info("archive: reclaiming completed runs past retention")
+	s.logger.InfoContext(ctx, "archive: reclaiming completed runs past retention", "count", len(entries))
 
 	var (
 		sem = make(chan struct{}, scanFanout)
@@ -69,7 +69,7 @@ func (s *objectStore) runArchive(ctx context.Context) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if err := s.reapRun(ctx, entry.version, entry.manifest); err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.WithError(err).WithField("run_version", entry.version.String()).Error("archive: failed to reap run")
+				s.logger.ErrorContext(ctx, "archive: failed to reap run", "error", err, versionAttr(entry.version))
 			}
 		}()
 	}
@@ -132,7 +132,7 @@ func (s *objectStore) archivableRuns(ctx context.Context) ([]reapEntry, error) {
 func (s *objectStore) archivable(ctx context.Context, key string, cutoff int64) *reapEntry {
 	version, err := versionFromKey(key)
 	if err != nil {
-		s.logger.WithError(err).WithField("key", key).Warn("archive: malformed manifest key")
+		s.logger.WarnContext(ctx, "archive: malformed manifest key", "error", err, "key", key)
 		return nil
 	}
 
@@ -144,7 +144,7 @@ func (s *objectStore) archivable(ctx context.Context, key string, cutoff int64) 
 		// TODO(poison): a manifest that keeps failing to read/decode (corrupt object) is logged
 		// and skipped every pass forever — never reaped, recurring error noise. Fold into the
 		// carried poison-run backoff/dead-letter follow-up so a persistently bad object is quarantined.
-		s.logger.WithError(err).WithField("run_version", version.String()).Error("archive: failed to read manifest")
+		s.logger.ErrorContext(ctx, "archive: failed to read manifest", "error", err, versionAttr(version))
 		return nil
 	}
 	if !manifestTerminal(manifest) {

@@ -100,7 +100,7 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 			return nil
 		case errors.Is(werr, errEtagMismatch):
 			casRetriesVec.WithLabelValues("queue").Inc()
-			s.logger.WithField("queue", name).Debug("queue roster changed concurrently, retrying")
+			s.logger.DebugContext(ctx, "queue roster changed concurrently, retrying", "queue", name)
 			return werr
 		default:
 			return backoff.Permanent(werr)
@@ -200,7 +200,7 @@ func (s *objectStore) heartbeatQueues(ctx context.Context) {
 		switch {
 		case err == nil, errors.Is(err, context.Canceled):
 		default:
-			s.logger.WithError(err).WithField("queue", name).Error("failed to heartbeat queue roster")
+			s.logger.ErrorContext(ctx, "failed to heartbeat queue roster", "error", err, "queue", name)
 		}
 	}
 }

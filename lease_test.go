@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,7 +12,6 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 // leaseHarness shares one fake S3 between several objectStores acting as distinct nodes.
@@ -66,7 +66,7 @@ func asymmetricTimings(ownerHeartbeat time.Duration) func(*ObjectStorageConfig) 
 func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectStore {
 	h.t.Helper()
 
-	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
 		Bucket:       h.bucket,
 		Endpoint:     h.url,
 		Region:       "auto",

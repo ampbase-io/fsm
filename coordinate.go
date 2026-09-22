@@ -184,7 +184,7 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 func (m *Manager) sweepCancellations(ctx context.Context, sweeper cancelSweeper) {
 	cancels, err := sweeper.pendingCancellations(ctx)
 	if err != nil {
-		m.logger.WithError(err).Error("cancel sweep failed")
+		m.logger.ErrorContext(ctx, "cancel sweep failed", "error", err)
 		return
 	}
 	for version, cause := range cancels {
@@ -192,7 +192,7 @@ func (m *Manager) sweepCancellations(ctx context.Context, sweeper cancelSweeper)
 			continue
 		}
 		if err := sweeper.cancelOwnedRun(ctx, version, cause); err != nil {
-			m.logger.WithError(err).WithField("run_version", version.String()).Error("failed to cancel owned run")
+			m.logger.ErrorContext(ctx, "failed to cancel owned run", "error", err, versionAttr(version))
 		}
 	}
 }
@@ -218,7 +218,7 @@ func (m *Manager) cancelUnleased(f fencer) {
 		if _, owned := f.ownedEpoch(version); owned {
 			continue
 		}
-		m.logger.WithField("run_version", version.String()).Warn("run lease lost")
+		m.logger.Warn("run lease lost", versionAttr(version))
 		m.stopRunning(version, ErrLeaseLost)
 	}
 }
@@ -233,23 +233,23 @@ func (m *Manager) runningVersions() []ulid.ULID {
 func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
 	claimed, err := claimer.claimRuns(ctx, m.registeredKeys())
 	if err != nil {
-		m.logger.WithError(err).Error("claim pass failed")
+		m.logger.ErrorContext(ctx, "claim pass failed", "error", err)
 		return
 	}
 
 	for _, c := range claimed {
-		logger := m.logger.WithField("run_version", c.resource.version.String())
+		logger := m.logger.With(versionAttr(c.resource.version))
 		f, ok := m.registeredFSM(c.key)
 		if !ok {
 			// Registration is append-only, so this cannot happen; a miss would strand a lease.
-			logger.WithField("action", c.key.action).Error("claimed a run for an unregistered FSM")
+			logger.ErrorContext(ctx, "claimed a run for an unregistered FSM", "action", c.key.action)
 			continue
 		}
-		logger.Info("claimed run")
+		logger.InfoContext(ctx, "claimed run")
 		// TODO: a run that repeatedly fails to resume is released by ForgetRun and re-claimed
 		// by every node's next pass; add per-run claim backoff or dead-lettering.
 		if err := f.resumeOne(ctx, c.resource); err != nil {
-			logger.WithError(err).Error("failed to resume claimed run")
+			logger.ErrorContext(ctx, "failed to resume claimed run", "error", err)
 		}
 	}
 }

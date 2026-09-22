@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,7 +17,6 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/sirupsen/logrus"
 )
 
 // fakeS3 is a minimal path-style S3 implementation covering the operations objectStore uses:
@@ -196,7 +196,7 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Helper()
 
 	bucket, url, fake := startFakeS3(t)
-	store, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
 		Bucket:   bucket,
 		Endpoint: url,
 		Region:   "auto",
@@ -219,7 +219,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), logrus.New(), &ObjectStorageConfig{}, "node-test", nil, nil); err == nil {
+	if _, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{}, "node-test", nil, nil); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }

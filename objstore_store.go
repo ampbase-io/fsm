@@ -100,7 +100,7 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			return nil
 		case errors.Is(err, errEtagMismatch):
 			casRetriesVec.WithLabelValues("manifest").Inc()
-			s.logger.WithField("key", key).Debug("manifest changed concurrently, retrying")
+			s.logger.DebugContext(ctx, "manifest changed concurrently, retrying", "key", key)
 			return err
 		default:
 			return backoff.Permanent(err)
@@ -167,10 +167,10 @@ func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEve
 	switch {
 	case errors.Is(err, ErrLeaseLost):
 		// Expected control flow after a takeover, not a storage failure.
-		s.logger.WithError(err).Warn("append fenced, run no longer owned")
+		s.logger.WarnContext(ctx, "append fenced, run no longer owned", "error", err)
 		return ulid.ULID{}, err
 	case err != nil:
-		s.logger.WithError(err).Error("failed to append event")
+		s.logger.ErrorContext(ctx, "failed to append event", "error", err)
 		return ulid.ULID{}, err
 	}
 
@@ -386,7 +386,7 @@ func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey str
 
 	if manifestTerminal(existing) {
 		if err := s.deleteObject(ctx, lockKey); err != nil {
-			s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete lock of completed run")
+			s.logger.ErrorContext(ctx, "failed to delete lock of completed run", "error", err, "key", lockKey)
 		}
 		return &AlreadyRunningError{Version: run.StartVersion}
 	}
@@ -486,7 +486,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	})
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
-		s.logger.WithField("run_version", run.StartVersion.String()).Warn("manifest not found for finish event")
+		s.logger.WarnContext(ctx, "manifest not found for finish event", versionAttr(run.StartVersion))
 		return nil
 	case errors.Is(err, ErrLeaseLost):
 		s.dropLease(run.StartVersion)
@@ -501,7 +501,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
 	lockKey := s.lockKey(manifest.GetResourceType(), manifest.GetResourceId(), manifest.GetAction(), manifest.GetQueue(), run.StartVersion)
 	if err := s.deleteObject(ctx, lockKey); err != nil {
-		s.logger.WithError(err).WithField("key", lockKey).Error("failed to delete resource lock")
+		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
 	}
 
 	if err := s.writeHistory(ctx, run.StartVersion, historyFromManifest(manifest, event)); err != nil {
@@ -517,7 +517,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 	// reads the already-freed slot.
 	if releaseQueue := admissionQueue(manifest); releaseQueue != "" {
 		if err := s.releaseQueued(ctx, releaseQueue, run.StartVersion); err != nil {
-			s.logger.WithError(err).WithField("run_version", run.StartVersion.String()).WithField("queue", releaseQueue).Error("failed to release queue slot")
+			s.logger.ErrorContext(ctx, "failed to release queue slot", "error", err, versionAttr(run.StartVersion), "queue", releaseQueue)
 		}
 		if busIsLive(s.bus) {
 			s.publishSignal(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
@@ -679,23 +679,23 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 // resolveLock resolves a single lock key to its owning run's manifest. Skips — malformed keys,
 // crash windows, terminal-manifest cleanup — return (nil, nil).
 func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEntry, error) {
-	logger := s.logger.WithField("key", lockKey)
+	logger := s.logger.With("key", lockKey)
 
 	// locks/<type>/<id>/<action>[/<run_version>]
 	segments := strings.Split(strings.TrimPrefix(lockKey, s.locksPrefix()), "/")
 	if len(segments) < 3 {
-		logger.Warn("malformed lock key")
+		logger.WarnContext(ctx, "malformed lock key")
 		return nil, nil
 	}
 	action, err := unescapeSegment(segments[2])
 	if err != nil {
-		logger.WithError(err).Warn("malformed lock key")
+		logger.WarnContext(ctx, "malformed lock key", "error", err)
 		return nil, nil
 	}
 
 	version, err := s.lockOwner(ctx, lockKey)
 	if err != nil {
-		logger.WithError(err).Error("failed to resolve lock owner")
+		logger.ErrorContext(ctx, "failed to resolve lock owner", "error", err)
 		return nil, nil
 	}
 
@@ -706,13 +706,13 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 		// belong to an in-flight START and is left alone; one old enough that no START can
 		// still be writing it (the run version carries its creation time) is reaped.
 		if time.Since(ulid.Time(version.Time())) > 2*s.cfg.leaseTimeout() {
-			logger.Warn("stale lock with no manifest, removing")
+			logger.WarnContext(ctx, "stale lock with no manifest, removing")
 			if err := s.deleteObject(ctx, lockKey); err != nil {
-				logger.WithError(err).Error("failed to delete stale lock")
+				logger.ErrorContext(ctx, "failed to delete stale lock", "error", err)
 			}
 			return nil, nil
 		}
-		logger.Warn("lock held but manifest missing, skipping")
+		logger.WarnContext(ctx, "lock held but manifest missing, skipping")
 		return nil, nil
 	case err != nil:
 		return nil, err
@@ -720,7 +720,7 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 
 	if manifestTerminal(manifest) {
 		if err := s.reapTerminalLock(ctx, lockKey); err != nil {
-			logger.WithError(err).Error("failed to delete orphaned lock")
+			logger.ErrorContext(ctx, "failed to delete orphaned lock", "error", err)
 		}
 		return nil, nil
 	}
@@ -731,7 +731,7 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 // reapTerminalLock finishes the cleanup of a completed run's lock — the crash window between
 // manifest completion and lock deletion.
 func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) error {
-	s.logger.WithField("key", lockKey).Info("completed run still holds its lock, removing")
+	s.logger.InfoContext(ctx, "completed run still holds its lock, removing", "key", lockKey)
 	return s.deleteObject(ctx, lockKey)
 }
 
@@ -1084,7 +1084,7 @@ func (s *objectStore) Runs(ctx context.Context, resourceType, resourceID string)
 	for _, key := range keys {
 		version, err := versionFromKey(key)
 		if err != nil {
-			s.logger.WithError(err).WithField("key", key).Error("failed to parse run version from index key")
+			s.logger.ErrorContext(ctx, "failed to parse run version from index key", "error", err, "key", key)
 			continue
 		}
 		runs = append(runs, version)

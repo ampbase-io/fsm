@@ -438,7 +438,7 @@ Note that `GetManifest` is only used by the object storage backend; the `boltSto
 
 ```go
 type Config struct {
-    Logger logrus.FieldLogger
+    Logger *slog.Logger
 
     // Storage backend: set DBPath for BoltDB (default, existing behavior),
     // or ObjectStorage for the S3-compatible backend. Exactly one must be set.
