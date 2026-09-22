@@ -11,31 +11,10 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/oklog/ulid/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
-)
-
-var (
-	transitionCounterVec = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "fsm_transition_count",
-			Help: "A count of transition completions.",
-		},
-		[]string{"action", "state", "resource", "status"},
-	)
-
-	transitionDurationVec = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "fsm_transition_duration_seconds",
-			Help:    "Time spent performing a transition.",
-			Buckets: []float64{.5, 1, 2.5, 5, 10, 30, 60, 150, 300, 600, 1200},
-		},
-		[]string{"action", "state", "resource", "status"},
-	)
 )
 
 func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Context, *Request[R, W]) (*Response[W], error) {
@@ -160,24 +139,17 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 	})
 }
 
-func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
+func retry(tracer trace.Tracer, instruments *instruments, store appender) TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			logger := req.Log()
 			run := req.Run()
 
-			localTransitionCounterVec := transitionCounterVec.MustCurryWith(prometheus.Labels{
-				"action":   run.Action,
-				"state":    run.CurrentState,
-				"resource": run.ResourceName,
-			})
-
-			transitionStartTime := time.Now()
-			localTransitionDurationVec := transitionDurationVec.MustCurryWith(prometheus.Labels{
-				"action":   run.Action,
-				"state":    run.CurrentState,
-				"resource": run.ResourceName,
-			})
+			// The transition's duration counts from its first attempt across every retry.
+			transitionStart := time.Now()
+			observe := func(status string) {
+				instruments.observeTransition(ctx, run, status, transitionStart)
+			}
 
 			boff := backoff.WithContext(&backoff.ExponentialBackOff{
 				InitialInterval:     100 * time.Millisecond,
@@ -200,8 +172,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 				func() (err error) {
 					defer func() {
 						if r := recover(); r != nil {
-							localTransitionCounterVec.WithLabelValues("panic").Inc()
-							localTransitionDurationVec.WithLabelValues("panic").Observe(time.Since(transitionStartTime).Seconds())
+							observe("panic")
 							transitionSpan.SetAttributes(semconv.ExceptionStacktrace(string(debug.Stack())))
 							err = fmt.Errorf("FSM %s.%s transition %s panic", run.ResourceName, run.Action, run.CurrentState)
 							logger.ErrorContext(transitionCtx, "recovered", "error", err, "stack", string(debug.Stack()))
@@ -209,8 +180,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 					}()
 					resp, err = next(withRetry(transitionCtx, retryCount), req)
 					if err == nil {
-						localTransitionCounterVec.WithLabelValues("ok").Inc()
-						localTransitionDurationVec.WithLabelValues("ok").Observe(time.Since(transitionStartTime).Seconds())
+						observe("ok")
 						return nil
 					}
 
@@ -221,37 +191,31 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 					)
 					switch {
 					case isAbort:
-						localTransitionCounterVec.WithLabelValues("abort").Inc()
-						localTransitionDurationVec.WithLabelValues("abort").Observe(time.Since(transitionStartTime).Seconds())
+						observe("abort")
 						logger.ErrorContext(transitionCtx, "transition aborted", "error", err)
 						return backoff.Permanent(halt(err))
 					case isUnrecoverable:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", ue.Kind.String()))
-						localTransitionCounterVec.WithLabelValues("unrecoverable").Inc()
-						localTransitionDurationVec.WithLabelValues("unrecoverable").Observe(time.Since(transitionStartTime).Seconds())
+						observe("unrecoverable")
 						logger.ErrorContext(transitionCtx, "reached unrecoverable error, canceling FSM", "error", err)
 						return backoff.Permanent(halt(err))
 					case isHandoff:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", "fsmHandoffError"))
-						localTransitionCounterVec.WithLabelValues("fsm_handoff_error").Inc()
-						localTransitionDurationVec.WithLabelValues("fsm_handoff_error").Observe(time.Since(transitionStartTime).Seconds())
+						observe("fsm_handoff_error")
 						logger.ErrorContext(transitionCtx, "reached fsm handoff error, canceling FSM", "error", err)
 						return backoff.Permanent(halt(err))
 					case errors.Is(err, ErrLeaseLost):
 						// Retrying a fenced write can never succeed; the run halts and the new
 						// owner drives it to completion.
-						localTransitionCounterVec.WithLabelValues("lease_lost").Inc()
-						localTransitionDurationVec.WithLabelValues("lease_lost").Observe(time.Since(transitionStartTime).Seconds())
+						observe("lease_lost")
 						logger.WarnContext(transitionCtx, "run lease lost, halting", "error", err)
 						return backoff.Permanent(err)
 					case ctx.Err() != nil:
-						localTransitionCounterVec.WithLabelValues("canceled").Inc()
-						localTransitionDurationVec.WithLabelValues("canceled").Observe(time.Since(transitionStartTime).Seconds())
+						observe("canceled")
 						logger.InfoContext(transitionCtx, "transition canceled", "error", context.Cause(ctx))
 						return backoff.Permanent(haltOnCancel(ctx, err))
 					default:
-						localTransitionCounterVec.WithLabelValues("error").Inc()
-						localTransitionDurationVec.WithLabelValues("error").Observe(time.Since(transitionStartTime).Seconds())
+						observe("error")
 						logger.WarnContext(transitionCtx, "transition failed, retrying", "error", err)
 						return err
 					}

@@ -99,7 +99,7 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			updated = manifest
 			return nil
 		case errors.Is(err, errEtagMismatch):
-			casRetriesVec.WithLabelValues("manifest").Inc()
+			s.instruments.casRetry(ctx, "manifest")
 			s.logger.DebugContext(ctx, "manifest changed concurrently, retrying", "key", key)
 			return err
 		default:

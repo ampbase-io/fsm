@@ -503,13 +503,13 @@ The admin gRPC service (`FSMService`) is unchanged in its interface. `ListActive
 
 ### Observability
 
-New metrics:
+Metrics are OpenTelemetry instruments on the Meter `Config.MeterProvider` supplies (the global provider by default). New with this backend:
 
-- `fsm_object_storage_cas_retries_total` — Counter of CAS retry attempts per operation type.
-- `fsm_object_storage_latency_seconds` — Histogram of object storage operation latency.
-- `fsm_lease_renewals_total` — Counter of successful and failed lease renewals.
-- `fsm_queue_broker_commits_total` — Counter of group commit flushes per queue.
-- `fsm_queue_depth` — Gauge of pending jobs per queue.
+- `fsm.object_storage.cas.retries` — Counter of compare-and-swap retries, by `fsm.cas.kind` (`conflict`, `manifest`, `queue`).
+- `fsm.object_storage.operation.duration` — Histogram of object storage operation latency, by `fsm.storage.op` and `fsm.storage.outcome`.
+- `fsm.lease.renewals` — Counter of lease renewal outcomes, by `fsm.lease.result` (`extended`, `lost`, `claimed`, `claim_lost`).
+- `fsm.queue.commits` — Counter of successful queue-roster CAS writes, per queue.
+- `fsm.queue.depth` — Gauge of admitted (in-flight) runs in a queue's roster, per queue; pending queued runs live under `locks/`, not the roster.
 
 New trace attributes on run spans: `fsm.owner_node`, `fsm.lease_epoch`, `fsm.storage_backend`.
 

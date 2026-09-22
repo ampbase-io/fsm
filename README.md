@@ -141,3 +141,36 @@ signals share a vocabulary: `fsm.action`, `fsm.type`, `fsm.alias`, `fsm.id`, `fs
 on a transition's lines `fsm.state` and `fsm.transition_version`. The JSON handler nests them
 under `"fsm"`; the text handler dots them. Outside the group: `sys` (`fsm` or `fsm-store`),
 `retry_count` on a retry's lines, and per-line keys such as `error`, `queue` and `key`.
+
+### Metrics
+
+Metrics are OpenTelemetry instruments. Pass a `metric.MeterProvider` as `Config.MeterProvider`;
+the default is the OTel global provider, which records nothing until an SDK is installed. Traces
+come from the global tracer provider.
+
+| Instrument | Kind | Attributes |
+|---|---|---|
+| `fsm.run.completed` | counter | `fsm.action`, `fsm.resource`, `fsm.status`, `fsm.error.kind` |
+| `fsm.run.duration` (s) | histogram | same |
+| `fsm.transition.completed` | counter | `fsm.action`, `fsm.state`, `fsm.resource`, `fsm.status` |
+| `fsm.transition.duration` (s) | histogram | same |
+| `fsm.object_storage.operation.duration` (s) | histogram | `fsm.storage.op`, `fsm.storage.outcome` |
+| `fsm.object_storage.cas.retries` | counter | `fsm.cas.kind` |
+| `fsm.lease.renewals` | counter | `fsm.lease.result` |
+| `fsm.queue.depth` | gauge | `fsm.queue` |
+| `fsm.queue.commits` | counter | `fsm.queue` |
+
+A transition can run for hours, so the duration histograms carry explicit bucket advice up to
+4 h for an SDK with no View. The recommended configuration is a base-2 exponential histogram,
+which fits any range at a fixed cost; the library's own tests run under this View:
+
+```go
+provider := sdkmetric.NewMeterProvider(
+    sdkmetric.WithReader(exporter),
+    sdkmetric.WithView(sdkmetric.NewView(
+        sdkmetric.Instrument{Name: "fsm.*.duration"},
+        sdkmetric.Stream{Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{MaxSize: 160, MaxScale: 20}},
+    )),
+)
+m, err := fsm.New(fsm.Config{DBPath: "/var/lib/myapp/fsm", MeterProvider: provider})
+```

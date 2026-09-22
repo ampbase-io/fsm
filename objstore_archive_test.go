@@ -405,7 +405,7 @@ func TestArchiveLoopConsumesSignal(t *testing.T) {
 
 func TestArchiveDisabledStartsNoLoop(t *testing.T) {
 	bucket, url, _ := startFakeS3(t)
-	s, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
+	s, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{
 		Bucket:          bucket,
 		Endpoint:        url,
 		Region:          "auto",
