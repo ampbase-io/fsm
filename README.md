@@ -100,3 +100,19 @@ m, err := fsm.New(fsm.Config{
     },
 })
 ```
+
+## Parent and child runs
+
+`fsm.WithParent(version)` records a run as a child of another, so `Children` and
+`ActiveChildren` list it. That is all it does:
+
+- **Lifetimes are independent.** Canceling or finishing the parent does not reach the child. A
+  parent that must not finish over a live child cancels it and waits for it.
+- **Ids are not scoped to the parent.** A run's lock is its type, id and action. Two parents that
+  start a child under one id contend for the same resource, and the second gets an
+  `AlreadyRunningError` naming the first parent's run. A parent that adopts the run that error
+  names should put its own run version in its children's ids.
+- **"Start this child unless I already did" needs more than that error.** Transitions and
+  finalizers run at least once, so a parent re-enters the code that starts its children.
+  `AlreadyRunningError` covers only a child still running: a finished child's id can be started
+  again, and queued starts stack. Check `Runs(id)` before starting.

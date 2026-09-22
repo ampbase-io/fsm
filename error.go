@@ -30,6 +30,12 @@ var (
 	errInvalidResource = errors.New("invalid resource payload")
 )
 
+// AlreadyRunningError reports that a Start found an unfinished run of the same type, id and
+// action. Version is whichever run that is — not necessarily one the caller started, nor a child
+// of the parent it named with WithParent. Two cases never report it: a finished run, whose id
+// can be started again, and a queued Start, since queued runs of one id stack. So "start this
+// unless it was already started" cannot rest on this error alone; Runs lists an id's finished
+// runs too, for as long as the backend retains them.
 type AlreadyRunningError struct {
 	Version ulid.ULID
 }

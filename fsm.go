@@ -502,6 +502,12 @@ func WithQueue(queue string) StartOptionsFn {
 	}
 }
 
+// WithParent records the run as a child of parent, so Children and ActiveChildren list it. It is
+// an index entry and nothing more. The child's lifetime is its own: canceling or finishing the
+// parent does not reach it. And its id is not scoped to the parent: two parents that start a
+// child under one id contend for the same resource, and the second gets an AlreadyRunningError
+// naming the first's run. A parent that adopts the run such an error names should give its
+// children ids no other parent can produce — its own run version in the id does.
 func WithParent(parent ulid.ULID) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.parent = parent
