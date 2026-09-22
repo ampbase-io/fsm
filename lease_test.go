@@ -66,7 +66,7 @@ func asymmetricTimings(ownerHeartbeat time.Duration) func(*ObjectStorageConfig) 
 func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectStore {
 	h.t.Helper()
 
-	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
 		Bucket:       h.bucket,
 		Endpoint:     h.url,
 		Region:       "auto",

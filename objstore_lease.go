@@ -148,9 +148,9 @@ func (s *objectStore) extendLeases(ctx context.Context) {
 		})
 		switch {
 		case err == nil:
-			leaseRenewalsVec.WithLabelValues("extended").Inc()
+			s.instruments.leaseRenewal(ctx, "extended")
 		case errors.Is(err, ErrLeaseLost), errors.Is(err, ErrFsmNotFound):
-			leaseRenewalsVec.WithLabelValues("lost").Inc()
+			s.instruments.leaseRenewal(ctx, "lost")
 			s.dropLease(version)
 		case errors.Is(err, context.Canceled):
 			// Shutdown mid-pass; Close releases the leases.
@@ -224,12 +224,12 @@ func (s *objectStore) claimReserved(ctx context.Context, version ulid.ULID, queu
 	})
 	if err != nil {
 		if errors.Is(err, errClaimLost) {
-			leaseRenewalsVec.WithLabelValues("claim_lost").Inc()
+			s.instruments.leaseRenewal(ctx, "claim_lost")
 		}
 		s.dropLease(version)
 		return nil, err
 	}
-	leaseRenewalsVec.WithLabelValues("claimed").Inc()
+	s.instruments.leaseRenewal(ctx, "claimed")
 	s.trackLease(version, manifest.GetLeaseEpoch(), queue)
 	return manifest, nil
 }

@@ -94,12 +94,12 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 
 		switch werr := s.putRoster(ctx, key, body, etag); {
 		case werr == nil:
-			queueCommitsVec.WithLabelValues(name).Inc()
-			queueDepthVec.WithLabelValues(name).Set(float64(len(queue.GetJobs())))
+			s.instruments.queueCommit(ctx, name)
+			s.instruments.queueDepth(ctx, name, len(queue.GetJobs()))
 			result = queue
 			return nil
 		case errors.Is(werr, errEtagMismatch):
-			casRetriesVec.WithLabelValues("queue").Inc()
+			s.instruments.casRetry(ctx, "queue")
 			s.logger.DebugContext(ctx, "queue roster changed concurrently, retrying", "queue", name)
 			return werr
 		default:

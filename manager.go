@@ -20,13 +20,18 @@ import (
 
 	"github.com/oklog/ulid/v2"
 	"go.opentelemetry.io/otel"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
 
-const tracerName = "fsm"
+// The instrumentation scope the tracer and meter share.
+const (
+	instrumentationName    = "fsm"
+	instrumentationVersion = "0.1.0"
+)
 
 // Store is the persistence contract the Manager requires of a storage backend. Narrower views a
 // single call site needs are declared at that site instead.
@@ -88,6 +93,8 @@ type Manager struct {
 	logger *slog.Logger
 
 	tracer trace.Tracer
+
+	instruments *instruments
 
 	wg sync.WaitGroup
 
@@ -164,6 +171,18 @@ type Config struct {
 	// bus only degrades latency to the polling floors. The default is a no-op bus; the library
 	// never imports a broker. Applies to the object storage backend.
 	EventBus EventBus
+
+	// MeterProvider supplies the Meter the library's metrics are recorded through. Defaults to
+	// the OpenTelemetry global provider, which records nothing until an SDK is installed.
+	MeterProvider metric.MeterProvider
+}
+
+// meterProvider returns the configured provider, or the global one.
+func (cfg Config) meterProvider() metric.MeterProvider {
+	if cfg.MeterProvider != nil {
+		return cfg.MeterProvider
+	}
+	return otel.GetMeterProvider()
 }
 
 // New creates a new FSM manager to register and run FSMs.
@@ -179,12 +198,19 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("DBPath and ObjectStorage are mutually exclusive; set exactly one")
 	}
 
-	tracer := otel.GetTracerProvider().Tracer(tracerName,
-		trace.WithInstrumentationVersion("0.1.0"),
+	tracer := otel.GetTracerProvider().Tracer(instrumentationName,
+		trace.WithInstrumentationVersion(instrumentationVersion),
 		trace.WithSchemaURL(semconv.SchemaURL),
 	)
+	instruments, err := newInstruments(cfg.meterProvider().Meter(instrumentationName,
+		metric.WithInstrumentationVersion(instrumentationVersion),
+		metric.WithSchemaURL(semconv.SchemaURL),
+	))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metric instruments: %w", err)
+	}
 
-	store, err := newBackend(cfg, tracer, cfg.Logger.With("sys", "fsm-store"))
+	store, err := newBackend(cfg, tracer, instruments, cfg.Logger.With("sys", "fsm-store"))
 	if err != nil {
 		return nil, err
 	}
@@ -192,15 +218,16 @@ func New(cfg Config) (*Manager, error) {
 	done := make(chan struct{})
 
 	man := &Manager{
-		logger:     cfg.Logger.With("sys", "fsm"),
-		tracer:     tracer,
-		store:      store,
-		bus:        busOrNoop(cfg.EventBus),
-		fsms:       map[fsmKey]*fsm{},
-		queues:     make(map[string]*queuedRunner, len(cfg.Queues)),
-		done:       done,
-		claimNudge: make(chan struct{}, 1),
-		running:    map[ulid.ULID]runHandle{},
+		logger:      cfg.Logger.With("sys", "fsm"),
+		tracer:      tracer,
+		instruments: instruments,
+		store:       store,
+		bus:         busOrNoop(cfg.EventBus),
+		fsms:        map[fsmKey]*fsm{},
+		queues:      make(map[string]*queuedRunner, len(cfg.Queues)),
+		done:        done,
+		claimNudge:  make(chan struct{}, 1),
+		running:     map[ulid.ULID]runHandle{},
 	}
 
 	// A store that coordinates run ownership via leases runs the background coordinate loop and
@@ -255,9 +282,9 @@ func New(cfg Config) (*Manager, error) {
 
 // newBackend constructs the storage backend selected by the config. Exactly one of DBPath or
 // ObjectStorage is set; the caller validates that.
-func newBackend(cfg Config, tracer trace.Tracer, logger *slog.Logger) (Store, error) {
+func newBackend(cfg Config, tracer trace.Tracer, instruments *instruments, logger *slog.Logger) (Store, error) {
 	if cfg.ObjectStorage != nil {
-		return newObjectStore(context.Background(), logger, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus, cfg.Queues)
+		return newObjectStore(context.Background(), logger, instruments, cfg.ObjectStorage, cfg.NodeID, cfg.EventBus, cfg.Queues)
 	}
 	if err := os.MkdirAll(cfg.DBPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to setup DB path: %w", err)

@@ -196,7 +196,7 @@ func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
 	t.Helper()
 
 	bucket, url, fake := startFakeS3(t)
-	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{
 		Bucket:   bucket,
 		Endpoint: url,
 		Region:   "auto",
@@ -219,7 +219,7 @@ func testULID(t *testing.T, ms uint64) ulid.ULID {
 }
 
 func TestObjectStoreRequiresBucket(t *testing.T) {
-	if _, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{}, "node-test", nil, nil); err == nil {
+	if _, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{}, "node-test", nil, nil); err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }

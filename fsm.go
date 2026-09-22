@@ -15,30 +15,9 @@ import (
 
 	"github.com/benbjohnson/immutable"
 	"github.com/oklog/ulid/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-)
-
-var (
-	actionCounterVec = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "fsm_action_count",
-			Help: "A count of action completions.",
-		},
-		[]string{"action", "resource", "status", "kind"},
-	)
-
-	actionDurationVec = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "fsm_action_duration_seconds",
-			Help:    "Time spent performing an action.",
-			Buckets: []float64{.5, 1, 2.5, 5, 10, 30, 60, 150, 300, 600, 1200},
-		},
-		[]string{"action", "resource", "status", "kind"},
-	)
 )
 
 type Request[R, W any] struct {
@@ -748,16 +727,9 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		}()
 
 		logger.InfoContext(ctx, "starting fsm")
-		localActionCounterVec := actionCounterVec.MustCurryWith(prometheus.Labels{
-			"action":   action,
-			"resource": alias,
-		})
 
-		actionStartTime := ulid.Time(runVersion.Time())
-		localActionDurationVec := actionDurationVec.MustCurryWith(prometheus.Labels{
-			"action":   action,
-			"resource": alias,
-		})
+		// The run's duration counts from its submission, so a queued or delayed wait is included.
+		runStart := ulid.Time(runVersion.Time())
 
 		request.withLogger(m.logger)
 		for _, init := range ri.initializers {
@@ -823,18 +795,15 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			)
 			switch {
 			case isAbort:
-				localActionCounterVec.WithLabelValues("abort", "").Inc()
-				localActionDurationVec.WithLabelValues("abort", "").Observe(time.Since(actionStartTime).Seconds())
+				m.instruments.observeRun(ctx, run, "abort", "", runStart)
 				span.SetAttributes(attribute.String("fsm.error_kind", "abort"))
 			case isUnrecoverable:
 				kind := ue.Kind.String()
-				localActionCounterVec.WithLabelValues("unrecoverable", kind).Inc()
-				localActionDurationVec.WithLabelValues("unrecoverable", "").Observe(time.Since(actionStartTime).Seconds())
+				m.instruments.observeRun(ctx, run, "unrecoverable", kind, runStart)
 				span.SetAttributes(attribute.String("fsm.error_kind", kind))
 				transitionLogger.ErrorContext(ctx, "reached unrecoverable error, canceling FSM", "error", err)
 			case isHandoff:
-				localActionCounterVec.WithLabelValues("fsm_handoff_error", "").Inc()
-				localActionDurationVec.WithLabelValues("fsm_handoff_error", "").Observe(time.Since(actionStartTime).Seconds())
+				m.instruments.observeRun(ctx, run, "fsm_handoff_error", "", runStart)
 				span.SetAttributes(attribute.String("fsm.error_kind", "handoff"))
 			}
 			request.withError(RunErr{
@@ -843,8 +812,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			})
 		}
 		if request.Run().fsmErr.Err == nil {
-			localActionCounterVec.WithLabelValues("ok", "").Inc()
-			localActionDurationVec.WithLabelValues("ok", "").Observe(time.Since(actionStartTime).Seconds())
+			m.instruments.observeRun(ctx, run, "ok", "", runStart)
 		}
 	}
 
