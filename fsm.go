@@ -777,12 +777,12 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				return
 			}
 
-			// A handler that ran to completion despite an operator's cancel still halts the run;
-			// halt(nil) is nil, so a live context changes nothing.
-			if err == nil {
-				err = halt(context.Cause(transitionCtx))
-			}
-			if err == nil {
+			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
+			case err == nil && canceled:
+				// The handler finished its work after the cancel landed. The cancel is still the
+				// run's outcome: Cancel has already answered its caller.
+				err = halt(cancel)
+			case err == nil:
 				continue
 			}
 

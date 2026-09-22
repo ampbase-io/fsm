@@ -311,6 +311,56 @@ func testShutdownReleasesFinalizer(t *testing.T, f *managerFactory) {
 	}
 }
 
+// TestCancelLandingOnCompletedHandler verifies an accepted cancel is the run's outcome even when
+// the handler it landed on never read its context and returned success: Cancel has already
+// answered its caller, so the run must not finish as a success behind it.
+func TestCancelLandingOnCompletedHandler(t *testing.T) {
+	runBackends(t, testCancelLandingOnCompletedHandler)
+}
+
+func testCancelLandingOnCompletedHandler(t *testing.T, f *managerFactory) {
+	ctx := context.Background()
+	m, _ := f.newManager(nil)
+
+	running := make(chan context.Context, 1)
+	release := make(chan struct{})
+	finalized := make(chan RunErr, 1)
+	start, _, err := m.Register[orderReq, orderResp]("cancel-ignored").
+		Start("work", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			running <- ctx
+			<-release
+			return NewResponse(&orderResp{Status: "ok"}), nil
+		}).
+		End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], runErr RunErr) {
+			finalized <- runErr
+		})).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "cancel-ignored-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	handlerCtx := within(t, running, 10*time.Second, "the run to start")
+	if err := m.Cancel(ctx, version, "operator says stop"); err != nil {
+		t.Fatalf("cancel failed: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool { return handlerCtx.Err() != nil }, "the cancel never reached the handler's context")
+	close(release)
+
+	runErr := within(t, finalized, 10*time.Second, "the finalizer")
+	if _, ok := errors.AsType[*CancelError](runErr.Err); !ok || runErr.State != "work" {
+		t.Fatalf("expected the finalizer to observe the cancel in state work, got %+v", runErr)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.Wait(waitCtx, version); err == nil || err.Error() != "operator says stop" {
+		t.Fatalf("expected the accepted cancel as the run's outcome, got %v", err)
+	}
+}
+
 // TestStrayCanceledIsRetried verifies a handler's own context.Canceled — from a context it
 // derived, while the run's is live — is an ordinary failure, not a completed transition.
 func TestStrayCanceledIsRetried(t *testing.T) { runBackends(t, testStrayCanceledIsRetried) }
