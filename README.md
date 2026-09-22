@@ -122,7 +122,9 @@ m, err := fsm.New(fsm.Config{
 ### Logging
 
 The library logs through `log/slog`. Pass a `*slog.Logger` as `Config.Logger`; the default is
-`slog.Default()`. Handlers get a logger through `req.Log()`, carrying the run's attributes.
+`slog.Default()`. Handlers get a logger through `req.Log()`, carrying the run's attributes. Every
+log call that has a context passes it to the handler, so a handler that reads trace context —
+an OpenTelemetry slog bridge, say — attaches each line to the run's span.
 
 ```go
 m, err := fsm.New(fsm.Config{
@@ -132,7 +134,10 @@ m, err := fsm.New(fsm.Config{
 ```
 
 Levels: a run's start and stop, a claim, and shutdown are Info; each transition, each wait, and
-each queued dispatch are Debug; a retry is Warn; a halt or a storage failure is Error. Attributes
-a run carries: `sys` (`fsm` or `fsm-store`), `run_id`, `run_type`, `run_alias`, `run_version`,
-then `transition` and `transition_version` on each transition's lines, and `retry_count` on a
-retry's.
+each queued dispatch are Debug; a retry is Warn; a halt or a storage failure is Error.
+
+A run's identity is one `fsm` group, keyed like its span and metric attributes so the three
+signals share a vocabulary: `fsm.action`, `fsm.type`, `fsm.alias`, `fsm.id`, `fsm.version`, and
+on a transition's lines `fsm.state` and `fsm.transition_version`. The JSON handler nests them
+under `"fsm"`; the text handler dots them. Outside the group: `sys` (`fsm` or `fsm-store`),
+`retry_count` on a retry's lines, and per-line keys such as `error`, `queue` and `key`.

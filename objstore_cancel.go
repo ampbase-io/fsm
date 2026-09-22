@@ -72,7 +72,7 @@ func (s *objectStore) pendingCancellations(ctx context.Context) (map[ulid.ULID]e
 	for _, key := range keys {
 		version, err := versionFromKey(key)
 		if err != nil {
-			s.logger.Warn("malformed cancel sentinel key", "error", err, "key", key)
+			s.logger.WarnContext(ctx, "malformed cancel sentinel key", "error", err, "key", key)
 			continue
 		}
 		if _, ok := owned[version]; !ok {
@@ -80,7 +80,7 @@ func (s *objectStore) pendingCancellations(ctx context.Context) (map[ulid.ULID]e
 		}
 		body, _, err := s.getObject(ctx, key)
 		if err != nil {
-			s.logger.Error("failed to read cancel sentinel", "error", err, "key", key)
+			s.logger.ErrorContext(ctx, "failed to read cancel sentinel", "error", err, "key", key)
 			continue
 		}
 		cancels[version] = &CancelError{Reason: string(body)}

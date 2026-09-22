@@ -45,11 +45,11 @@ type Request[R, W any] struct {
 	Msg *R
 	W   Response[W]
 
-	// runLogger carries the run's attributes; logger adds the current transition's. Each
-	// transition derives from runLogger, never from the previous transition's logger, or the
-	// transition attributes would accumulate (slog's With appends).
-	runLogger, logger *slog.Logger
-	run               Run
+	// base is the Manager's logger; logger is base with the run's attributes, rebuilt from
+	// base on every transition rather than derived from the previous transition's logger (slog's
+	// With appends, so the attributes would accumulate).
+	base, logger *slog.Logger
+	run          Run
 
 	// leaseEpoch is the epoch this node holds the run's lease at, surfaced to handlers through
 	// FencingToken. Zero under a single-process backend, which has no leases.
@@ -92,15 +92,36 @@ func (r *Request[_, _]) FencingToken() FencingToken {
 	return FencingToken{RunVersion: r.run.StartVersion, LeaseEpoch: r.leaseEpoch}
 }
 
-func (r *Request[_, _]) withLogger(logger *slog.Logger) {
-	r.runLogger = logger
-	r.logger = logger
+func (r *Request[_, _]) withLogger(base *slog.Logger) {
+	r.base = base
+	r.logger = base.With(runAttr(r.run))
 }
 
 func (r *Request[_, _]) withTransition(name string, version ulid.ULID) {
-	r.logger = r.runLogger.With("transition", name, "transition_version", version)
 	r.run.TransitionVersion = version
 	r.run.CurrentState = name
+	r.logger = r.base.With(runAttr(r.run))
+}
+
+// runAttr groups a run's identity under fsm, keyed like the run's span and metric attributes, so
+// the three signals share one vocabulary. The transition keys are present once the run is in one.
+func runAttr(run Run) slog.Attr {
+	attrs := []any{
+		"action", run.Action,
+		"type", run.TypeName,
+		"alias", run.ResourceName,
+		"id", run.ID,
+		"version", run.StartVersion.String(),
+	}
+	if run.CurrentState != "" {
+		attrs = append(attrs, "state", run.CurrentState, "transition_version", run.TransitionVersion.String())
+	}
+	return slog.Group("fsm", attrs...)
+}
+
+// versionAttr is runAttr for a site that knows a run only by its version.
+func versionAttr(version ulid.ULID) slog.Attr {
+	return slog.Group("fsm", "version", version.String())
 }
 
 func (r *Request[_, _]) withError(err RunErr) {
@@ -147,11 +168,11 @@ type AnyRequest interface {
 // executing a transition are introduced
 func MockRequest[R, W any](req *Request[R, W], logger *slog.Logger, run Run) *Request[R, W] {
 	return &Request[R, W]{
-		Msg:       req.Msg,
-		W:         req.W,
-		runLogger: logger,
-		logger:    logger,
-		run:       run,
+		Msg:    req.Msg,
+		W:      req.W,
+		base:   logger,
+		logger: logger.With(runAttr(run)),
+		run:    run,
 	}
 }
 
@@ -382,7 +403,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 	return func(ctx context.Context, resource *activeResource) error {
 		clearRun := func(run Run) {
 			if err := m.store.ForgetRun(run); err != nil {
-				m.logger.Error("failed to update fsm state store", "error", err)
+				m.logger.ErrorContext(ctx, "failed to update fsm state store", "error", err)
 			}
 		}
 
@@ -395,7 +416,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		if runAfter := resource.active.GetOptions().GetRunAfter(); runAfter != nil {
 			if err := startOpt.runAfter.UnmarshalText(runAfter); err != nil {
-				m.logger.Error("failed to unmarshal run_after", "error", err)
+				m.logger.ErrorContext(ctx, "failed to unmarshal run_after", "error", err)
 			}
 		}
 
@@ -403,7 +424,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
 			if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
-				m.logger.Error("failed to unmarshal parent", "error", err)
+				m.logger.ErrorContext(ctx, "failed to unmarshal parent", "error", err)
 			}
 		}
 
@@ -420,7 +441,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 
 		var req R
 		if err := f.rCodec.Unmarshal(resource.active.Resource, &req); err != nil {
-			m.logger.Error("failed to unmarshal resource, unable to resume", "error", err)
+			m.logger.ErrorContext(ctx, "failed to unmarshal resource, unable to resume", "error", err)
 			clearRun(r)
 			return err
 		}
@@ -428,12 +449,12 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		var w W
 		if resource.response != nil {
 			if err := f.wCodec.Unmarshal(resource.response, &w); err != nil {
-				m.logger.Error("failed to unmarshal response, unable to resume", "error", err, "response_bytes", string(resource.response))
+				m.logger.ErrorContext(ctx, "failed to unmarshal response, unable to resume", "error", err, "response_bytes", string(resource.response))
 				clearRun(r)
 				return err
 			}
 		}
-		m.logger.Debug("pruning completed transitions", "completed", resource.completedTransitions)
+		m.logger.DebugContext(ctx, "pruning completed transitions", "completed", resource.completedTransitions)
 
 		remainingTransitions := immutable.NewList[*transition]()
 		for _, name := range resource.active.Transitions {
@@ -444,7 +465,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 					name:     name,
 				}]
 				if !ok {
-					m.logger.Warn("transition did not exist", "transition", name)
+					m.logger.WarnContext(ctx, "transition did not exist", slog.Group("fsm", "version", resource.version.String(), "state", name))
 					transition = newTransition(name, noOp, TransitionConfig[R, W]{
 						interceptors: []TransitionInterceptorFunc{
 							skipper(),
@@ -526,11 +547,11 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 			opt(&startOpt)
 		}
 
-		logger := m.logger.With("run_id", id, "run_type", f.typeName, "run_alias", f.alias)
+		logger := m.logger.With(slog.Group("fsm", "action", f.action, "type", f.typeName, "alias", f.alias, "id", id))
 
 		resource, err := f.rCodec.Marshal(request.Msg)
 		if err != nil {
-			logger.Error("failed to marshal request", "error", err)
+			logger.ErrorContext(ctx, "failed to marshal request", "error", err)
 			return ulid.ULID{}, fmt.Errorf("failed to marshal request: %w", err)
 		}
 
@@ -543,7 +564,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		// keep executing locally (matching runnerFromOpts precedence).
 		if _, ok := m.store.(runClaimer); ok && admissionControlled(&startOpt) {
 			if _, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, true); err != nil {
-				logger.Error("failed to append start event", "error", err)
+				logger.ErrorContext(ctx, "failed to append start event", "error", err)
 				return ulid.ULID{}, err
 			}
 			m.nudgeClaim()
@@ -567,7 +588,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 
 		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, false)
 		if err != nil {
-			logger.Error("failed to append start event", "error", err)
+			logger.ErrorContext(ctx, "failed to append start event", "error", err)
 			return ulid.ULID{}, err
 		}
 		request.run = startedRun
@@ -652,7 +673,6 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	var (
 		run        = request.Run()
 		runVersion = run.StartVersion
-		id         = run.ID
 		action     = run.Action
 		alias      = run.ResourceName
 		typeName   = run.TypeName
@@ -694,7 +714,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 	ctx, span := m.tracer.Start(ctx, fmt.Sprintf("%s.%s", alias, action), startOpts...)
 
-	logger := m.logger.With("run_id", id, "run_type", typeName, "run_alias", alias, "run_version", runVersion.String())
+	logger := m.logger.With(runAttr(run))
 
 	runFn := func() {
 		// What stops the run and what halts its transitions are different events: runCtx ends on
@@ -727,7 +747,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			stop(nil)
 		}()
 
-		logger.Info("starting fsm")
+		logger.InfoContext(ctx, "starting fsm")
 		localActionCounterVec := actionCounterVec.MustCurryWith(prometheus.Labels{
 			"action":   action,
 			"resource": alias,
@@ -739,7 +759,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			"resource": alias,
 		})
 
-		request.withLogger(logger)
+		request.withLogger(m.logger)
 		for _, init := range ri.initializers {
 			ctx = init(ctx, request)
 		}
@@ -755,14 +775,14 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			idx, transition := iter.Next()
 			transitionName := transition.name
 			transitionVersion := ulid.Make()
-			transitionLogger := logger.With("transition", transitionName, "transition_version", transitionVersion)
 			request.withTransition(transitionName, transitionVersion)
+			transitionLogger := request.Log()
 
 			if stopped(runCtx, transitionLogger) {
 				return
 			}
 
-			transitionLogger.Debug("running transition")
+			transitionLogger.DebugContext(ctx, "running transition")
 
 			transitionCtx := ctx
 			if idx == finisher {
@@ -786,7 +806,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			if errors.Is(err, ErrLeaseLost) {
 				// Halt without finalizers or FINISH: this node may no longer write to the run,
 				// and the new owner runs them at its own finish.
-				transitionLogger.Warn("run lease lost, halting")
+				transitionLogger.WarnContext(ctx, "run lease lost, halting")
 				return
 			}
 
@@ -811,7 +831,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				localActionCounterVec.WithLabelValues("unrecoverable", kind).Inc()
 				localActionDurationVec.WithLabelValues("unrecoverable", "").Observe(time.Since(actionStartTime).Seconds())
 				span.SetAttributes(attribute.String("fsm.error_kind", kind))
-				transitionLogger.Error("reached unrecoverable error, canceling FSM", "error", err)
+				transitionLogger.ErrorContext(ctx, "reached unrecoverable error, canceling FSM", "error", err)
 			case isHandoff:
 				localActionCounterVec.WithLabelValues("fsm_handoff_error", "").Inc()
 				localActionDurationVec.WithLabelValues("fsm_handoff_error", "").Observe(time.Since(actionStartTime).Seconds())
@@ -853,7 +873,7 @@ func stopped(runCtx context.Context, logger *slog.Logger) bool {
 	if cause == nil {
 		return false
 	}
-	logger.Info("run stopped", "error", cause)
+	logger.InfoContext(runCtx, "run stopped", "error", cause)
 	return true
 }
 

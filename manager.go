@@ -302,7 +302,7 @@ func (m *Manager) Shutdown(timeout time.Duration) {
 
 	m.mu.RLock()
 	for id, run := range m.running {
-		m.logger.Info("shutting down fsm", "fsm_id", id.String())
+		m.logger.Info("shutting down fsm", versionAttr(id))
 		run.stop(ErrShutdown)
 	}
 	m.mu.RUnlock()
@@ -508,19 +508,19 @@ func (m *Manager) executing(version ulid.ULID) (runHandle, bool) {
 
 // Wait blocks until the run with the given version completes.
 func (m *Manager) Wait(ctx context.Context, version ulid.ULID) error {
-	logger := m.logger.With("start_version", version.String())
+	logger := m.logger.With(versionAttr(version))
 
-	logger.Debug("waiting for FSM to finish")
-	defer logger.Debug("done waiting for FSM to finish")
+	logger.DebugContext(ctx, "waiting for FSM to finish")
+	defer logger.DebugContext(ctx, "done waiting for FSM to finish")
 	return m.store.WaitRun(ctx, version)
 }
 
 // WaitByID blocks until the run with the given ID completes.
 func (m *Manager) WaitByID(ctx context.Context, id string) error {
-	logger := m.logger.With("fsm_run_id", id)
+	logger := m.logger.With(slog.Group("fsm", "id", id))
 
-	logger.Debug("waiting for FSM to finish")
-	defer logger.Debug("done waiting for FSM to finish")
+	logger.DebugContext(ctx, "waiting for FSM to finish")
+	defer logger.DebugContext(ctx, "done waiting for FSM to finish")
 
 	// Resolve the id to its run version. On a miss the version stays zero and WaitRun reports
 	// it via the store (completed) or as not found.
@@ -529,7 +529,7 @@ func (m *Manager) WaitByID(ctx context.Context, id string) error {
 		return err
 	}
 	if version.Compare(ulid.ULID{}) != 0 {
-		logger = logger.With("start_version", version.String())
+		logger = m.logger.With(slog.Group("fsm", "id", id, "version", version.String()))
 	}
 	return m.store.WaitRun(ctx, version)
 }

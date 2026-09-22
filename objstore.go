@@ -354,7 +354,7 @@ func (s *objectStore) putConditional(ctx context.Context, key string, body []byt
 			return nil
 		case isConditionalConflict(err):
 			casRetriesVec.WithLabelValues("conflict").Inc()
-			s.logger.Debug("conditional write conflict, retrying", "key", key)
+			s.logger.DebugContext(ctx, "conditional write conflict, retrying", "key", key)
 			return err
 		default:
 			return backoff.Permanent(err)
@@ -604,7 +604,7 @@ func (s *objectStore) listChildren(ctx context.Context, parent ulid.ULID) ([]uli
 	for _, key := range keys {
 		child, err := versionFromKey(key)
 		if err != nil {
-			s.logger.Error("failed to parse child ULID from key", "error", err, "key", key)
+			s.logger.ErrorContext(ctx, "failed to parse child ULID from key", "error", err, "key", key)
 			continue
 		}
 		children = append(children, child)

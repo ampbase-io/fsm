@@ -67,7 +67,7 @@ func defaultRunner() runner {
 func delayedRunner(delayUntil time.Time) runner {
 	return runnerFn(func(ctx context.Context, logger *slog.Logger, fn func()) {
 		delay := delayUntil.Sub(time.Now())
-		logger.Debug("delaying start", "delay", delay)
+		logger.DebugContext(ctx, "delaying start", "delay", delay)
 		t := time.NewTimer(delay)
 		select {
 		case <-t.C:
@@ -87,12 +87,12 @@ func runAfter(w waiter, after ulid.ULID) runner {
 		err := w.Wait(ctx, after)
 		switch {
 		case errors.Is(err, context.Canceled):
-			logger.Info("context canceled, fsm shutting down")
+			logger.InfoContext(ctx, "context canceled, fsm shutting down")
 			return
 		case errors.Is(err, ErrFsmNotFound):
-			logger.Warn("FSM not found, immediately starting", "run_after_version", after.String())
+			logger.WarnContext(ctx, "FSM not found, immediately starting", "run_after_version", after.String())
 		case err != nil:
-			logger.Error("failed to wait for FSM to complete, immediately starting", "error", err)
+			logger.ErrorContext(ctx, "failed to wait for FSM to complete, immediately starting", "error", err)
 		}
 		fn()
 	})
@@ -122,7 +122,7 @@ func (r *queuedRunner) occupancy(logger *slog.Logger, msg string) {
 func (r *queuedRunner) Run(ctx context.Context, logger *slog.Logger, ack chan struct{}, fn func()) {
 	item := queueItem{
 		fn: func() {
-			logger.Debug("running queued function")
+			logger.DebugContext(ctx, "running queued function")
 			fn()
 		},
 		ack: ack,

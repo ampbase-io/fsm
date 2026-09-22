@@ -78,7 +78,8 @@ func linesWithMessage(lines []string, msg string) []string {
 
 // TestTransitionLogsAreDebug pins the level policy: a consumer logging at Info sees a run start
 // and stop but not every transition; one logging at Debug sees the transitions, and each
-// transition line carries the run's attributes and exactly one transition.
+// transition line carries the run's fsm group — keyed like its span and metric attributes —
+// exactly once.
 func TestTransitionLogsAreDebug(t *testing.T) { runBackends(t, testTransitionLogsAreDebug) }
 
 func testTransitionLogsAreDebug(t *testing.T, f *managerFactory) {
@@ -98,11 +99,13 @@ func testTransitionLogsAreDebug(t *testing.T, f *managerFactory) {
 		t.Fatalf("expected a 'running transition' line per transition at Debug, got %d:\n%s", len(running), strings.Join(running, "\n"))
 	}
 	for _, line := range running {
-		if !strings.Contains(line, "run_id=logged-1") || !strings.Contains(line, "sys=fsm") {
-			t.Fatalf("expected the run's attributes on a transition line, got: %s", line)
+		for _, attr := range []string{"sys=fsm", "fsm.action=logged", "fsm.id=logged-1", "fsm.alias=order_req", "fsm.version="} {
+			if !strings.Contains(line, " "+attr) {
+				t.Fatalf("expected %s on a transition line, got: %s", attr, line)
+			}
 		}
-		if n := strings.Count(line, " transition="); n != 1 {
-			t.Fatalf("expected exactly one transition attribute per line, got %d: %s", n, line)
+		if n := strings.Count(line, " fsm.state="); n != 1 {
+			t.Fatalf("expected exactly one fsm.state per line, got %d: %s", n, line)
 		}
 	}
 }

@@ -44,7 +44,7 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 		run := req.Run()
 
 		for idx, f := range finalizers {
-			logger.Debug("calling finalizer", "finalizer", idx)
+			logger.DebugContext(ctx, "calling finalizer", "finalizer", idx)
 			f(ctx, req, run.fsmErr)
 		}
 
@@ -59,7 +59,7 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 		}
 
 		if _, err := m.store.Append(ctx, run, event); err != nil {
-			logger.Error("failed to append complete event", "error", err)
+			logger.ErrorContext(ctx, "failed to append complete event", "error", err)
 			return nil, err
 		}
 		return nil, nil
@@ -93,7 +93,7 @@ func skipper() TransitionInterceptorFunc {
 	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
 		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
 			if fsmErr := req.Run().fsmErr; fsmErr.Err != nil {
-				req.Log().Debug("skipping transition due to previous error", "error", fsmErr.Err)
+				req.Log().DebugContext(ctx, "skipping transition due to previous error", "error", fsmErr.Err)
 				return nil, nil
 			}
 			return next(ctx, req)
@@ -125,17 +125,17 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 			resp, err := next(ctx, req)
 			switch haltErr, isHalt := errors.AsType[*haltError](err); {
 			case isHalt:
-				logger.Info("transition returned cancelable error, completing run", "error", haltErr.err)
+				logger.InfoContext(ctx, "transition returned cancelable error, completing run", "error", haltErr.err)
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
 				event.Error = haltErr.Error()
 			case err != nil:
 				return resp, err
 			default:
-				logger.Debug("transition completed successfully")
+				logger.DebugContext(ctx, "transition completed successfully")
 				if resp != nil && resp.Any() != nil {
 					b, err := codec.Marshal(resp.Any())
 					if err != nil {
-						logger.Error("failed to marshal response", "error", err)
+						logger.ErrorContext(ctx, "failed to marshal response", "error", err)
 						return nil, err
 					}
 					event.Response = b
@@ -149,10 +149,10 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 			case errors.Is(appendErr, ErrLeaseLost):
 				// A fenced append means the run must halt here even though the transition
 				// itself succeeded; swallowing it would keep executing without a durable record.
-				logger.Warn("append fenced, halting run", "error", appendErr)
+				logger.WarnContext(ctx, "append fenced, halting run", "error", appendErr)
 				return resp, appendErr
 			case appendErr != nil:
-				logger.Error("failed to append complete event", "error", appendErr)
+				logger.ErrorContext(ctx, "failed to append complete event", "error", appendErr)
 			}
 
 			return resp, err
@@ -204,7 +204,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 							localTransitionDurationVec.WithLabelValues("panic").Observe(time.Since(transitionStartTime).Seconds())
 							transitionSpan.SetAttributes(semconv.ExceptionStacktrace(string(debug.Stack())))
 							err = fmt.Errorf("FSM %s.%s transition %s panic", run.ResourceName, run.Action, run.CurrentState)
-							logger.Error("recovered", "error", err, "stack", string(debug.Stack()))
+							logger.ErrorContext(transitionCtx, "recovered", "error", err, "stack", string(debug.Stack()))
 						}
 					}()
 					resp, err = next(withRetry(transitionCtx, retryCount), req)
@@ -223,36 +223,36 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 					case isAbort:
 						localTransitionCounterVec.WithLabelValues("abort").Inc()
 						localTransitionDurationVec.WithLabelValues("abort").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Error("transition aborted", "error", err)
+						logger.ErrorContext(transitionCtx, "transition aborted", "error", err)
 						return backoff.Permanent(halt(err))
 					case isUnrecoverable:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", ue.Kind.String()))
 						localTransitionCounterVec.WithLabelValues("unrecoverable").Inc()
 						localTransitionDurationVec.WithLabelValues("unrecoverable").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Error("reached unrecoverable error, canceling FSM", "error", err)
+						logger.ErrorContext(transitionCtx, "reached unrecoverable error, canceling FSM", "error", err)
 						return backoff.Permanent(halt(err))
 					case isHandoff:
 						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", "fsmHandoffError"))
 						localTransitionCounterVec.WithLabelValues("fsm_handoff_error").Inc()
 						localTransitionDurationVec.WithLabelValues("fsm_handoff_error").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Error("reached fsm handoff error, canceling FSM", "error", err)
+						logger.ErrorContext(transitionCtx, "reached fsm handoff error, canceling FSM", "error", err)
 						return backoff.Permanent(halt(err))
 					case errors.Is(err, ErrLeaseLost):
 						// Retrying a fenced write can never succeed; the run halts and the new
 						// owner drives it to completion.
 						localTransitionCounterVec.WithLabelValues("lease_lost").Inc()
 						localTransitionDurationVec.WithLabelValues("lease_lost").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Warn("run lease lost, halting", "error", err)
+						logger.WarnContext(transitionCtx, "run lease lost, halting", "error", err)
 						return backoff.Permanent(err)
 					case ctx.Err() != nil:
 						localTransitionCounterVec.WithLabelValues("canceled").Inc()
 						localTransitionDurationVec.WithLabelValues("canceled").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Info("transition canceled", "error", context.Cause(ctx))
+						logger.InfoContext(transitionCtx, "transition canceled", "error", context.Cause(ctx))
 						return backoff.Permanent(haltOnCancel(ctx, err))
 					default:
 						localTransitionCounterVec.WithLabelValues("error").Inc()
 						localTransitionDurationVec.WithLabelValues("error").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Warn("transition failed, retrying", "error", err)
+						logger.WarnContext(transitionCtx, "transition failed, retrying", "error", err)
 						return err
 					}
 				},
@@ -260,7 +260,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 				func(err error, _ time.Duration) {
 					switch {
 					case lastErr.Error() != err.Error(), retryCount%10 == 0:
-						logger.Debug("recording transition error")
+						logger.DebugContext(transitionCtx, "recording transition error")
 						if lastErr.Error() != err.Error() {
 							store.Append(ctx,
 								run,
@@ -284,7 +284,7 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 
 						transitionCtx, transitionSpan = newTransitionSpan(ctx, tracer, run)
 					default:
-						logger.Debug("retrying without recording error")
+						logger.DebugContext(transitionCtx, "retrying without recording error")
 					}
 					retryCount++
 					logger = req.Log().With("retry_count", retryCount)
