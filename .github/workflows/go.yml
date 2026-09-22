@@ -30,14 +30,14 @@ jobs:
         run: go mod tidy && git diff --exit-code go.mod go.sum
       - name: Check formatting
         # Must be the toolchain's own gofmt: older gofmt binaries false-positive
-        # on the generic methods the builder API uses. go vet and
-        # typecheck-based linters are skipped for the same reason until their
-        # type checkers learn Go 1.27 generic methods.
+        # on the generic methods the builder API uses.
         run: |
           unformatted="$($(go env GOROOT)/bin/gofmt -l .)"
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
       - name: Build
         run: go build ./...
+      - name: Vet
+        run: go vet ./...
       - name: Test
         # The race detector is load-bearing here — it has caught real
         # coordination bugs the plain suite missed.
@@ -71,5 +71,7 @@ jobs:
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
       - name: Build
         run: go build ./...
+      - name: Vet
+        run: go vet ./...
       - name: Test
         run: go test -race ./...
