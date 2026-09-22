@@ -59,6 +59,10 @@ func (f *fakeS3) setFailDelete(key string) {
 
 // setPrePut arms (or, with nil, disarms) the pre-PUT hook. Set under the harness lock, so a test
 // goroutine can arm it race-free against the server goroutines that read it.
+//
+// A hook that blocks holds one of the server's request goroutines, and the server's Close waits
+// for it. Release it on every test exit — a deferred sync.OnceFunc, not a line after the
+// assertions — or a failed assertion hangs the package to its timeout instead of failing.
 func (f *fakeS3) setPrePut(fn func(key string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

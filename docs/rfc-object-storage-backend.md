@@ -347,6 +347,8 @@ The background archive loop is simplified compared to the BoltDB version. There 
 1. Delete children entries under `children/<run_version>/`.
 1. Update the manifest to `status: "archived"` (or delete it).
 
+**History is readable from the manifest flip.** The history object is the last write of a finish, after the manifest turns terminal and the lock is deleted — and a waiter on another node is released at the flip. `History` therefore answers a run that has a terminal manifest but no history object from that manifest and the FINISH event it points at: the same record the finish is about to write, and the one the archive loop's verify step repairs after a crashed finish. The read writes nothing. Without it, a caller that reads "no history" as "no such run" can start a run that has just finished a second time, since its lock is already free.
+
 S3 lifecycle policies serve as a backstop: configure auto-deletion for objects under the `events/` prefix older than N days.
 
 ### In-Process State Cache (memdb)

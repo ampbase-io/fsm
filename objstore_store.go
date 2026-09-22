@@ -1013,17 +1013,42 @@ func (s *objectStore) localFinish(version ulid.ULID) (RunErr, finishState) {
 	return finish.err, finish.state
 }
 
-// History returns the archived record for a completed run. History objects are written at
-// FINISH time, so any completed run resolves immediately.
+// History returns the terminal record for a completed run, on any node, from the moment the run
+// is observably terminal. The history object is the last write of a finish, after the manifest
+// flip a peer's WaitRun returns at, so a run without one is answered from its terminal manifest.
 func (s *objectStore) History(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error) {
 	history, err := s.readHistory(ctx, runVersion)
-	if err != nil {
-		if errors.Is(err, ErrFsmNotFound) {
-			return nil, fmt.Errorf("history event not found, %s, %w", runVersion, ErrFsmNotFound)
-		}
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		return s.terminalHistory(ctx, runVersion)
+	case err != nil:
 		return nil, err
 	}
 	return history, nil
+}
+
+// terminalHistory builds a run's history record from its terminal manifest and the FINISH event
+// it points at — the same record the finish writes and the archive loop repairs. It writes
+// nothing: the owner's finish, or the archive loop after a crashed one, makes the record durable.
+func (s *objectStore) terminalHistory(ctx context.Context, runVersion ulid.ULID) (*fsmv1.HistoryEvent, error) {
+	notFound := fmt.Errorf("history event not found, %s, %w", runVersion, ErrFsmNotFound)
+
+	manifest, _, err := s.getManifest(ctx, runVersion)
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		return nil, notFound
+	case err != nil:
+		return nil, err
+	}
+	if !manifestTerminal(manifest) {
+		return nil, notFound
+	}
+
+	finishEvent, err := s.finishEventFromManifest(ctx, manifest)
+	if err != nil {
+		return nil, err
+	}
+	return historyFromManifest(manifest, finishEvent), nil
 }
 
 // RunResult returns the run's marshaled response. It reads the terminal manifest, whose
