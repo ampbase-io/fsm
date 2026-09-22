@@ -65,10 +65,10 @@ start, resume, err := m.Register[CreateReq, CreateResp]("create").StrictResume()
 ```
 
 On the object storage backend the refusal happens before the lease is taken, so the run stays
-unowned for a node whose definition has the transition; the refusing node logs a warning and
-counts `fsm.resume.refused`. On BoltDB `resume` returns `ErrUnknownTransition`. Only transitions
-still to run are checked, so a step every in-flight run has already completed can be dropped
-under either mode.
+unowned for a node whose definition has the transition. On BoltDB `resume` returns
+`ErrUnknownTransition`. Either way the refusing node logs a warning naming the transition and
+counts `fsm.resume.refused`. Only transitions still to run are checked, so a step every in-flight
+run has already completed can be dropped under either mode.
 
 ## Cancellation
 

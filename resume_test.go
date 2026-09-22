@@ -14,9 +14,15 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
-// driftFSM registers the "drift" FSM, created → [shipped →] done, with or without StrictResume.
-// created blocks until its context ends unless allowComplete is set, reporting each entry.
-func driftFSM(t *testing.T, m *Manager, strict, withShipped bool, entered chan<- struct{}, allowComplete *atomic.Bool) (Start[orderReq, orderResp], Resume) {
+// drift is how a registration of the drift FSM differs from the created → shipped → done that
+// started the run: strict about resuming, and missing the shipped transition.
+type drift struct {
+	strict, missingShipped bool
+}
+
+// driftFSM registers the drift FSM as d describes it. created blocks until its context ends
+// unless allowComplete is set, reporting each entry.
+func driftFSM(t *testing.T, m *Manager, d drift, entered chan<- struct{}, allowComplete *atomic.Bool) (Start[orderReq, orderResp], Resume) {
 	t.Helper()
 
 	created := func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
@@ -32,14 +38,14 @@ func driftFSM(t *testing.T, m *Manager, strict, withShipped bool, entered chan<-
 	}
 
 	reg := m.Register[orderReq, orderResp]("drift")
-	if strict {
+	if d.strict {
 		reg = reg.StrictResume()
 	}
-	b := reg.Start("created", created)
-	if withShipped {
-		b = b.To("shipped", shipped)
+	next := reg.Start("created", created)
+	if !d.missingShipped {
+		next = next.To("shipped", shipped)
 	}
-	start, resume, err := b.End("done").Build(context.Background())
+	start, resume, err := next.End("done").Build(context.Background())
 	if err != nil {
 		t.Fatalf("failed to build drift FSM: %v", err)
 	}
@@ -57,12 +63,12 @@ func fastClaims(cfg *ObjectStorageConfig) {
 // interruptedDriftRun starts a created → shipped → done run and shuts its manager down while
 // created is blocked, leaving the run recorded with shipped still to come. It returns the run's
 // version.
-func interruptedDriftRun(t *testing.T, f *managerFactory, entered chan struct{}, allowComplete *atomic.Bool) ulid.ULID {
+func interruptedDriftRun(t *testing.T, b *backend, entered chan struct{}, allowComplete *atomic.Bool) ulid.ULID {
 	t.Helper()
 	ctx := context.Background()
 
-	m1, stop1 := f.newManager(nil)
-	start, _ := driftFSM(t, m1, false, true, entered, allowComplete)
+	m1, stop1 := b.newManager(nil)
+	start, _ := driftFSM(t, m1, drift{}, entered, allowComplete)
 	version, err := start(ctx, "drift-1", NewRequest(&orderReq{}, &orderResp{}))
 	if err != nil {
 		t.Fatalf("failed to start run: %v", err)
@@ -79,27 +85,27 @@ func interruptedDriftRun(t *testing.T, f *managerFactory, entered chan struct{},
 // both, shipped is never recorded complete, the refusing definition never runs the handler, and
 // a definition with the transition then resumes and finishes the run.
 func TestStrictResumeRefusesUnknownTransition(t *testing.T) {
-	t.Run("bolt", func(t *testing.T) { testStrictResumeRefusesUnknownTransition(t, newBoltFactory(t)) })
+	t.Run("bolt", func(t *testing.T) { testStrictResumeRefusesUnknownTransition(t, newBoltBackend(t)) })
 	t.Run("object", func(t *testing.T) {
-		testStrictResumeRefusesUnknownTransition(t, newObjectFactoryWith(t, fastClaims))
+		testStrictResumeRefusesUnknownTransition(t, newObjectBackendWith(t, fastClaims))
 	})
 }
 
-func testStrictResumeRefusesUnknownTransition(t *testing.T, f *managerFactory) {
+func testStrictResumeRefusesUnknownTransition(t *testing.T, b *backend) {
 	ctx := context.Background()
 	capture := &logCapture{}
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	f.configureManager = func(cfg *Config) {
+	b.configureManager = func(cfg *Config) {
 		cfg.Logger = slog.New(slog.NewTextHandler(capture, nil))
 		cfg.MeterProvider = provider
 	}
 	entered := make(chan struct{}, 3)
 	var allowComplete atomic.Bool
-	version := interruptedDriftRun(t, f, entered, &allowComplete)
+	version := interruptedDriftRun(t, b, entered, &allowComplete)
 
-	m2, stop2 := f.newManager(nil)
-	_, resume := driftFSM(t, m2, true, false, entered, &allowComplete)
+	m2, stop2 := b.newManager(nil)
+	_, resume := driftFSM(t, m2, drift{strict: true, missingShipped: true}, entered, &allowComplete)
 	err := resume(ctx)
 	// Long enough for the object backend's claim loop to make several passes.
 	time.Sleep(500 * time.Millisecond)
@@ -112,9 +118,6 @@ func testStrictResumeRefusesUnknownTransition(t *testing.T, f *managerFactory) {
 		manifest := mustManifest(t, store, version)
 		if manifest.GetOwnerNode() != "" || manifest.GetLeaseEpoch() != 1 {
 			t.Fatalf("expected the run left unowned at epoch 1, got owner %q epoch %d", manifest.GetOwnerNode(), manifest.GetLeaseEpoch())
-		}
-		if counterValue(t, collect(t, reader), "fsm.resume.refused", attrState, "shipped") == 0 {
-			t.Fatal("expected the refusal counted under the undefined transition")
 		}
 	default:
 		if !errors.Is(err, ErrUnknownTransition) {
@@ -132,6 +135,9 @@ func testStrictResumeRefusesUnknownTransition(t *testing.T, f *managerFactory) {
 	}) {
 		t.Fatal("expected a warning naming the undefined transition")
 	}
+	if counterValue(t, collect(t, reader), "fsm.resume.refused", attrState, "shipped") == 0 {
+		t.Fatal("expected the refusal counted under the undefined transition")
+	}
 	active, err := m2.store.Active(ctx, fsmKey{typeName: "orderReq", action: "drift"})
 	if err != nil {
 		t.Fatalf("failed to list active runs: %v", err)
@@ -148,8 +154,8 @@ func testStrictResumeRefusesUnknownTransition(t *testing.T, f *managerFactory) {
 	// refusing manager must be gone before the next one opens the same store.)
 	stop2()
 	allowComplete.Store(true)
-	m3, _ := f.newManager(nil)
-	_, resume = driftFSM(t, m3, true, true, entered, &allowComplete)
+	m3, _ := b.newManager(nil)
+	_, resume = driftFSM(t, m3, drift{strict: true}, entered, &allowComplete)
 	if err := resume(ctx); err != nil {
 		t.Fatalf("failed to resume with the full definition: %v", err)
 	}
@@ -166,19 +172,19 @@ func TestLenientResumeSkipsUnknownTransition(t *testing.T) {
 	runBackends(t, testLenientResumeSkipsUnknownTransition)
 }
 
-func testLenientResumeSkipsUnknownTransition(t *testing.T, f *managerFactory) {
+func testLenientResumeSkipsUnknownTransition(t *testing.T, b *backend) {
 	ctx := context.Background()
 	capture := &logCapture{}
-	f.configureManager = func(cfg *Config) {
+	b.configureManager = func(cfg *Config) {
 		cfg.Logger = slog.New(slog.NewTextHandler(capture, nil))
 	}
 	entered := make(chan struct{}, 2)
 	var allowComplete atomic.Bool
-	version := interruptedDriftRun(t, f, entered, &allowComplete)
+	version := interruptedDriftRun(t, b, entered, &allowComplete)
 
 	allowComplete.Store(true)
-	m2, _ := f.newManager(nil)
-	_, resume := driftFSM(t, m2, false, false, entered, &allowComplete)
+	m2, _ := b.newManager(nil)
+	_, resume := driftFSM(t, m2, drift{missingShipped: true}, entered, &allowComplete)
 	if err := resume(ctx); err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}

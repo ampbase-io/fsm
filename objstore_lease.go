@@ -234,18 +234,18 @@ func (s *objectStore) claimReserved(ctx context.Context, version ulid.ULID, queu
 	return manifest, nil
 }
 
-// claimRuns claims every eligible run of the given FSMs that resumable admits and returns them
+// claimRuns claims every eligible run of the given FSMs that check admits and returns them
 // paired with the FSM that will resume each. This is the object backend's work-acquisition
 // path: pending, released, and expired-lease runs are all obtained here, whether through the
 // periodic claim pass or a caller-invoked Resume. One lock scan per distinct resource type
 // serves every action registered on it; failures on individual runs are logged and skipped so
 // one bad manifest cannot block the rest.
-func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey, resumable resumeCheck) ([]claimedRun, error) {
+func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey, check resumeCheck) ([]claimedRun, error) {
 	registered := keySet(keys)
 
 	var claimed []claimedRun
 	for _, typeName := range resourceTypes(keys) {
-		runs, err := s.claimLocks(ctx, typeName, registered, resumable)
+		runs, err := s.claimLocks(ctx, typeName, registered, check)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +255,7 @@ func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey, resumable re
 }
 
 // claimLocks claims every run under one resource type's lock prefix whose action this node runs.
-func (s *objectStore) claimLocks(ctx context.Context, typeName string, registered map[fsmKey]struct{}, resumable resumeCheck) ([]claimedRun, error) {
+func (s *objectStore) claimLocks(ctx context.Context, typeName string, registered map[fsmKey]struct{}, check resumeCheck) ([]claimedRun, error) {
 	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
 	if err != nil {
 		return nil, err
@@ -268,7 +268,7 @@ func (s *objectStore) claimLocks(ctx context.Context, typeName string, registere
 		if _, ok := registered[key]; !ok {
 			continue
 		}
-		if run, won := s.claimEntry(ctx, key, e, resumable); won {
+		if run, won := s.claimEntry(ctx, key, e, check); won {
 			claimed = append(claimed, run)
 		}
 	}
@@ -300,12 +300,12 @@ func keySet(keys []fsmKey) map[fsmKey]struct{} {
 // definition refuses is left unowned — no CAS, no epoch bump — so a node that cannot finish it
 // never takes it from one that can. Lost races and individual failures are skipped so one bad
 // manifest cannot block the rest of the pass.
-func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry, resumable resumeCheck) (claimedRun, bool) {
+func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry, check resumeCheck) (claimedRun, bool) {
 	if !s.claimable(e.manifest, time.Now()) {
 		return claimedRun{}, false
 	}
 
-	if unknown := resumable(key, e.manifest.GetTransitions(), e.manifest.GetCompletedStates()); unknown != "" {
+	if unknown := check(key, e.manifest.GetTransitions(), e.manifest.GetCompletedStates()); unknown != "" {
 		s.logger.WarnContext(ctx, "refusing to claim run: transition not defined", versionAttr(e.version), "action", key.action, "state", unknown)
 		s.instruments.resumeRefused(ctx, key.action, unknown)
 		return claimedRun{}, false

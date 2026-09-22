@@ -467,6 +467,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		// the mechanism for the single-process backend and a guard for the rest.
 		if unknown := f.refusedTransition(resource.active.Transitions, resource.completedTransitions); unknown != "" {
 			m.logger.WarnContext(ctx, "refusing to resume run: transition not defined", slog.Group("fsm", "version", resource.version.String(), "state", unknown))
+			m.instruments.resumeRefused(ctx, f.action, unknown)
 			clearRun(r)
 			return fmt.Errorf("run %s at %s: %w", resource.version, unknown, ErrUnknownTransition)
 		}

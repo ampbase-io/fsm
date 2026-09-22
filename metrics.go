@@ -73,7 +73,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		leaseRenewals:      counter("fsm.lease.renewals", "{renewal}", "Lease renewal outcomes, by result."),
 		depth:              depth,
 		queueCommits:       counter("fsm.queue.commits", "{commit}", "Successful queue-roster CAS writes, by queue."),
-		resumeRefusals:     counter("fsm.resume.refused", "{run}", "Claims refused under StrictResume, by action and the undefined transition."),
+		resumeRefusals:     counter("fsm.resume.refused", "{run}", "Resumes refused under StrictResume, by action and the undefined transition."),
 	}
 	return i, errors.Join(errs...)
 }

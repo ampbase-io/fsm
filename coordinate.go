@@ -28,10 +28,10 @@ type leaseCoordinator interface {
 // resumption (claimRuns) and witnesses "this backend executes via cluster claiming" at the
 // execution-placement sites (an unowned Start the loop picks up, rather than local execution).
 type runClaimer interface {
-	// claimRuns claims every eligible run of the given FSMs that resumable admits, each paired
+	// claimRuns claims every eligible run of the given FSMs that check admits, each paired
 	// with the key of the FSM that will resume it. Keys, not fsms: a backend selects runs but
 	// never executes one.
-	claimRuns(ctx context.Context, keys []fsmKey, resumable resumeCheck) ([]claimedRun, error)
+	claimRuns(ctx context.Context, keys []fsmKey, check resumeCheck) ([]claimedRun, error)
 }
 
 // resumeCheck returns the recorded transition over which the FSM registered under key refuses
