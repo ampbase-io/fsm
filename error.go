@@ -38,8 +38,8 @@ func (e *AlreadyRunningError) Error() string {
 	return fmt.Sprintf("FSM already running, version = %s", e.Version.String())
 }
 
-// CancelError is the cancel cause of a run stopped by Manager.Cancel, on whichever node issued
-// it. The run halts, records the reason, and runs its finalizers.
+// CancelError is the cancel cause of a run stopped by Manager.Cancel. The run halts, records the
+// reason, and runs its finalizers.
 type CancelError struct {
 	Reason string
 }

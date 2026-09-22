@@ -697,8 +697,8 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	})
 
 	runFn := func() {
-		// What ends the run on this node and what halts its transitions are different events:
-		// runCtx ends on a shutdown or a lost lease, ctx additionally on an operator's cancel.
+		// What stops the run and what halts its transitions are different events: runCtx ends on
+		// a shutdown or a lost lease, ctx additionally on an operator's cancel.
 		runCtx, stop := context.WithCancelCause(ctx)
 		ctx, cancel := context.WithCancelCause(runCtx)
 
@@ -849,19 +849,19 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	return
 }
 
-// stopped reports whether the run was ended on this node by a shutdown or a lost lease. Nothing
-// more may be recorded here; the run's next owner resumes it.
+// stopped reports whether the run was ended short of an outcome by a shutdown or a lost lease.
+// Nothing more may be recorded; the run resumes where it left off.
 func stopped(runCtx context.Context, logger logrus.FieldLogger) bool {
 	cause := context.Cause(runCtx)
 	if cause == nil {
 		return false
 	}
-	logger.WithError(cause).Info("run stopped on this node")
+	logger.WithError(cause).Info("run stopped")
 	return true
 }
 
-// finalizerContext returns a context carrying ctx's values that ends only when the run stops on
-// this node, so finalizers outlive the operator's cancel that halted the transitions.
+// finalizerContext returns a context carrying ctx's values that ends only when the run is
+// stopped, so finalizers outlive the operator's cancel that halted the transitions.
 func finalizerContext(ctx, runCtx context.Context) (context.Context, func()) {
 	finalizerCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	unlink := context.AfterFunc(runCtx, func() { cancel(context.Cause(runCtx)) })

@@ -114,13 +114,13 @@ type Manager struct {
 	running map[ulid.ULID]runHandle
 }
 
-// runHandle is the two ways a run executing on this node can be ended.
+// runHandle is the two ways an executing run can be ended.
 type runHandle struct {
 	// cancel halts the run's transitions on an operator's cancel; its finalizers still run.
 	cancel context.CancelCauseFunc
 
-	// stop ends the run on this node — a shutdown or a lost lease — recording nothing, so its
-	// next owner resumes it.
+	// stop ends the run short of an outcome — a shutdown or a lost lease — recording nothing, so
+	// it resumes where it left off.
 	stop context.CancelCauseFunc
 }
 
@@ -292,7 +292,7 @@ func (m *Manager) serveAdmin(socket string) error {
 	return nil
 }
 
-// Shutdown stops every run executing on this node and blocks until they have all stopped. A
+// Shutdown stops every run this Manager is executing and blocks until they have all stopped. A
 // stopped run's context — its finalizers' included — ends with cause ErrShutdown; the run
 // records nothing and resumes where it left off on the next start or claim.
 func (m *Manager) Shutdown(timeout time.Duration) {
@@ -476,8 +476,8 @@ func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) e
 	return nil
 }
 
-// cancelRunning halts the run's transitions with an operator's cause, reporting whether the run
-// is executing on this node.
+// cancelRunning halts the run's transitions with an operator's cause, reporting whether this
+// Manager is executing the run.
 func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
 	run, ok := m.executing(version)
 	if !ok {
@@ -487,7 +487,7 @@ func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
 	return true
 }
 
-// stopRunning ends the run on this node with the given cause, if it is executing here.
+// stopRunning ends the run with the given cause, if this Manager is executing it.
 func (m *Manager) stopRunning(version ulid.ULID, cause error) {
 	run, ok := m.executing(version)
 	if !ok {

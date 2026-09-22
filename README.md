@@ -58,7 +58,7 @@ A transition's context ends for one of three reasons, and `context.Cause(ctx)` n
 |---|---|---|
 | `*fsm.CancelError` | `Manager.Cancel` was called; `Reason` carries its cause. | Stop. The run halts, skips its remaining transitions, and runs its finalizers. |
 | `fsm.ErrShutdown` | This `Manager` is shutting down. | Return promptly and record nothing; the run resumes on the next start or claim. |
-| `fsm.ErrLeaseLost` | Another node now owns the run. | Return promptly and record nothing; the new owner is already running it. |
+| `fsm.ErrLeaseLost` | Another node now owns the run (object storage backend only). | Return promptly and record nothing; the new owner is already running it. |
 
 ```go
 <-ctx.Done()

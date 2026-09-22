@@ -167,9 +167,10 @@ func (o finalizerOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *Transition
 // none of their cancellation — neither a deadline nor a cancel func reaches it — and it outlives
 // an operator's Cancel, so it can do the work the halt calls for. It has no deadline of its own:
 // the run's lease is held until FINISH, which is recorded only after the finalizers return, so a
-// finalizer may wait as long as that work takes. The context ends, with cause ErrShutdown or
-// ErrLeaseLost, only when the run stops on this node. A finalizer runs again if the run is
-// resumed before its FINISH is recorded.
+// finalizer may wait as long as that work takes. The context ends only when the run is stopped
+// short of finishing: on a shutdown, with cause ErrShutdown, or under the object storage backend
+// on a lost lease, with cause ErrLeaseLost. A finalizer runs again if the run is resumed before
+// its FINISH is recorded.
 type Finalizer[R, W any] func(context.Context, *Request[R, W], RunErr)
 
 // WithFinalizers adds the provided Finalizers to the list of finalizers to be executed when the FSM
