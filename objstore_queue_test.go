@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -19,9 +20,8 @@ import (
 func (h *leaseHarness) queueStore(nodeID string, leaseTimeout time.Duration, queues map[string]int) *objectStore {
 	h.t.Helper()
 	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
-		Bucket:       h.bucket,
-		Endpoint:     h.url,
-		Region:       "auto",
+		Bucket:       h.s3.Bucket(),
+		Client:       h.s3.Client(),
 		LeaseTimeout: leaseTimeout,
 	}, nodeID, nil, queues)
 	if err != nil {
@@ -105,11 +105,11 @@ func TestAdmitQueuedCASRetryLosesLastSlot(t *testing.T) {
 	// the roster, before its write lands — so the conditional PUT fails and casQueue retries
 	// against a full roster. Errors go through t.Errorf: the hook runs on a server goroutine.
 	queueKey := a.queueKey("q")
-	h.fake.setPrePut(func(key string) {
+	h.s3.SetPrePut(func(key string) {
 		if key != queueKey {
 			return
 		}
-		h.fake.setPrePut(nil) // one interposition only, so the peer's own write is not intercepted
+		h.s3.SetPrePut(nil) // one interposition only, so the peer's own write is not intercepted
 		switch admitted, err := peer.admitQueued(ctx, "q", ulid.Make()); {
 		case err != nil:
 			t.Errorf("peer admitQueued: %v", err)
@@ -218,7 +218,7 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 		runs     = 6
 	)
 
-	bus := newTestBus()
+	bus := fake.NewBus()
 	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		cfg.LeaseTimeout = 2 * time.Second
 		cfg.HeartbeatPeriod = 200 * time.Millisecond
@@ -260,7 +260,7 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 	// Every node's claim loop must be subscribed before the pending broadcasts fire, so no wakeup
 	// is missed and work spreads across the fleet.
 	eventually(t, 5*time.Second, func() bool {
-		return bus.subscriberCount(subjectPending) >= nodes
+		return bus.SubscriberCount(subjectPending) >= nodes
 	}, "not all nodes subscribed to the pending subject")
 
 	versions := make([]ulid.ULID, 0, runs)
@@ -289,7 +289,7 @@ func TestQueueCapacityClusterWide(t *testing.T) {
 // queued slot and then "dies" (its heartbeat and lease lapse); a peer must reclaim the abandoned
 // slot within the timeout and drive the run to completion, even though the queue's capacity is one.
 func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
-	bus := newTestBus()
+	bus := fake.NewBus()
 	nodes := 0
 	f := newObjectFactoryWithBus(t, bus, func(cfg *ObjectStorageConfig) {
 		nodes++
@@ -322,7 +322,7 @@ func TestQueueSlotReclaimedAfterNodeDeath(t *testing.T) {
 	// Wake node-2 once its claim loop is subscribed; it must reclaim node-1's stale slot to admit
 	// and complete the run despite the capacity of one.
 	eventually(t, 2*time.Second, func() bool {
-		return bus.subscriberCount(subjectPending) >= 2
+		return bus.SubscriberCount(subjectPending) >= 2
 	}, "node-2 never subscribed to the pending subject")
 	bus.Publish(subjectPending, &fsmv1.RunEvent{Kind: fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING})
 

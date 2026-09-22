@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -16,17 +17,13 @@ import (
 
 // leaseHarness shares one fake S3 between several objectStores acting as distinct nodes.
 type leaseHarness struct {
-	t      *testing.T
-	bucket string
-	url    string
-	fake   *fakeS3
+	t  *testing.T
+	s3 *fake.S3
 }
 
 func newLeaseHarness(t *testing.T) *leaseHarness {
 	t.Helper()
-
-	bucket, url, fake := startFakeS3(t)
-	return &leaseHarness{t: t, bucket: bucket, url: url, fake: fake}
+	return &leaseHarness{t: t, s3: fake.NewS3(t)}
 }
 
 // owns reports whether the store currently holds the run's lease. The production owns method was
@@ -67,9 +64,8 @@ func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectS
 	h.t.Helper()
 
 	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
-		Bucket:       h.bucket,
-		Endpoint:     h.url,
-		Region:       "auto",
+		Bucket:       h.s3.Bucket(),
+		Client:       h.s3.Client(),
 		LeaseTimeout: leaseTimeout,
 	}, nodeID, nil, nil)
 	if err != nil {
@@ -415,7 +411,7 @@ func TestClaimSurvivesLostResponse(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 
 	b := h.store("node-b", 10*time.Second)
-	h.fake.lostPuts = 1 // the next conditional PUT is b's claim CAS
+	h.s3.LostPuts = 1 // the next conditional PUT is b's claim CAS
 	claimed, err := b.claimRuns(ctx, []fsmKey{deployKey})
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("expected the claim to survive a lost response, got %v (err=%v)", claimed, err)

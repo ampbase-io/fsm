@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -88,10 +89,10 @@ func (w *wakeCoordinator) claims() int { return int(w.claimCount.Load()) }
 // runWakeLoop starts a coordinate loop over a wakeCoordinator (hour-long cadence, so only the
 // pending wakeup can drive a claim pass) and waits until it has subscribed to the pending
 // subject. It returns the bus and coordinator for driving and asserting the wake.
-func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
+func runWakeLoop(t *testing.T) (*fake.Bus, *wakeCoordinator) {
 	t.Helper()
 
-	bus := newTestBus()
+	bus := fake.NewBus()
 	lc := &wakeCoordinator{}
 	m := &Manager{
 		logger:  slog.Default(),
@@ -106,12 +107,12 @@ func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
 	t.Cleanup(func() { close(m.done); <-loopDone })
 
 	eventually(t, 2*time.Second, func() bool {
-		return bus.subscriberCount(subjectPending) >= 1
+		return bus.SubscriberCount(subjectPending) >= 1
 	}, "coordinate never subscribed to the pending subject")
 	return bus, lc
 }
 
-func publishPending(bus *testBus) {
+func publishPending(bus *fake.Bus) {
 	bus.Publish(subjectPending, &fsmv1.RunEvent{Kind: fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING})
 }
 

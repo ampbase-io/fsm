@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
@@ -175,7 +176,7 @@ func TestArchiveDeletesManifestLast(t *testing.T) {
 
 	// Fail the manifest delete: a reap that crashes at its last step. Its earlier deletes still
 	// ran, proving the manifest is deleted after the events, children, and cancel sentinel.
-	h.fake.setFailDelete(s.manifestKey(run.StartVersion))
+	h.s3.SetFailDelete(s.manifestKey(run.StartVersion))
 	if err := s.reapRun(ctx, run.StartVersion, mustManifest(t, s, run.StartVersion)); err == nil {
 		t.Fatal("expected reapRun to fail when the manifest delete fails")
 	}
@@ -194,7 +195,7 @@ func TestArchiveDeletesManifestLast(t *testing.T) {
 	}
 
 	// Clearing the fault lets the next pass finish the reap.
-	h.fake.setFailDelete("")
+	h.s3.SetFailDelete("")
 	s.runArchive(ctx)
 	if _, _, err := s.getManifest(ctx, run.StartVersion); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("expected the manifest reaped once the fault cleared, got %v", err)
@@ -255,11 +256,11 @@ func TestHistoryReadableInFinishWindow(t *testing.T) {
 	inWindow, held := make(chan struct{}), make(chan struct{})
 	release := sync.OnceFunc(func() { close(held) })
 	defer release()
-	h.fake.setPrePut(func(key string) {
+	h.s3.SetPrePut(func(key string) {
 		if !strings.Contains(key, "/history/") {
 			return
 		}
-		h.fake.setPrePut(nil)
+		h.s3.SetPrePut(nil)
 		close(inWindow)
 		<-held
 	})
@@ -404,11 +405,10 @@ func TestArchiveLoopConsumesSignal(t *testing.T) {
 }
 
 func TestArchiveDisabledStartsNoLoop(t *testing.T) {
-	bucket, url, _ := startFakeS3(t)
+	s3 := fake.NewS3(t)
 	s, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{
-		Bucket:          bucket,
-		Endpoint:        url,
-		Region:          "auto",
+		Bucket:          s3.Bucket(),
+		Client:          s3.Client(),
 		ArchiveDisabled: true,
 	}, "node-a", nil, nil)
 	if err != nil {

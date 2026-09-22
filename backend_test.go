@@ -2,11 +2,12 @@ package fsm
 
 import (
 	"fmt"
-	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 )
 
 // managerFactory creates Managers over a shared storage backend. Successive newManager calls
@@ -71,22 +72,6 @@ func newObjectFactory(t *testing.T) *managerFactory {
 	return newObjectFactoryWith(t, nil)
 }
 
-// startFakeS3 boots the in-process S3 server and credentials every object-backend test needs.
-func startFakeS3(t *testing.T) (bucket, url string, fake *fakeS3) {
-	t.Helper()
-
-	const b = "test-bucket"
-	fake = newFakeS3()
-	server := httptest.NewServer(fake.handler(b))
-	t.Cleanup(server.Close)
-
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-
-	return b, server.URL, fake
-}
-
 // newObjectFactoryWith lets a test adjust the object storage config (e.g. lease timings)
 // before each manager is created. Every manager gets a distinct NodeID, as distinct nodes
 // sharing a bucket would in production.
@@ -97,18 +82,20 @@ func newObjectFactoryWith(t *testing.T, configure func(*ObjectStorageConfig)) *m
 // newObjectFactoryWithBus is newObjectFactoryWith with a shared EventBus injected into every
 // manager, so a test can drive the cross-node fast paths (wait wakeup, claim wakeup). A nil bus
 // leaves the no-op default in place.
+//
+// This mirrors fsmtest.NewObjectFactory; the in-package tests cannot import fsmtest (it imports
+// fsm), so the factory exists twice.
 func newObjectFactoryWithBus(t *testing.T, bus EventBus, configure func(*ObjectStorageConfig)) *managerFactory {
 	t.Helper()
 
-	bucket, url, _ := startFakeS3(t)
+	s3 := fake.NewS3(t)
 
 	f := &managerFactory{name: "object"}
 	nodes := 0
 	f.newManager = func(queues map[string]int) (*Manager, func()) {
 		cfg := &ObjectStorageConfig{
-			Bucket:   bucket,
-			Endpoint: url,
-			Region:   "auto",
+			Bucket: s3.Bucket(),
+			Client: s3.Client(),
 			// The fake S3 answers instantly, so tight poll intervals keep object-backend
 			// waits from eating the default 100ms floor per Wait.
 			WaitPollInterval:    1 * time.Millisecond,

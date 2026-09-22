@@ -3,211 +3,32 @@ package fsm
 import (
 	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"sort"
 	"strings"
-	"sync"
 	"testing"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/oklog/ulid/v2"
 )
 
-// fakeS3 is a minimal path-style S3 implementation covering the operations objectStore uses:
-// conditional PUT (If-None-Match: * and If-Match CAS), GET, DELETE, and ListObjectsV2. It can
-// inject 409 Conflict responses to exercise the conditional-write retry path.
-type fakeS3 struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	revs    map[string]int
-
-	// conflicts is the number of conditional PUTs to reject with 409 before accepting.
-	conflicts int
-
-	// lostPuts is the number of conditional PUTs to apply but answer with 409, simulating a
-	// write that succeeds server-side while its response is lost.
-	lostPuts int
-
-	// failDelete, when non-empty, makes DELETE of exactly this key return 500, to exercise a reap
-	// that crashes partway through its deletes.
-	failDelete string
-
-	// prePut, when set, runs just before a PUT is applied, outside the harness lock so the hook may
-	// itself write through a store. It lets a test land a competing write at an exact point inside
-	// a CAS loop — the losing attempt has read and mutated, but has not yet written — instead of
-	// racing one in on timing.
-	prePut func(key string)
-
-	puts               int
-	consistentReads    int
-	nonConsistentReads int
-}
-
-// setFailDelete arms a DELETE failure for the given key under the harness lock, so a test goroutine
-// can set it race-free against the server goroutines that read it.
-func (f *fakeS3) setFailDelete(key string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.failDelete = key
-}
-
-// setPrePut arms (or, with nil, disarms) the pre-PUT hook. Set under the harness lock, so a test
-// goroutine can arm it race-free against the server goroutines that read it.
-//
-// A hook that blocks holds one of the server's request goroutines, and the server's Close waits
-// for it. Release it on every test exit — a deferred sync.OnceFunc, not a line after the
-// assertions — or a failed assertion hangs the package to its timeout instead of failing.
-func (f *fakeS3) setPrePut(fn func(key string)) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.prePut = fn
-}
-
-// firePrePut invokes the armed hook, if any, with the lock released — the hook is expected to
-// drive the store, whose requests need the handler lock in turn.
-func (f *fakeS3) firePrePut(key string) {
-	f.mu.Lock()
-	fn := f.prePut
-	f.mu.Unlock()
-	if fn != nil {
-		fn(key)
-	}
-}
-
-func newFakeS3() *fakeS3 {
-	return &fakeS3{objects: map[string][]byte{}, revs: map[string]int{}}
-}
-
-// etag returns the current ETag for a key; it changes on every accepted write so If-Match
-// detects concurrent modification.
-func (f *fakeS3) etag(key string) string {
-	return fmt.Sprintf("%q", fmt.Sprintf("%s#%d", key, f.revs[key]))
-}
-
-func (f *fakeS3) handler(bucket string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/"+bucket), "/")
-		if r.Method == http.MethodPut {
-			f.firePrePut(key)
-		}
-
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		switch {
-		case r.Method == http.MethodPut:
-			f.puts++
-			conditional := r.Header.Get("If-None-Match") == "*" || r.Header.Get("If-Match") != ""
-			if conditional && f.conflicts > 0 {
-				f.conflicts--
-				w.WriteHeader(http.StatusConflict)
-				return
-			}
-			if r.Header.Get("If-None-Match") == "*" {
-				if _, ok := f.objects[key]; ok {
-					w.WriteHeader(http.StatusPreconditionFailed)
-					return
-				}
-			}
-			if im := r.Header.Get("If-Match"); im != "" {
-				if _, ok := f.objects[key]; !ok || im != f.etag(key) {
-					w.WriteHeader(http.StatusPreconditionFailed)
-					return
-				}
-			}
-			body, _ := io.ReadAll(r.Body)
-			f.objects[key] = body
-			f.revs[key]++
-			if conditional && f.lostPuts > 0 {
-				f.lostPuts--
-				w.WriteHeader(http.StatusConflict)
-				return
-			}
-			w.Header().Set("ETag", f.etag(key))
-			w.WriteHeader(http.StatusOK)
-
-		case r.Method == http.MethodDelete:
-			if f.failDelete != "" && key == f.failDelete {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			delete(f.objects, key)
-			delete(f.revs, key)
-			w.WriteHeader(http.StatusNoContent)
-
-		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
-			if r.Header.Get("X-Tigris-Consistent") == "true" {
-				f.consistentReads++
-			} else {
-				f.nonConsistentReads++
-			}
-			prefix := r.URL.Query().Get("prefix")
-			keys := make([]string, 0, len(f.objects))
-			for k := range f.objects {
-				if strings.HasPrefix(k, prefix) {
-					keys = append(keys, k)
-				}
-			}
-			sort.Strings(keys)
-
-			type contents struct {
-				Key string `xml:"Key"`
-			}
-			result := struct {
-				XMLName     xml.Name   `xml:"ListBucketResult"`
-				Name        string     `xml:"Name"`
-				IsTruncated bool       `xml:"IsTruncated"`
-				KeyCount    int        `xml:"KeyCount"`
-				Contents    []contents `xml:"Contents"`
-			}{Name: bucket, KeyCount: len(keys)}
-			for _, k := range keys {
-				result.Contents = append(result.Contents, contents{Key: k})
-			}
-			w.Header().Set("Content-Type", "application/xml")
-			xml.NewEncoder(w).Encode(result)
-
-		case r.Method == http.MethodGet:
-			if r.Header.Get("X-Tigris-Consistent") == "true" {
-				f.consistentReads++
-			} else {
-				f.nonConsistentReads++
-			}
-			body, ok := f.objects[key]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			w.Header().Set("ETag", f.etag(key))
-			w.Write(body)
-
-		default:
-			w.WriteHeader(http.StatusNotImplemented)
-		}
-	})
-}
-
-func newTestObjectStore(t *testing.T) (*objectStore, *fakeS3) {
+// newTestObjectStore builds an objectStore over a fresh fake S3, reached through the fake's client.
+func newTestObjectStore(t *testing.T) (*objectStore, *fake.S3) {
 	t.Helper()
 
-	bucket, url, fake := startFakeS3(t)
+	s3 := fake.NewS3(t)
 	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(t), &ObjectStorageConfig{
-		Bucket:   bucket,
-		Endpoint: url,
-		Region:   "auto",
+		Bucket: s3.Bucket(),
+		Client: s3.Client(),
 	}, "node-test", nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	return store, fake
+	return store, s3
 }
 
 // testULID builds a deterministic ULID whose timestamp controls ordering.
@@ -231,28 +52,41 @@ func TestObjectStoreRequiresBucket(t *testing.T) {
 // and middleware carries every operation.
 func TestObjectStoreUsesInjectedClient(t *testing.T) {
 	ctx := context.Background()
-	bucket, url, fake := startFakeS3(t)
+	store, s3 := newTestObjectStore(t)
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion("auto"))
-	if err != nil {
-		t.Fatalf("failed to load AWS config: %v", err)
+	if err := store.putIfAbsent(ctx, "fsm/injected/key", []byte("a")); err != nil {
+		t.Fatalf("write through the injected client failed: %v", err)
 	}
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.BaseEndpoint = &url
-		o.UsePathStyle = true
-	})
+	if s3.Puts() == 0 {
+		t.Fatal("the write did not reach the fake through the injected client")
+	}
+}
 
-	store, err := newObjectStore(ctx, slog.Default(), testInstruments(t), &ObjectStorageConfig{Bucket: bucket, Client: client}, "node-test", nil, nil)
+// TestObjectStoreBuildsClientFromEndpoint covers the other constructor path — no Client, so the
+// store builds one from Endpoint and Region with the SDK's default credential chain. The only
+// test that reads credentials from the environment, so the only one that cannot run in parallel.
+func TestObjectStoreBuildsClientFromEndpoint(t *testing.T) {
+	ctx := context.Background()
+	s3 := fake.NewS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	store, err := newObjectStore(ctx, slog.Default(), testInstruments(t), &ObjectStorageConfig{
+		Bucket:   s3.Bucket(),
+		Endpoint: s3.URL(),
+		Region:   "auto",
+	}, "node-test", nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create object store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
 
-	if err := store.putIfAbsent(ctx, "fsm/injected/key", []byte("a")); err != nil {
-		t.Fatalf("write through the injected client failed: %v", err)
+	if err := store.putIfAbsent(ctx, "fsm/endpoint/key", []byte("a")); err != nil {
+		t.Fatalf("write through the built client failed: %v", err)
 	}
-	if fake.puts == 0 {
-		t.Fatal("the write did not reach the fake through the injected client")
+	if s3.Puts() == 0 {
+		t.Fatal("the write did not reach the fake through the built client")
 	}
 }
 
@@ -269,15 +103,15 @@ func TestPutIfAbsent(t *testing.T) {
 }
 
 func TestPutIfAbsentRetriesConflict(t *testing.T) {
-	store, fake := newTestObjectStore(t)
+	store, s3 := newTestObjectStore(t)
 	ctx := context.Background()
 
-	fake.conflicts = 2
+	s3.Conflicts = 2
 	if err := store.putIfAbsent(ctx, "fsm/test/conflict", []byte("a")); err != nil {
 		t.Fatalf("expected write to succeed after 409 retries, got %v", err)
 	}
-	if fake.puts != 3 {
-		t.Fatalf("expected 3 put attempts (2 conflicts + success), got %d", fake.puts)
+	if got := s3.Puts(); got != 3 {
+		t.Fatalf("expected 3 put attempts (2 conflicts + success), got %d", got)
 	}
 }
 
@@ -329,7 +163,7 @@ func TestGetObjectNotFound(t *testing.T) {
 }
 
 func TestEventRoundTrip(t *testing.T) {
-	store, fake := newTestObjectStore(t)
+	store, s3 := newTestObjectStore(t)
 	ctx := context.Background()
 
 	runVersion := testULID(t, 1)
@@ -365,10 +199,10 @@ func TestEventRoundTrip(t *testing.T) {
 		}
 	}
 
-	if fake.nonConsistentReads > 0 {
-		t.Fatalf("expected all reads to set X-Tigris-Consistent, %d did not", fake.nonConsistentReads)
+	if got := s3.NonConsistentReads(); got > 0 {
+		t.Fatalf("expected all reads to set X-Tigris-Consistent, %d did not", got)
 	}
-	if fake.consistentReads == 0 {
+	if s3.ConsistentReads() == 0 {
 		t.Fatal("expected consistent reads to be recorded")
 	}
 }

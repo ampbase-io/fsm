@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"connectrpc.com/connect"
@@ -401,7 +402,7 @@ func testStrayCanceledIsRetried(t *testing.T, f *managerFactory) {
 // does not own a run issues the cancel, the durable sentinel + broadcast reach the owning node,
 // and its cancel sweep stops the executing run with the recorded cause.
 func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
-	bus := newTestBus()
+	bus := fake.NewBus()
 	f := newObjectFactoryWithBus(t, bus, nil)
 	ctx := context.Background()
 
@@ -501,7 +502,7 @@ func TestCancelViaSweepFloorNoBus(t *testing.T) {
 // this node owns but has not begun executing is driven to a terminal canceled manifest, so its
 // waiters resolve with the cause instead of blocking to the delay, and its transition never runs.
 func TestCancelDelayedRunBeforeExecution(t *testing.T) {
-	bus := newTestBus()
+	bus := fake.NewBus()
 	f := newObjectFactoryWithBus(t, bus, nil)
 	ctx := context.Background()
 
