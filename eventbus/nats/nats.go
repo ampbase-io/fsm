@@ -28,6 +28,32 @@ import (
 type Bus struct {
 	nc     *nats.Conn
 	logger *slog.Logger
+
+	// prefix, when set, is prepended to every subject on the wire: the core's fsm.run.pending
+	// travels as <prefix>.fsm.run.pending. It scopes one Manager's traffic to a tenant on a shared
+	// hub whose grants are subject-based, and keeps tenants from hearing each other's signals.
+	prefix string
+}
+
+// Option configures a Bus.
+type Option func(*Bus)
+
+// WithSubjectPrefix scopes every subject the bus publishes and subscribes to under prefix, so a
+// connection whose grant is "<prefix>.>" can carry the core's fixed fsm.run.* subjects. The
+// prefix is given without a trailing dot; an empty prefix leaves the subjects as the core names
+// them.
+func WithSubjectPrefix(prefix string) Option {
+	return func(b *Bus) {
+		b.prefix = prefix
+	}
+}
+
+// subject returns the wire subject for one the core names.
+func (b *Bus) subject(core string) string {
+	if b.prefix == "" {
+		return core
+	}
+	return b.prefix + "." + core
 }
 
 // The adapter must stay assignable to the interface the core injects.
@@ -39,17 +65,22 @@ var _ fsm.EventBus = (*Bus)(nil)
 const deliveryBuffer = 128
 
 // New wraps an established NATS connection as an fsm.EventBus. A nil logger discards.
-func New(nc *nats.Conn, logger *slog.Logger) *Bus {
+func New(nc *nats.Conn, logger *slog.Logger, opts ...Option) *Bus {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Bus{nc: nc, logger: logger}
+	b := &Bus{nc: nc, logger: logger}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // Publish marshals the event and hands it to NATS, which buffers it in the client — the call does
 // not block on the network, satisfying the "MUST NOT block the caller" contract. A marshal or
 // publish failure is logged and dropped; the durable log remains the source of truth.
-func (b *Bus) Publish(subject string, event *fsmv1.RunEvent) {
+func (b *Bus) Publish(core string, event *fsmv1.RunEvent) {
+	subject := b.subject(core)
 	data, err := proto.Marshal(event)
 	if err != nil {
 		b.logger.Warn("failed to marshal run event, dropping", "error", err, "subject", subject)
@@ -68,7 +99,8 @@ func (b *Bus) Publish(subject string, event *fsmv1.RunEvent) {
 // It does not join an in-flight fn, so fn may run once more for an already-buffered event after
 // unsubscribe returns — best-effort delivery makes that harmless, but a caller must not assume fn
 // has stopped the instant unsubscribe returns.
-func (b *Bus) Subscribe(subject string, fn func(*fsmv1.RunEvent)) (func(), error) {
+func (b *Bus) Subscribe(core string, fn func(*fsmv1.RunEvent)) (func(), error) {
+	subject := b.subject(core)
 	events := make(chan *fsmv1.RunEvent, deliveryBuffer)
 	done := make(chan struct{})
 
