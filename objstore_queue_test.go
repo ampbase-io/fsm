@@ -18,7 +18,7 @@ import (
 // capacities configured, so the admission helpers can be exercised directly.
 func (h *leaseHarness) queueStore(nodeID string, leaseTimeout time.Duration, queues map[string]int) *objectStore {
 	h.t.Helper()
-	store, err := newObjectStore(context.Background(), slog.Default(), &ObjectStorageConfig{
+	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
 		Bucket:       h.bucket,
 		Endpoint:     h.url,
 		Region:       "auto",

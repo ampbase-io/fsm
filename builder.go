@@ -210,7 +210,7 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 	s.cfg.interceptors = []TransitionInterceptorFunc{
 		skipper(),
 		canceller(s.m.store, s.f.wCodec),
-		retry(s.m.tracer, s.m.store),
+		retry(s.m.tracer, s.m.instruments, s.m.store),
 	}
 
 	for _, o := range opts {
@@ -256,7 +256,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 
 	cfg := TransitionConfig[R, W]{
 		interceptors: []TransitionInterceptorFunc{
-			retry(s.m.tracer, s.m.store),
+			retry(s.m.tracer, s.m.instruments, s.m.store),
 		},
 	}
 	for _, opt := range opts {

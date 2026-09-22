@@ -23,6 +23,13 @@ backend's distributed-execution design is the active work.
 - **The object-storage event log is the source of truth.** The bus is an accelerator: publish
   only after the durable write, never block a transition, tolerate dropped events. `owner_node`
   is a node identity, never a routable address — there is no worker-to-worker RPC in the design.
+- **Logging is `log/slog` via `Config.Logger`; metrics are OpenTelemetry via
+  `Config.MeterProvider`** (the global provider by default). Never import a logging framework or a
+  metrics registry. Per-transition and per-wait lines are Debug; a run's start and stop, claims
+  and shutdown are Info. A run's identity is one `fsm` slog group (`runAttr`, fsm.go), keyed like
+  its span and metric attributes; derive a per-transition logger from the run's base logger
+  (`Request.base`), never from the previous transition's — slog's `With` appends, so the group
+  would repeat. Pass the ctx to the log call wherever one is in scope.
 
 ## Architecture map
 - `manager.go` — the `Store` interface, declared with the `Manager` that consumes it (interfaces
@@ -50,6 +57,8 @@ backend's distributed-execution design is the active work.
   interceptors (retry, cancel, finish).
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
   `proto/fsm/v1/`; generated code in `gen/`.
+- `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like
+  the tracer (`Manager`, `retry`, `objectStore`); attribute keys and bucket advice live there.
 
 ## Build, test, verify
 - **Toolchain: Go 1.27rc1** — the builder API uses generic methods, which need it. Plain `go`.

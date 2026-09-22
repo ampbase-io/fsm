@@ -103,8 +103,10 @@ func (c *ObjectStorageConfig) archiveInterval() time.Duration {
 // objectStore implements the Store interface over S3-compatible object storage.
 type objectStore struct {
 	logger *slog.Logger
-	client *s3.Client
-	cfg    *ObjectStorageConfig
+
+	instruments *instruments
+	client      *s3.Client
+	cfg         *ObjectStorageConfig
 
 	// node identifies this node in run manifests for lease ownership and on run spans as
 	// fsm.owner_node. It must be unique per process: a zombie sharing a NodeID is still fenced
@@ -149,7 +151,7 @@ type objectStore struct {
 	archiveCh     chan struct{}
 }
 
-func newObjectStore(ctx context.Context, logger *slog.Logger, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
+func newObjectStore(ctx context.Context, logger *slog.Logger, instruments *instruments, cfg *ObjectStorageConfig, nodeID string, bus EventBus, queues map[string]int) (*objectStore, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("object storage bucket is required")
 	}
@@ -173,14 +175,15 @@ func newObjectStore(ctx context.Context, logger *slog.Logger, cfg *ObjectStorage
 	})
 
 	s := &objectStore{
-		logger:   logger.With("node_id", nodeID),
-		client:   client,
-		cfg:      cfg,
-		node:     nodeID,
-		bus:      busOrNoop(bus),
-		queues:   queues,
-		leases:   map[ulid.ULID]lease{},
-		finishes: map[ulid.ULID]runFinish{},
+		logger:      logger.With("node_id", nodeID),
+		instruments: instruments,
+		client:      client,
+		cfg:         cfg,
+		node:        nodeID,
+		bus:         busOrNoop(bus),
+		queues:      queues,
+		leases:      map[ulid.ULID]lease{},
+		finishes:    map[ulid.ULID]runFinish{},
 	}
 
 	// The archive loop reclaims completed runs past retention. It is store-scoped (it only
@@ -348,12 +351,12 @@ func (s *objectStore) putConditional(ctx context.Context, key string, body []byt
 		set(in)
 		start := time.Now()
 		_, err := s.client.PutObject(ctx, in)
-		observeStorage("put", start, err)
+		s.instruments.observeStorage(ctx, "put", start, err)
 		switch {
 		case err == nil:
 			return nil
 		case isConditionalConflict(err):
-			casRetriesVec.WithLabelValues("conflict").Inc()
+			s.instruments.casRetry(ctx, "conflict")
 			s.logger.DebugContext(ctx, "conditional write conflict, retrying", "key", key)
 			return err
 		default:
@@ -409,7 +412,7 @@ func (s *objectStore) deleteObject(ctx context.Context, key string) error {
 		Bucket: &s.cfg.Bucket,
 		Key:    &key,
 	})
-	observeStorage("delete", start, err)
+	s.instruments.observeStorage(ctx, "delete", start, err)
 	if err != nil {
 		return fmt.Errorf("delete object %s: %w", key, err)
 	}
@@ -439,7 +442,7 @@ func (s *objectStore) getObject(ctx context.Context, key string) ([]byte, string
 		Key:    &key,
 	}, consistentRead)
 	// Observe the raw error before the 404 wrap so not_found classifies correctly.
-	observeStorage("get", start, err)
+	s.instruments.observeStorage(ctx, "get", start, err)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, "", ErrFsmNotFound
@@ -468,7 +471,7 @@ func (s *objectStore) listKeys(ctx context.Context, prefix string) ([]string, er
 	for paginator.HasMorePages() {
 		start := time.Now()
 		page, err := paginator.NextPage(ctx, consistentRead)
-		observeStorage("list", start, err)
+		s.instruments.observeStorage(ctx, "list", start, err)
 		if err != nil {
 			return nil, fmt.Errorf("list objects with prefix %s: %w", prefix, err)
 		}
