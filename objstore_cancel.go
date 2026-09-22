@@ -83,7 +83,7 @@ func (s *objectStore) pendingCancellations(ctx context.Context) (map[ulid.ULID]e
 			s.logger.WithError(err).WithField("key", key).Error("failed to read cancel sentinel")
 			continue
 		}
-		cancels[version] = errors.New(string(body))
+		cancels[version] = &CancelError{Reason: string(body)}
 	}
 	return cancels, nil
 }

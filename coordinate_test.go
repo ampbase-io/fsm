@@ -98,7 +98,7 @@ func runWakeLoop(t *testing.T) (*testBus, *wakeCoordinator) {
 		bus:     bus,
 		done:    make(chan struct{}),
 		fsms:    map[fsmKey]*fsm{},
-		running: map[ulid.ULID]context.CancelCauseFunc{},
+		running: map[ulid.ULID]runHandle{},
 	}
 
 	loopDone := make(chan struct{})
@@ -162,7 +162,7 @@ func TestClaimWakeRearmsAfterFiring(t *testing.T) {
 func TestCancelUnleased(t *testing.T) {
 	m := &Manager{
 		logger:  logrus.New(),
-		running: map[ulid.ULID]context.CancelCauseFunc{},
+		running: map[ulid.ULID]runHandle{},
 	}
 
 	leased, unleased := ulid.Make(), ulid.Make()
@@ -170,8 +170,8 @@ func TestCancelUnleased(t *testing.T) {
 	unleasedCtx, unleasedCancel := context.WithCancelCause(context.Background())
 	defer leasedCancel(nil)
 	defer unleasedCancel(nil)
-	m.running[leased] = leasedCancel
-	m.running[unleased] = unleasedCancel
+	m.running[leased] = runHandle{stop: leasedCancel}
+	m.running[unleased] = runHandle{stop: unleasedCancel}
 
 	m.cancelUnleased(heldLeases{leased: true})
 
@@ -218,7 +218,7 @@ func TestSweepCancellationsRoutesByExecution(t *testing.T) {
 
 	m := &Manager{
 		logger:  logrus.New(),
-		running: map[ulid.ULID]context.CancelCauseFunc{executing: execCancel},
+		running: map[ulid.ULID]runHandle{executing: {cancel: execCancel}},
 	}
 	stub := &cancelStub{pending: map[ulid.ULID]error{
 		executing: errors.New("stop executing"),
@@ -245,7 +245,7 @@ func TestSweepCancellationsContinuesPastFailure(t *testing.T) {
 	first, second := ulid.Make(), ulid.Make()
 	m := &Manager{
 		logger:  logrus.New(),
-		running: map[ulid.ULID]context.CancelCauseFunc{}, // neither is executing → both go through cancelOwnedRun
+		running: map[ulid.ULID]runHandle{}, // neither is executing → both go through cancelOwnedRun
 	}
 	stub := &cancelStub{
 		pending: map[ulid.ULID]error{first: errors.New("stop first"), second: errors.New("stop second")},

@@ -219,7 +219,7 @@ func (m *Manager) cancelUnleased(f fencer) {
 			continue
 		}
 		m.logger.WithField("run_version", version.String()).Warn("run lease lost")
-		m.cancelRunning(version, ErrLeaseLost)
+		m.stopRunning(version, ErrLeaseLost)
 	}
 }
 

@@ -111,7 +111,17 @@ type Manager struct {
 	claimNudge chan struct{}
 
 	mu      sync.RWMutex
-	running map[ulid.ULID]context.CancelCauseFunc
+	running map[ulid.ULID]runHandle
+}
+
+// runHandle is the two ways an executing run can be ended.
+type runHandle struct {
+	// cancel halts the run's transitions on an operator's cancel; its finalizers still run.
+	cancel context.CancelCauseFunc
+
+	// stop ends the run short of an outcome — a shutdown or a lost lease — recording nothing, so
+	// it resumes where it left off.
+	stop context.CancelCauseFunc
 }
 
 type fsmKey struct {
@@ -188,7 +198,7 @@ func New(cfg Config) (*Manager, error) {
 		queues:     make(map[string]*queuedRunner, len(cfg.Queues)),
 		done:       done,
 		claimNudge: make(chan struct{}, 1),
-		running:    map[ulid.ULID]context.CancelCauseFunc{},
+		running:    map[ulid.ULID]runHandle{},
 	}
 
 	// A store that coordinates run ownership via leases runs the background coordinate loop and
@@ -282,14 +292,16 @@ func (m *Manager) serveAdmin(socket string) error {
 	return nil
 }
 
-// Shutdown sends a stop signal to all FSMs and blocks until they have all stopped.
+// Shutdown stops every run this Manager is executing and blocks until they have all stopped. A
+// stopped run's context — its finalizers' included — ends with cause ErrShutdown; the run
+// records nothing and resumes where it left off on the next start or claim.
 func (m *Manager) Shutdown(timeout time.Duration) {
 	m.logger.WithField("shutdown_timeout", timeout).Info("shutting down")
 
 	m.mu.RLock()
-	for id, cancel := range m.running {
+	for id, run := range m.running {
 		m.logger.WithField("fsm_id", id.String()).Info("shutting down fsm")
-		cancel(nil)
+		run.stop(ErrShutdown)
 	}
 	m.mu.RUnlock()
 
@@ -440,12 +452,15 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 // Cancel sends a cancel signal to the FSM should it exist. It does not block until the FSM has
 // completed, so callers should use Wait to ensure the FSM has stopped, if needed.
 //
+// The running transition's context ends with a *CancelError carrying cause; the run halts,
+// skips its remaining transitions, and runs its finalizers on a context the cancel does not end.
+//
 // Under a lease-coordinated backend the cancel is subject-addressed: it is recorded durably and
 // broadcast, and whichever node owns the run reacts — the run need not be executing on this
 // node, or anywhere yet. The local context is canceled too for immediate effect when this node
 // is the owner. A single-process backend cancels the local run directly.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
-	cerr := errors.New(cause)
+	cerr := &CancelError{Reason: cause}
 	if rec, ok := m.store.(cancelRecorder); ok {
 		// Record durably first — while the run is still active — so the owner reacts even if it
 		// is another node; then cancel locally for immediacy if we hold it.
@@ -461,17 +476,32 @@ func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) e
 	return nil
 }
 
-// cancelRunning cancels the run's local context with the given cause, reporting whether a
-// running context was found.
+// cancelRunning halts the run's transitions with an operator's cause, reporting whether this
+// Manager is executing the run.
 func (m *Manager) cancelRunning(version ulid.ULID, cause error) bool {
-	m.mu.RLock()
-	cancel, ok := m.running[version]
-	m.mu.RUnlock()
+	run, ok := m.executing(version)
 	if !ok {
 		return false
 	}
-	cancel(cause)
+	run.cancel(cause)
 	return true
+}
+
+// stopRunning ends the run with the given cause, if this Manager is executing it.
+func (m *Manager) stopRunning(version ulid.ULID, cause error) {
+	run, ok := m.executing(version)
+	if !ok {
+		return
+	}
+	run.stop(cause)
+}
+
+func (m *Manager) executing(version ulid.ULID) (runHandle, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	run, ok := m.running[version]
+	return run, ok
 }
 
 // Wait blocks until the run with the given version completes.

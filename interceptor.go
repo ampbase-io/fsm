@@ -245,15 +245,11 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 						localTransitionDurationVec.WithLabelValues("lease_lost").Observe(time.Since(transitionStartTime).Seconds())
 						logger.WithError(err).Warn("run lease lost, halting")
 						return backoff.Permanent(err)
-					case errors.Is(err, context.Canceled):
+					case ctx.Err() != nil:
 						localTransitionCounterVec.WithLabelValues("canceled").Inc()
 						localTransitionDurationVec.WithLabelValues("canceled").Observe(time.Since(transitionStartTime).Seconds())
-						logger.Debug("transition received signal to shutdown")
-						if cerr := context.Cause(ctx); cerr != context.Canceled {
-							logger.WithError(cerr).Error("FSM was intentionally canceled")
-							err = halt(cerr)
-						}
-						return backoff.Permanent(err)
+						logger.WithError(context.Cause(ctx)).Info("transition canceled")
+						return backoff.Permanent(haltOnCancel(ctx, err))
 					default:
 						localTransitionCounterVec.WithLabelValues("error").Inc()
 						localTransitionDurationVec.WithLabelValues("error").Observe(time.Since(transitionStartTime).Seconds())
@@ -302,6 +298,17 @@ func retry(tracer trace.Tracer, store appender) TransitionInterceptorFunc {
 			return resp, err
 		})
 	})
+}
+
+// haltOnCancel turns err into a halt carrying the operator's reason when ctx was ended by
+// Manager.Cancel, so the run records it and finishes. A shutdown or a lost lease passes through:
+// the run stops without a record and its next owner resumes it.
+func haltOnCancel(ctx context.Context, err error) error {
+	cerr, ok := errors.AsType[*CancelError](context.Cause(ctx))
+	if !ok {
+		return err
+	}
+	return halt(cerr)
 }
 
 func newTransitionSpan(ctx context.Context, tracer trace.Tracer, run Run) (context.Context, trace.Span) {
