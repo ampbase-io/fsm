@@ -61,15 +61,18 @@ backend's distributed-execution design is the active work.
   the tracer (`Manager`, `retry`, `objectStore`); attribute keys and bucket advice live there.
 
 ## Build, test, verify
-- **Toolchain: Go 1.27rc1** — the builder API uses generic methods, which need it. Plain `go`.
-- **`go vet` is broken repo-wide** — its type-checker rejects generic methods. Don't run it.
-  Verify with:
+- **Toolchain: Go 1.27** — the builder API uses generic methods, which need it. Plain `go`.
+- Verify with, in the root **and** in `eventbus/nats` (a nested module):
   - `go build ./...`
+  - `go vet ./...` — works since Go 1.27.1 (1.27rc1's type-checker rejected generic methods);
+    its `slog` analyzer is what makes the loose `"key", value` log form safe.
   - `go test -race ./...` — **always `-race`**; it has caught real concurrency bugs repeatedly.
   - `$(go env GOROOT)/bin/gofmt -l .` — the toolchain's gofmt, not the one on `PATH` (an older
     gofmt false-positives on generic methods).
+  - `go mod tidy && git diff --exit-code go.mod go.sum` — CI's tidiness gate, in both modules.
 - **Proto:** regenerate with `go run github.com/bufbuild/buf/cmd/buf@v1.28.1 generate`.
-- CI (`.github/workflows/`) runs the same: a `go` job (build + `-race` + gofmt), `buf`, CodeQL.
+- CI (`.github/workflows/`) runs the same: a `go` job (tidy + gofmt + build + vet + `-race`) for
+  the root and for `eventbus/nats`, `buf`, CodeQL.
 
 ## Testing conventions
 - New behavior tests run against **both backends**: `func TestX(t){ runBackends(t, testX) }`. The
