@@ -93,8 +93,6 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
-	// TODO(follow-up): Wait on a never-existed version resolves as success — WaitRun maps an
-	// unknown run to nil — indistinguishable from a real success. Distinguish it with CodeNotFound.
 	waitErr := s.m.Wait(ctx, version)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		code := connect.CodeCanceled
@@ -102,6 +100,11 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 			code = connect.CodeDeadlineExceeded
 		}
 		return nil, connect.NewError(code, ctxErr)
+	}
+	// Not-found is checked before the outcome filter: it is neither an outcome nor transient, and
+	// reported as unavailable a client would retry it forever.
+	if errors.Is(waitErr, ErrFsmNotFound) {
+		return nil, connect.NewError(connect.CodeNotFound, waitErr)
 	}
 	// A recorded run outcome is nil or a *haltError; any other error is a transient storage
 	// failure the wait's poll surfaced, not the run's result. Report it retryable and sanitized so

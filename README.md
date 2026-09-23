@@ -47,6 +47,9 @@ if err := m.Wait(ctx, version); err != nil {
 }
 ```
 
+`Wait` returns the run's recorded error, nil on success, or `fsm.ErrFsmNotFound` for a version
+the backend does not know.
+
 Request/response types are persisted with a protobuf codec when they implement `proto.Message`,
 with a custom codec when they implement `fsm.Codec`, and with JSON otherwise.
 

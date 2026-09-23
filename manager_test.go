@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -208,6 +209,42 @@ func testRunAfter(t *testing.T, b *backend) {
 	}
 	if !bRan.Load() {
 		t.Fatal("second FSM never ran")
+	}
+}
+
+// TestRunAfterUnknownPredecessor pins the runner's answer to a predecessor the backend does not
+// know: run-after is ordering, not a success gate, so the dependent starts — as it does after a
+// failed predecessor — with a warning naming the version.
+func TestRunAfterUnknownPredecessor(t *testing.T) { runBackends(t, testRunAfterUnknownPredecessor) }
+
+func testRunAfterUnknownPredecessor(t *testing.T, b *backend) {
+	capture := &logCapture{}
+	b.configureManager = func(cfg *Config) {
+		cfg.Logger = slog.New(slog.NewTextHandler(capture, nil))
+	}
+	m, _ := b.newManager(nil)
+	ctx := context.Background()
+	start, _, err := m.Register[orderReq, orderResp]("after-unknown").
+		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			return NewResponse(&orderResp{Status: "ok"}), nil
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "after-unknown-1", NewRequest(&orderReq{}, &orderResp{}), WithRunAfter(ulid.Make()))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.Wait(waitCtx, version); err != nil {
+		t.Fatalf("dependent completed with error: %v", err)
+	}
+	if len(linesWithMessage(capture.lines(), "FSM not found, immediately starting")) == 0 {
+		t.Fatal("expected the unknown predecessor logged")
 	}
 }
 
@@ -475,9 +512,10 @@ func testActiveAcrossTypes(t *testing.T, b *backend) {
 	}
 }
 
-// TestWaitUnknownRun locks in the not-found contract both Wait paths were rebuilt on: a run
-// the backend never recorded reports "gone" (nil), promptly — never a hang or an error. The
-// runAfter runner depends on this to start dependents whose predecessor is unknown.
+// TestWaitUnknownRun pins the not-found contract of both Wait paths: a run the backend never
+// recorded reports ErrFsmNotFound, promptly — never a hang, and never a nil a caller could not
+// tell from a success. (The runAfter runner handles the error itself; see
+// TestRunAfterUnknownPredecessor.)
 func TestWaitUnknownRun(t *testing.T) { runBackends(t, testWaitUnknownRun) }
 
 func testWaitUnknownRun(t *testing.T, b *backend) {
@@ -486,11 +524,11 @@ func testWaitUnknownRun(t *testing.T, b *backend) {
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.Wait(waitCtx, ulid.Make()); err != nil {
-		t.Fatalf("expected nil for an unknown run version, got %v", err)
+	if err := m.Wait(waitCtx, ulid.Make()); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected ErrFsmNotFound for an unknown run version, got %v", err)
 	}
-	if err := m.WaitByID(waitCtx, "never-started"); err != nil {
-		t.Fatalf("expected nil for an unknown run id, got %v", err)
+	if err := m.WaitByID(waitCtx, "never-started"); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected ErrFsmNotFound for an unknown run id, got %v", err)
 	}
 }
 

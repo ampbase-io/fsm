@@ -465,6 +465,25 @@ func testControlWaitDeadline(t *testing.T, b *backend) {
 	}
 }
 
+// TestControlWaitUnknownNotFound verifies Wait on a version the backend does not know is
+// CodeNotFound — not a success, and not the retryable CodeUnavailable the outcome filter would
+// give an unmapped error.
+func TestControlWaitUnknownNotFound(t *testing.T) { runBackends(t, testControlWaitUnknownNotFound) }
+
+func testControlWaitUnknownNotFound(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
+	echoFSM(t, m, "control-unknown")
+	admin := &adminServer{m: m}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := admin.Wait(waitCtx, connect.NewRequest(&fsmv1.WaitRequest{Version: ulid.Make().String()}))
+	connErr, ok := errors.AsType[*connect.Error](err)
+	if !ok || connErr.Code() != connect.CodeNotFound {
+		t.Fatalf("expected CodeNotFound for an unknown run, got %v", err)
+	}
+}
+
 // TestIsRunOutcome covers the classifier Wait uses to keep a transient poll failure out of the
 // run-outcome slot: only nil or a *haltError (including wrapped) is a recorded outcome.
 func TestIsRunOutcome(t *testing.T) {
