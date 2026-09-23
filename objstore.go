@@ -167,6 +167,11 @@ type objectStore struct {
 	finishMu sync.Mutex
 	finishes map[ulid.ULID]runFinish
 
+	// deferred is this node's backoff on runs it failed to resume, consulted by the claim
+	// filter. A restart clears it, which is the point: the fix for such a run is a deploy.
+	deferMu  sync.Mutex
+	deferred map[ulid.ULID]resumeDeferral
+
 	// The archive loop's lifecycle. archiveCancel stops it (from Close); archiveDone closes when
 	// it has exited, so Close blocks until the in-flight pass returns; archiveCh is a test-only
 	// signal that wakes the loop between intervals. (boltStore overloads one archiveCh for both
@@ -200,6 +205,7 @@ func newObjectStore(ctx context.Context, logger *slog.Logger, instruments *instr
 		queues:      queues,
 		leases:      map[ulid.ULID]lease{},
 		finishes:    map[ulid.ULID]runFinish{},
+		deferred:    map[ulid.ULID]resumeDeferral{},
 	}
 
 	// The archive loop reclaims completed runs past retention. It is store-scoped (it only

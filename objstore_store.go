@@ -924,9 +924,14 @@ func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
 	return err
 }
 
-// ForgetRun releases this node's claim on the run after a failed resume so another node (or a
-// later claim pass) can adopt it; the resource lock stays visible until recovery succeeds.
+// ForgetRun releases this node's claim on the run after a failed resume so another node — or
+// this one, once its backoff has elapsed — can adopt it; the resource lock stays visible until
+// recovery succeeds. The deferral is recorded first, before the lease is dropped, so a pass
+// racing the release cannot re-claim in between; and regardless of whether the lease is still
+// held, since a lost lease does not make the run decodable.
 func (s *objectStore) ForgetRun(run Run) error {
+	s.deferResume(run.StartVersion, time.Now())
+
 	epoch, ok := s.ownedEpoch(run.StartVersion)
 	if !ok {
 		return nil

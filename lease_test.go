@@ -452,6 +452,112 @@ func TestForgetRunReleasesLease(t *testing.T) {
 	}
 }
 
+// deferralOf reads a run's deferral under the lock.
+func (s *objectStore) deferralOf(version ulid.ULID) (resumeDeferral, bool) {
+	s.deferMu.Lock()
+	defer s.deferMu.Unlock()
+	d, ok := s.deferred[version]
+	return d, ok
+}
+
+// TestResumeDeferralSchedule pins the per-node backoff for a run that failed to resume: the
+// first delay is the lease timeout, each failure doubles it, the cap holds, a lease timeout
+// above the cap starts at the cap, and the bound evicts elapsed entries before live ones.
+func TestResumeDeferralSchedule(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", time.Minute)
+	v := ulid.Make()
+	now := time.Now()
+
+	if s.resumeDeferred(v, now) {
+		t.Fatal("expected no deferral before a failure")
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, maxResumeDeferral, maxResumeDeferral}
+	for i, delay := range want {
+		s.deferResume(v, now)
+		d, _ := s.deferralOf(v)
+		if d.delay != delay {
+			t.Fatalf("failure %d: delay %s, want %s", i+1, d.delay, delay)
+		}
+		if until := d.until.Sub(now); until < 3*delay/4 || until >= 5*delay/4 {
+			t.Fatalf("failure %d: deadline %s from now, want within [0.75, 1.25) × %s", i+1, until, delay)
+		}
+		if !s.resumeDeferred(v, now) {
+			t.Fatalf("failure %d: expected the run deferred at the failure instant", i+1)
+		}
+		if s.resumeDeferred(v, now.Add(5*delay/4)) {
+			t.Fatalf("failure %d: expected the deferral elapsed past its jitter ceiling", i+1)
+		}
+	}
+
+	long := h.store("node-long", time.Hour)
+	long.deferResume(v, now)
+	if d, _ := long.deferralOf(v); d.delay != maxResumeDeferral {
+		t.Fatalf("expected a lease timeout above the cap to start at the cap, got %s", d.delay)
+	}
+
+	// At the bound, elapsed deferrals go first; a live one only when none has elapsed.
+	full := h.store("node-full", time.Second)
+	for range maxDeferrals {
+		full.deferResume(ulid.Make(), now.Add(-time.Hour))
+	}
+	full.deferResume(v, now)
+	if n := len(full.deferred); n != 1 {
+		t.Fatalf("expected every elapsed deferral evicted, got %d entries", n)
+	}
+	for range maxDeferrals - 1 {
+		full.deferResume(ulid.Make(), now)
+	}
+	full.deferResume(ulid.Make(), now)
+	if n := len(full.deferred); n != maxDeferrals {
+		t.Fatalf("expected one live deferral evicted to hold the bound, got %d entries", n)
+	}
+}
+
+// TestForgetRunDefersReclaim verifies the node-local backoff behind ForgetRun: the node that
+// failed to resume a run skips it on its next pass — no write, no epoch bump — while a peer
+// claims it at once, and the node retries once its first deferral has elapsed.
+func TestForgetRunDefersReclaim(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 40*time.Millisecond)
+	b := h.store("node-b", 10*time.Second)
+
+	run := startRun(t, a, "defer-1")
+	if err := a.ForgetRun(run); err != nil {
+		t.Fatalf("failed to forget run: %v", err)
+	}
+	puts, epoch := h.s3.Puts(), mustManifest(t, a, run.StartVersion).GetLeaseEpoch()
+
+	if claimed, err := a.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 0 {
+		t.Fatalf("expected the forgetting node to skip the run, got %v (err=%v)", claimed, err)
+	}
+	if got := h.s3.Puts(); got != puts {
+		t.Fatalf("expected a deferred pass to write nothing, got %d puts", got-puts)
+	}
+	if got := mustManifest(t, a, run.StartVersion).GetLeaseEpoch(); got != epoch {
+		t.Fatalf("expected the epoch untouched by a deferred pass, got %d after %d", got, epoch)
+	}
+	if owns(a, run.StartVersion) {
+		t.Fatal("expected no lease held after a deferred pass")
+	}
+
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 1 {
+		t.Fatalf("expected a peer to claim the run at once, got %v (err=%v)", claimed, err)
+	}
+	if err := b.ForgetRun(run); err != nil {
+		t.Fatalf("failed to forget run on the peer: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond) // past the 40ms deferral's jitter ceiling
+	if claimed, err := a.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 1 {
+		t.Fatalf("expected the run claimable again once the deferral elapsed, got %v (err=%v)", claimed, err)
+	}
+	if got := mustManifest(t, a, run.StartVersion).GetLeaseEpoch(); got <= epoch {
+		t.Fatalf("expected the epoch advanced by the retry, got %d after %d", got, epoch)
+	}
+}
+
 // TestAdoptRunManifest exercises the crash-retry adoption seam directly: a START whose
 // earlier attempt already created the manifest adopts the lease at the manifest's recorded
 // epoch when this node owns it, and is fenced when another node does.

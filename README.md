@@ -108,6 +108,11 @@ A consumer that already operates an S3 client — with its own credentials, retr
 middleware — passes it as `ObjectStorageConfig.Client` and the library uses it as is; `Endpoint`
 and `Region` are then the client's. The client must address the bucket path-style.
 
+A run whose persisted request no longer decodes with the registered definition cannot be
+resumed. The node that fails it releases the run and retries it with exponential backoff — from
+the lease timeout up to every ten minutes — while peers try on their own schedules; a restart
+with a fixed definition retries at once.
+
 ### Event bus on a shared NATS hub
 
 The library names its subjects `fsm.run.*`. On a hub whose grants are subject-scoped, give the
