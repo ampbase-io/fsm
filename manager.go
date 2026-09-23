@@ -63,7 +63,7 @@ type Store interface {
 	// ActiveChildren returns the incomplete runs started from the given parent.
 	ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, error)
 	// WaitRun blocks until the run reaches a terminal state or ctx ends, returning the run's
-	// recorded error (nil on success, and nil for runs no longer known to the backend).
+	// recorded error (nil on success), or ErrFsmNotFound for a run the backend does not know.
 	WaitRun(ctx context.Context, runVersion ulid.ULID) error
 	// RunResult returns the marshaled W response of a completed run, or nil when it recorded
 	// none. Safe to read the moment WaitRun returns: the object backend answers from the

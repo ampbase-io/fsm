@@ -85,13 +85,12 @@ var fsmSchema = &memdb.DBSchema{
 	},
 }
 
-// historyOutcome reports a completed run's terminal result from the store, mapping a missing
-// record to a nil error (the run is gone) and a recorded error to a haltError.
+// historyOutcome reports a completed run's terminal result from the store: a recorded error as a
+// haltError, and no record at all as the History error — the backend does not know the run, and
+// a caller must be able to tell that from a success.
 func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	he, err := s.History(ctx, version)
 	switch {
-	case errors.Is(err, ErrFsmNotFound):
-		return nil
 	case err != nil:
 		return err
 	case he.GetLastEvent().GetError() != "":
