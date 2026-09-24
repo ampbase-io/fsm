@@ -25,6 +25,7 @@ type leaseState int
 const (
 	leaseClaiming leaseState = iota // claim CAS in flight; reserved against same-store claimers
 	leaseHeld                       // lease held at epoch; extended by the heartbeat
+	leaseDeferred                   // released after a failed resume; reserved until the retry timer clears it
 )
 
 type lease struct {
@@ -295,16 +296,12 @@ func keySet(keys []fsmKey) map[fsmKey]struct{} {
 }
 
 // claimEntry attempts to claim one scanned run for key, reporting whether it was won. A run
-// this store already holds or is mid-claim on falls out at reserveClaim, which checks
-// atomically; the claimable pre-filter just avoids pointless CAS attempts, and a run this node
-// failed to resume is skipped while its backoff lasts. Lost races and individual failures are
-// skipped so one bad manifest cannot block the rest of the pass.
+// this store already holds, is mid-claim on, or is deferring after a failed resume falls out
+// at reserveClaim, which checks atomically; the claimable pre-filter just avoids pointless CAS
+// attempts. Lost races and individual failures are skipped so one bad manifest cannot block
+// the rest of the pass.
 func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry) (claimedRun, bool) {
-	now := time.Now()
-	if !s.claimable(e.manifest, now) {
-		return claimedRun{}, false
-	}
-	if s.resumeDeferred(e.version, now) {
+	if !s.claimable(e.manifest, time.Now()) {
 		return claimedRun{}, false
 	}
 
@@ -324,62 +321,27 @@ func (s *objectStore) claimEntry(ctx context.Context, key fsmKey, e lockEntry) (
 	return claimedRun{key: key, resource: manifestResource(e.version, manifest)}, true
 }
 
-// resumeDeferral is this node's backoff on a run it failed to resume: claim passes skip the run
-// until the deadline, and each further failure doubles the delay.
-type resumeDeferral struct {
-	until time.Time
-	delay time.Duration
-}
-
-const (
-	// maxResumeDeferral caps a node's retry interval for a run it cannot resume.
-	maxResumeDeferral = 10 * time.Minute
-
-	// maxDeferrals bounds the deferred map; see evictDeferrals for the eviction policy.
-	maxDeferrals = 4096
-)
-
-// deferResume records a failed resume of the run: this node's claim passes skip it for double
-// the previous delay, from the lease timeout up to maxResumeDeferral, jittered so peers that
-// heard the same wakeup do not retry in lockstep. Node-local on purpose — the fix for an
-// unresumable run is a deploy, and the restart clears the map so fixed code retries at once.
-func (s *objectStore) deferResume(version ulid.ULID, now time.Time) {
-	s.deferMu.Lock()
-	defer s.deferMu.Unlock()
-
-	delay := min(s.cfg.leaseTimeout(), maxResumeDeferral)
-	if prev, ok := s.deferred[version]; ok {
-		delay = min(2*prev.delay, maxResumeDeferral)
-	}
-	if len(s.deferred) >= maxDeferrals {
-		s.evictDeferrals(now)
-	}
-	s.deferred[version] = resumeDeferral{until: now.Add(withJitter(delay)), delay: delay}
-}
-
-// resumeDeferred reports whether this node is still backing off from resuming the run.
-func (s *objectStore) resumeDeferred(version ulid.ULID, now time.Time) bool {
-	s.deferMu.Lock()
-	defer s.deferMu.Unlock()
-
-	d, ok := s.deferred[version]
-	return ok && now.Before(d.until)
-}
-
-// evictDeferrals drops every elapsed deferral, and one arbitrary live one if none has elapsed,
-// to bound the map; an evicted live entry just retries sooner. Callers hold deferMu.
-func (s *objectStore) evictDeferrals(now time.Time) {
-	for version, d := range s.deferred {
-		if !now.Before(d.until) {
-			delete(s.deferred, version)
-		}
-	}
-	if len(s.deferred) < maxDeferrals {
+// deferClaim holds the run's lease slot as deferred for the resume retry interval, so
+// reserveClaim refuses it and this node's claim passes skip it without a CAS; peers keep their
+// own slots. Only an empty slot is taken: a claim that raced the release keeps its reservation,
+// fails the same way, and defers then. Jittered so peers that heard the same wakeup do not
+// retry in lockstep. The timer's clear touches only the map, so one outliving Close is harmless.
+func (s *objectStore) deferClaim(version ulid.ULID) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if _, ok := s.leases[version]; ok {
 		return
 	}
-	for version := range s.deferred {
-		delete(s.deferred, version)
-		return
+	s.leases[version] = lease{state: leaseDeferred}
+	time.AfterFunc(withJitter(s.cfg.resumeRetryInterval()), func() { s.clearDeferral(version) })
+}
+
+// clearDeferral frees a deferred slot, leaving any other state it has since taken alone.
+func (s *objectStore) clearDeferral(version ulid.ULID) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if l, ok := s.leases[version]; ok && l.state == leaseDeferred {
+		delete(s.leases, version)
 	}
 }
 

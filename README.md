@@ -109,8 +109,8 @@ middleware — passes it as `ObjectStorageConfig.Client` and the library uses it
 and `Region` are then the client's. The client must address the bucket path-style.
 
 A run whose persisted request no longer decodes with the registered definition cannot be
-resumed. The node that fails it releases the run and retries it with exponential backoff — from
-the lease timeout up to every ten minutes — while peers try on their own schedules; a restart
+resumed. The node that fails it releases the run and leaves it for ten lease timeouts (five
+minutes at the default) before trying again, while peers try on their own schedules; a restart
 with a fixed definition retries at once.
 
 ### Event bus on a shared NATS hub
