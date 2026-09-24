@@ -282,6 +282,9 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 
 type Start[R, W any] func(ctx context.Context, id string, req *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error)
 
+// Resume starts every interrupted run of the FSM this node may take. On the object storage
+// backend a run this node failed to resume before is skipped until its retry interval has
+// passed, and that is not an error.
 type Resume func(context.Context) error
 
 // Build returns a function that can be used to run the FSM as well as resume any previously

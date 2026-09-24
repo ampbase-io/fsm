@@ -452,6 +452,51 @@ func TestForgetRunReleasesLease(t *testing.T) {
 	}
 }
 
+// TestForgetRunDefersReclaim verifies the deferred lease slot behind ForgetRun: the node that
+// failed to resume a run skips it on its next pass — no write, no epoch bump, and the slot does
+// not read as owned — while a peer claims it at once, and the node retries once the retry
+// interval (ten lease timeouts) has passed.
+func TestForgetRunDefersReclaim(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	a := h.store("node-a", 20*time.Millisecond) // a 200ms retry interval
+	b := h.store("node-b", 10*time.Second)
+
+	run := startRun(t, a, "defer-1")
+	if err := a.ForgetRun(run); err != nil {
+		t.Fatalf("failed to forget run: %v", err)
+	}
+	puts, epoch := h.s3.Puts(), mustManifest(t, a, run.StartVersion).GetLeaseEpoch()
+
+	if claimed, err := a.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 0 {
+		t.Fatalf("expected the forgetting node to skip the run, got %v (err=%v)", claimed, err)
+	}
+	if got := h.s3.Puts(); got != puts {
+		t.Fatalf("expected a deferred pass to write nothing, got %d puts", got-puts)
+	}
+	if got := mustManifest(t, a, run.StartVersion).GetLeaseEpoch(); got != epoch {
+		t.Fatalf("expected the epoch untouched by a deferred pass, got %d after %d", got, epoch)
+	}
+	if owns(a, run.StartVersion) {
+		t.Fatal("expected a deferred slot not to read as a held lease")
+	}
+
+	if claimed, err := b.claimRuns(ctx, []fsmKey{deployKey}); err != nil || len(claimed) != 1 {
+		t.Fatalf("expected a peer to claim the run at once, got %v (err=%v)", claimed, err)
+	}
+	if err := b.ForgetRun(run); err != nil {
+		t.Fatalf("failed to forget run on the peer: %v", err)
+	}
+
+	eventually(t, 5*time.Second, func() bool {
+		claimed, err := a.claimRuns(ctx, []fsmKey{deployKey})
+		return err == nil && len(claimed) == 1
+	}, "the run never became claimable again on the node that deferred it")
+	if got := mustManifest(t, a, run.StartVersion).GetLeaseEpoch(); got <= epoch {
+		t.Fatalf("expected the epoch advanced by the retry, got %d after %d", got, epoch)
+	}
+}
+
 // TestAdoptRunManifest exercises the crash-retry adoption seam directly: a START whose
 // earlier attempt already created the manifest adopts the lease at the manifest's recorded
 // epoch when this node owns it, and is fenced when another node does.

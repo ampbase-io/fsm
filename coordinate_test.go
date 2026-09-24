@@ -286,7 +286,8 @@ func TestClaimPassContinuesPastFailedDispatch(t *testing.T) {
 	start := blockingFSM(t, m1, "cpoison", entered, block)
 
 	// cpoison-1 sorts before cpoison-2 in the lock listing, so the poisoned run is dispatched
-	// first each pass and the healthy one only completes if the pass keeps going.
+	// first on the pass that claims both, and the healthy one only completes if that pass
+	// keeps going. (Later passes skip the poisoned run: the failed resume defers it.)
 	v1, err := start(ctx, "cpoison-1", NewRequest(&orderReq{}, &orderResp{}))
 	if err != nil {
 		t.Fatalf("failed to start FSM: %v", err)

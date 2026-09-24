@@ -109,6 +109,14 @@ func (c *ObjectStorageConfig) claimInterval() time.Duration {
 	return orDefault(c.ClaimInterval, c.leaseTimeout()/2)
 }
 
+// resumeRetryInterval is how long a node leaves a run it failed to resume before trying again:
+// ten lease timeouts, five minutes at the default. The failure is deterministic — the persisted
+// bytes do not decode with this code — so nothing is gained by hurrying; the fix is a deploy,
+// and the restart retries at once.
+func (c *ObjectStorageConfig) resumeRetryInterval() time.Duration {
+	return 10 * c.leaseTimeout()
+}
+
 func (c *ObjectStorageConfig) waitPollInterval() time.Duration {
 	return orDefault(c.WaitPollInterval, 100*time.Millisecond)
 }

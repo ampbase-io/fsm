@@ -46,8 +46,9 @@ backend's distributed-execution design is the active work.
 - `store.go` — the BoltDB implementation. `boltStore` is memdb-backed and private; the object
   impl is `objectStore`.
 - `objstore_store.go` / `objstore_lease.go` / `objstore_cancel.go` / `objstore.go` — the object
-  backend: Append + queries + WaitRun; leases and `lease_epoch` fencing; cancel sentinels; the
-  S3 client, key helpers, and conditional writes.
+  backend: Append + queries + WaitRun; leases and `lease_epoch` fencing (a run that failed to
+  resume keeps a `leaseDeferred` slot, which `reserveClaim` refuses until a timer clears it —
+  no second map); cancel sentinels; the S3 client, key helpers, and conditional writes.
 - `coordinate.go` — the lease-coordinated background loop (`leaseCoordinator`): heartbeat
   (extend leases, sweep for lost leases and cancels), jittered claim pass, event-driven wakeups.
 - `eventbus.go` — `EventPublisher`/`EventSubscriber`/`EventBus`, the protobuf `fsmv1.RunEvent`

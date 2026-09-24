@@ -246,8 +246,6 @@ func (m *Manager) claimPass(ctx context.Context, claimer runClaimer) {
 			continue
 		}
 		logger.InfoContext(ctx, "claimed run")
-		// TODO: a run that repeatedly fails to resume is released by ForgetRun and re-claimed
-		// by every node's next pass; add per-run claim backoff or dead-lettering.
 		if err := f.resumeOne(ctx, c.resource); err != nil {
 			logger.ErrorContext(ctx, "failed to resume claimed run", "error", err)
 		}
