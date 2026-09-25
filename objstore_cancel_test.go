@@ -177,6 +177,24 @@ func TestCancelOwnedRunDrivesTerminal(t *testing.T) {
 	}
 }
 
+// TestCancelOwnedRunDeletesSentinel verifies a run driven terminal by its sentinel takes the
+// sentinel with it, so the cancel/ prefix the heartbeat sweeps list does not carry it until the
+// archive reap.
+func TestCancelOwnedRunDeletesSentinel(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	ctx := context.Background()
+
+	run := startRun(t, s, "cor-gc")
+	plantSentinel(t, s, run.StartVersion, "operator stop")
+	if err := s.cancelOwnedRun(ctx, run.StartVersion, &CancelError{Reason: "operator stop"}); err != nil {
+		t.Fatalf("cancelOwnedRun failed: %v", err)
+	}
+	if !objectGone(t, s, s.cancelKey(run.StartVersion)) {
+		t.Fatal("expected the cancel sentinel deleted with the finish")
+	}
+}
+
 func TestCancelOwnedRunNotOwnedNoop(t *testing.T) {
 	h := newLeaseHarness(t)
 	a := h.store("node-a", 10*time.Second)

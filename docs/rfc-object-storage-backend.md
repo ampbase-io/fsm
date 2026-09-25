@@ -345,6 +345,8 @@ The background archive loop is simplified compared to the BoltDB version. There 
 1. Verify the history object exists (write it if not, idempotently).
 1. Delete event objects under `events/<id>/<action>/<run_version>/`.
 1. Delete children entries under `children/<run_version>/`.
+1. Delete the cancel sentinel `cancel/<run_version>`, if any. A canceled run deletes its own at
+   FINISH; this is the backstop for a sentinel whose cancel lost the race with FINISH.
 1. Update the manifest to `status: "archived"` (or delete it).
 
 **History is readable from the manifest flip.** The history object is the last write of a finish, after the manifest turns terminal and the lock is deleted — and a waiter on another node is released at the flip. `History` therefore answers a run that has a terminal manifest but no history object from that manifest and the FINISH event it points at: the same record the finish is about to write, and the one the archive loop's verify step repairs after a crashed finish. The read writes nothing. Without it, a caller that reads "no history" as "no such run" can start a run that has just finished a second time, since its lock is already free.
