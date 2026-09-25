@@ -73,4 +73,7 @@ message RunManifest {
   // loop reads it to decide when a completed run has aged past retention. A dedicated field,
   // rather than reusing updated_at, so a later manifest CAS cannot move the retention clock.
   int64 completed_at = 27;
+
+  // error_kind classifies error, as on the StateEvent that recorded it.
+  string error_kind = 28;
 }

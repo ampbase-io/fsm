@@ -50,6 +50,14 @@ message StateEvent {
   uint64 retry_count = 8;
 
   bytes run_version = 9;
+
+  // error_kind classifies a halted run's error so the typed error is rebuilt the same on every
+  // node: canceled, abort, unrecoverable_system, unrecoverable_user, handoff, or error. Empty
+  // on success, and on records written before it was recorded.
+  string error_kind = 10;
+
+  // error_state is the state the run halted in. On a FINISH event, state is the finisher's own.
+  string error_state = 11;
 }
 
 enum EventType {

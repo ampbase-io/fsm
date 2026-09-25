@@ -437,6 +437,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
 			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
 			m.Error = event.GetError()
+			m.ErrorKind = event.GetErrorKind()
 			m.ErrorState = event.GetState()
 		case fsmv1.EventType_EVENT_TYPE_ERROR:
 			m.RetryCount = event.GetRetryCount()
@@ -480,6 +481,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		// cross-node. The FINISH event still carries that same response for the history record.
 		if run.fsmErr.Err != nil {
 			m.Error = run.fsmErr.Err.Error()
+			m.ErrorKind = outcomeKind(run.fsmErr.Err)
 			m.ErrorState = run.fsmErr.State
 		}
 		return nil
@@ -607,7 +609,7 @@ func manifestRunErr(m *fsmv1.RunManifest) RunErr {
 		return RunErr{}
 	}
 	return RunErr{
-		Err:   errors.New(m.GetError()),
+		Err:   outcomeError(m.GetErrorKind(), m.GetError()),
 		State: m.GetErrorState(),
 	}
 }
@@ -855,9 +857,7 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		case finishInFlight:
 			return false, nil
 		}
-		if manifest.GetError() != "" {
-			outcome = &haltError{err: errors.New(manifest.GetError())}
-		}
+		outcome = recordedOutcome(manifest.GetErrorKind(), manifest.GetError())
 		return true, nil
 	}
 

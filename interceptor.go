@@ -63,6 +63,8 @@ func finishEvent(run Run, state string) *fsmv1.StateEvent {
 	}
 	if run.fsmErr.Err != nil {
 		event.Error = run.fsmErr.Err.Error()
+		event.ErrorKind = outcomeKind(run.fsmErr.Err)
+		event.ErrorState = run.fsmErr.State
 	}
 	return event
 }
@@ -107,6 +109,7 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				logger.InfoContext(ctx, "transition returned cancelable error, completing run", "error", haltErr.err)
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
 				event.Error = haltErr.Error()
+				event.ErrorKind = outcomeKind(haltErr)
 			case err != nil:
 				return resp, err
 			default:

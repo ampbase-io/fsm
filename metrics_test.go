@@ -146,13 +146,20 @@ func testRunMetrics(t *testing.T, b *backend) {
 	pass := func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 		return nil, nil
 	}
+	entered := make(chan struct{}, 1)
 	start, _, err := m.Register[orderReq, orderResp]("measured").
 		Start("first", pass).
 		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			if req.Msg.Name == "abort" {
+			switch req.Msg.Name {
+			case "abort":
 				return nil, Abort(errors.New("boom"))
+			case "cancel":
+				entered <- struct{}{}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return nil, nil
 			}
-			return nil, nil
 		}).
 		End("done").
 		Build(ctx)
@@ -164,6 +171,12 @@ func testRunMetrics(t *testing.T, b *backend) {
 		if err != nil {
 			t.Fatalf("failed to start FSM: %v", err)
 		}
+		if name == "cancel" {
+			<-entered
+			if err := m.Cancel(ctx, version, "measured stop"); err != nil {
+				t.Fatalf("cancel failed: %v", err)
+			}
+		}
 		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		return m.Wait(waitCtx, version)
@@ -174,30 +187,36 @@ func testRunMetrics(t *testing.T, b *backend) {
 	if err := waitFor("measured-abort", "abort"); err == nil {
 		t.Fatal("expected the aborting run to fail")
 	}
+	if err := waitFor("measured-cancel", "cancel"); err == nil {
+		t.Fatal("expected the canceled run to report its cancel")
+	}
 
 	metrics := collect(t, reader)
-	if got := counterValue(t, metrics, "fsm.run.completed", attrStatus, "ok"); got != 1 {
-		t.Fatalf("expected one run completed ok, got %d", got)
+	for status, want := range map[string]int64{"ok": 1, "abort": 1, "canceled": 1} {
+		if got := counterValue(t, metrics, "fsm.run.completed", attrStatus, status); got != want {
+			t.Fatalf("expected %d run(s) completed %s, got %d", want, status, got)
+		}
 	}
-	if got := counterValue(t, metrics, "fsm.run.completed", attrStatus, "abort"); got != 1 {
-		t.Fatalf("expected one run aborted, got %d", got)
-	}
-	// first, second, done for the ok run; first and done for the aborting one — the finisher
-	// records the halt, so it runs and completes ok — and its second is recorded as abort.
-	if got := counterValue(t, metrics, "fsm.transition.completed", attrStatus, "ok"); got != 5 {
-		t.Fatalf("expected five transitions completed ok, got %d", got)
+	// first, second, done for the ok run; first and done for the aborting and the canceled ones
+	// — the finisher records the halt, so it runs and completes ok — and their second is
+	// recorded as abort and canceled respectively.
+	if got := counterValue(t, metrics, "fsm.transition.completed", attrStatus, "ok"); got != 7 {
+		t.Fatalf("expected seven transitions completed ok, got %d", got)
 	}
 	if got := counterValue(t, metrics, "fsm.transition.completed", attrStatus, "abort"); got != 1 {
 		t.Fatalf("expected one transition aborted, got %d", got)
 	}
-	if got := counterValue(t, metrics, "fsm.transition.completed", attrState, "second"); got != 2 {
+	if got := counterValue(t, metrics, "fsm.transition.completed", attrStatus, "canceled"); got != 1 {
+		t.Fatalf("expected one transition canceled, got %d", got)
+	}
+	if got := counterValue(t, metrics, "fsm.transition.completed", attrState, "second"); got != 3 {
 		t.Fatalf("expected the state attribute on transition points, got %d for second", got)
 	}
-	if got := histogramCount(t, metrics, "fsm.run.duration"); got != 2 {
-		t.Fatalf("expected two run duration samples, got %d", got)
+	if got := histogramCount(t, metrics, "fsm.run.duration"); got != 3 {
+		t.Fatalf("expected three run duration samples, got %d", got)
 	}
-	if got := histogramCount(t, metrics, "fsm.transition.duration"); got != 6 {
-		t.Fatalf("expected six transition duration samples, got %d", got)
+	if got := histogramCount(t, metrics, "fsm.transition.duration"); got != 9 {
+		t.Fatalf("expected nine transition duration samples, got %d", got)
 	}
 }
 

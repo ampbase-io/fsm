@@ -333,7 +333,7 @@ func TestArchivedFailedRunPreservesError(t *testing.T) {
 	// node-a starts and finishes a run with a halt error; the FINISH event and manifest both
 	// record the cause.
 	run := startRun(t, a, "arch-failed")
-	run.fsmErr = RunErr{Err: errors.New("boom"), State: "exploding"}
+	run.fsmErr = RunErr{Err: halt(Abort(errors.New("boom"))), State: "exploding"}
 	if _, err := a.Append(ctx, run, finishEvent(run, "exploding")); err != nil {
 		t.Fatalf("failed to finish run with error: %v", err)
 	}
@@ -352,6 +352,8 @@ func TestArchivedFailedRunPreservesError(t *testing.T) {
 		t.Fatal("archived failed run reported success; its error was lost when the manifest was reaped")
 	case err.Error() != "boom":
 		t.Fatalf("expected the run's error preserved through archival, got %v", err)
+	case !func() bool { _, ok := errors.AsType[*AbortError](err); return ok }():
+		t.Fatalf("expected the run's error typed through archival, got %T", err)
 	}
 }
 

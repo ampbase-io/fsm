@@ -154,3 +154,75 @@ func (e *UnrecoverableError) Error() string {
 func (e *UnrecoverableError) Unwrap() error {
 	return e.error
 }
+
+// isHalt reports whether err is a run's recorded halt rather than a transport or storage error.
+func isHalt(err error) bool {
+	_, ok := errors.AsType[*haltError](err)
+	return ok
+}
+
+// Outcome kinds: how a halted run ended, recorded beside its error so the typed error is
+// rebuilt the same on every node. A successful run records none.
+const (
+	kindOK                  = ""
+	kindCanceled            = "canceled"
+	kindAbort               = "abort"
+	kindUnrecoverableSystem = "unrecoverable_system"
+	kindUnrecoverableUser   = "unrecoverable_user"
+	kindHandoff             = "handoff"
+	kindError               = "error"
+)
+
+// outcomeKind classifies a run's recorded error into its kind; nil is kindOK.
+func outcomeKind(err error) string {
+	var (
+		_, isCancel         = errors.AsType[*CancelError](err)
+		_, isAbort          = errors.AsType[*AbortError](err)
+		ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
+		_, isHandoff        = errors.AsType[*HandoffError](err)
+	)
+	switch {
+	case err == nil:
+		return kindOK
+	case isCancel:
+		return kindCanceled
+	case isAbort:
+		return kindAbort
+	case isUnrecoverable && ue.Kind == ErrorKindUser:
+		return kindUnrecoverableUser
+	case isUnrecoverable:
+		return kindUnrecoverableSystem
+	case isHandoff:
+		return kindHandoff
+	default:
+		return kindError
+	}
+}
+
+// outcomeError rebuilds a recorded run error from its kind and message, halt-wrapped as the run
+// loop records it. A kind this version does not know — including the empty kind of a record
+// written before kinds were recorded — is the message alone.
+func outcomeError(kind, msg string) error {
+	switch kind {
+	case kindCanceled:
+		return halt(&CancelError{Reason: msg})
+	case kindAbort:
+		return halt(&AbortError{err: errors.New(msg)})
+	case kindUnrecoverableSystem:
+		return halt(NewUnrecoverableSystemError(errors.New(msg)))
+	case kindUnrecoverableUser:
+		return halt(NewUnrecoverableUserError(errors.New(msg)))
+	default:
+		return halt(errors.New(msg))
+	}
+}
+
+// recordedOutcome is outcomeError for a record that may hold no error at all: a success reads
+// as nil. The kind is checked as well as the message, since a cancel with no reason records an
+// empty message.
+func recordedOutcome(kind, msg string) error {
+	if kind == kindOK && msg == "" {
+		return nil
+	}
+	return outcomeError(kind, msg)
+}

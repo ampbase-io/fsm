@@ -110,7 +110,7 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 	}
 
 	run := runFromManifest(version, manifest)
-	run.fsmErr = RunErr{Err: cause, State: cancelBeforeExecState}
+	run.fsmErr = RunErr{Err: halt(cause), State: cancelBeforeExecState}
 	_, err = s.Append(ctx, run, finishEvent(run, cancelBeforeExecState))
 	return err
 }

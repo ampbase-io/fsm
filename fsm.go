@@ -766,20 +766,21 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				return
 			}
 
-			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
-			case err == nil && canceled:
-				// The handler finished its work after the cancel landed. The cancel is still the
-				// run's outcome: Cancel has already answered its caller.
-				err = halt(cancel)
-			case err == nil:
-				continue
-			}
-
 			if errors.Is(err, ErrLeaseLost) {
 				// Halt without finalizers or FINISH: this node may no longer write to the run,
 				// and the new owner runs them at its own finish.
 				transitionLogger.WarnContext(ctx, "run lease lost, halting")
 				return
+			}
+
+			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
+			case canceled && !isHalt(err):
+				// The cancel is the run's outcome whether the handler finished its work after
+				// it landed or a retry's sleep returned the bare context error: Cancel has
+				// already answered its caller.
+				err = halt(cancel)
+			case err == nil:
+				continue
 			}
 
 			// The first halt is the run's outcome. Every transition after it is skipped, yet
@@ -788,23 +789,11 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				continue
 			}
 
-			var (
-				_, isAbort          = errors.AsType[*AbortError](err)
-				ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
-				_, isHandoff        = errors.AsType[*HandoffError](err)
-			)
-			switch {
-			case isAbort:
-				m.instruments.observeRun(ctx, run, "abort", "", runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", "abort"))
-			case isUnrecoverable:
-				kind := ue.Kind.String()
-				m.instruments.observeRun(ctx, run, "unrecoverable", kind, runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", kind))
+			kind := outcomeKind(err)
+			m.instruments.observeRun(ctx, run, kind, runStart)
+			span.SetAttributes(attribute.String("fsm.error_kind", kind))
+			if _, unrecoverable := errors.AsType[*UnrecoverableError](err); unrecoverable {
 				transitionLogger.ErrorContext(ctx, "reached unrecoverable error, canceling FSM", "error", err)
-			case isHandoff:
-				m.instruments.observeRun(ctx, run, "fsm_handoff_error", "", runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", "handoff"))
 			}
 			request.withError(RunErr{
 				Err:   err,
@@ -812,7 +801,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			})
 		}
 		if request.Run().fsmErr.Err == nil {
-			m.instruments.observeRun(ctx, run, "ok", "", runStart)
+			m.instruments.observeRun(ctx, run, kindOK, runStart)
 		}
 	}
 
