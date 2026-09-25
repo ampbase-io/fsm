@@ -137,6 +137,9 @@ func testCancelRecordsStoppingState(t *testing.T, b *backend) {
 	if state := mustManifest(t, store, version).GetErrorState(); state != "a" {
 		t.Fatalf("expected the manifest to record error state a, got %q", state)
 	}
+	if !objectGone(t, store, store.cancelKey(version)) {
+		t.Fatal("expected the cancel sentinel deleted at finish")
+	}
 }
 
 // TestFinalizerOutlivesCancel verifies an operator's cancel halts a run's transitions but leaves

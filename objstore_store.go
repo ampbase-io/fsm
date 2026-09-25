@@ -504,6 +504,16 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
 	}
 
+	// A canceled run's sentinel is inert once the manifest is terminal; deleting it here keeps
+	// the cancel/ prefix every heartbeat sweep lists from carrying a week of finished cancels.
+	// Only a cancel outcome has one — every other finish pays no request — and the archive reap
+	// is the backstop for a sentinel whose cancel lost the race with FINISH.
+	if _, canceled := errors.AsType[*CancelError](run.fsmErr.Err); canceled {
+		if err := s.deleteObject(ctx, s.cancelKey(run.StartVersion)); err != nil {
+			s.logger.ErrorContext(ctx, "failed to delete cancel sentinel", "error", err, versionAttr(run.StartVersion))
+		}
+	}
+
 	if err := s.writeHistory(ctx, run.StartVersion, historyFromManifest(manifest, event)); err != nil {
 		return err
 	}
