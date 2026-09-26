@@ -57,6 +57,10 @@ message StateEvent {
 
   // error_state is the state the run halted in. On a FINISH event, state is the finisher's own.
   string error_state = 11;
+
+  // iteration is which run of a repeated transition (RepeatWhile) the event records, from zero.
+  // Unset for a transition that does not repeat.
+  optional uint32 iteration = 12;
 }
 
 // HaltKind is how a run halted: the classification of the error recorded beside it.

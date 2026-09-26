@@ -76,9 +76,11 @@ func (r *Request[_, _]) withLogger(base *slog.Logger) {
 	r.logger = base.With(runAttr(r.run))
 }
 
-func (r *Request[_, _]) withTransition(name string, version ulid.ULID) {
+func (r *Request[_, _]) withTransition(t *transition, version ulid.ULID, iteration int) {
 	r.run.TransitionVersion = version
-	r.run.CurrentState = name
+	r.run.CurrentState = t.name
+	r.run.iterated = t.repeats
+	r.run.Iteration = iteration
 	r.logger = r.base.With(runAttr(r.run))
 }
 
@@ -94,6 +96,9 @@ func runAttr(run Run) slog.Attr {
 	}
 	if run.CurrentState != "" {
 		attrs = append(attrs, "state", run.CurrentState, "transition_version", run.TransitionVersion.String())
+	}
+	if run.iterated {
+		attrs = append(attrs, "iteration", run.Iteration)
 	}
 	return slog.Group("fsm", attrs...)
 }
@@ -132,7 +137,7 @@ type AnyRequest interface {
 
 	withLogger(*slog.Logger)
 
-	withTransition(string, ulid.ULID)
+	withTransition(*transition, ulid.ULID, int)
 
 	withError(RunErr)
 
@@ -238,6 +243,10 @@ type Run struct {
 
 	CurrentState string
 
+	// Iteration is the index of the running iteration of a RepeatWhile transition, from zero. It
+	// is zero in a transition that does not repeat.
+	Iteration int
+
 	ResourceName string
 
 	TypeName string
@@ -248,6 +257,18 @@ type Run struct {
 
 	// fsmErr is the error and originating state that caused the FSM to stop executing transitions.
 	fsmErr RunErr
+
+	// iterated is set while the run is in a RepeatWhile transition, so its records carry Iteration.
+	iterated bool
+}
+
+// iteration is the index a record of the run's current transition carries: set only in a
+// RepeatWhile transition.
+func (r Run) iteration() *uint32 {
+	if !r.iterated {
+		return nil
+	}
+	return new(uint32(r.Iteration))
 }
 
 type fsm struct {
@@ -315,6 +336,10 @@ type transition struct {
 	name string
 
 	impl TransitionFunc
+
+	// repeats is set for a RepeatWhile transition: the run loop iterates it until its gate
+	// answers RepeatDone.
+	repeats bool
 }
 
 type TransitionFunc func(context.Context, AnyRequest) (AnyResponse, error)
@@ -350,8 +375,9 @@ func newTransition[R, W any](name string, transitionFn func(context.Context, *Re
 	}
 
 	return &transition{
-		name: name,
-		impl: untyped,
+		name:    name,
+		impl:    untyped,
+		repeats: cfg.repeat != nil,
 	}
 }
 
@@ -475,26 +501,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		}
 		m.logger.DebugContext(ctx, "pruning completed transitions", "completed", resource.completedTransitions)
 
-		remainingTransitions := immutable.NewList[*transition]()
-		for _, name := range resource.active.Transitions {
-			if !slices.Contains(resource.completedTransitions, name) {
-				transition, ok := f.registeredTransitions[transitionKey{
-					action:   f.action,
-					typeName: f.typeName,
-					name:     name,
-				}]
-				if !ok {
-					m.logger.WarnContext(ctx, "transition did not exist", slog.Group("fsm", "version", resource.version.String(), "state", name))
-					transition = newTransition(name, noOp, TransitionConfig[R, W]{
-						interceptors: []TransitionInterceptorFunc{
-							skipper(),
-							canceller(m.store, f.wCodec),
-						},
-					})
-				}
-				remainingTransitions = remainingTransitions.Append(transition)
-			}
-		}
+		remainingTransitions := m.remaining[R, W](ctx, f, resource)
 
 		ctx = withRetry(ctx, resource.retryCount)
 		ctx = withRestart(ctx, true)
@@ -506,9 +513,41 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		request := NewRequest(&req, &w)
 		request.run = r
 
-		run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions})
+		run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions, iterations: resource.iterations})
 		return nil
 	}
+}
+
+// remaining is what a resumed run has left to execute, in order: every transition not completed,
+// and a repeated transition even once it has completed an iteration, since its predicate decides
+// at the recorded index whether it has more to run.
+func (m *Manager) remaining[R, W any](ctx context.Context, f *fsm, resource *activeResource) *immutable.List[*transition] {
+	remaining := immutable.NewList[*transition]()
+	for _, name := range resource.active.Transitions {
+		t, ok := f.registeredTransitions[transitionKey{action: f.action, typeName: f.typeName, name: name}]
+		switch {
+		case ok && t.repeats:
+			remaining = remaining.Append(t)
+		case slices.Contains(resource.completedTransitions, name):
+		case ok:
+			remaining = remaining.Append(t)
+		default:
+			m.logger.WarnContext(ctx, "transition did not exist", slog.Group("fsm", "version", resource.version.String(), "state", name))
+			remaining = remaining.Append(m.missing[R, W](f, name))
+		}
+	}
+	return remaining
+}
+
+// missing stands in for a recorded transition this definition no longer has: it runs nothing
+// and records the transition complete.
+func (m *Manager) missing[R, W any](f *fsm, name string) *transition {
+	return newTransition(name, noOp, TransitionConfig[R, W]{
+		interceptors: []TransitionInterceptorFunc{
+			skipper(),
+			canceller(m.store, f.wCodec),
+		},
+	})
 }
 
 type StartOptionsFn func(*startOptions)
@@ -682,6 +721,10 @@ type runInstance struct {
 	initializers []InitializerFunc
 
 	transitions *immutable.List[*transition]
+
+	// iterations is where each repeated transition resumes: the number of its iterations already
+	// completed. Nil on a fresh start.
+	iterations map[string]uint32
 }
 
 func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runInstance) {
@@ -782,59 +825,17 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		// The finisher is always the last transition, on a fresh start and on a resume alike.
 		finisher := ri.transitions.Len() - 1
 
+		e := &execution{m: m, request: request, span: span, run: run, runStart: runStart}
 		iter := ri.transitions.Iterator()
 		for !iter.Done() {
-			idx, transition := iter.Next()
-			transitionName := transition.name
-			transitionVersion := ulid.Make()
-			request.withTransition(transitionName, transitionVersion)
-			transitionLogger := request.Log()
-
-			if stopped(runCtx, transitionLogger) {
-				return
-			}
-
-			transitionLogger.DebugContext(ctx, "running transition")
-
+			idx, t := iter.Next()
 			transitionCtx := ctx
 			if idx == finisher {
 				transitionCtx = finalizerCtx
 			}
-			_, err := transition.impl(transitionCtx, request)
-
-			if stopped(runCtx, transitionLogger) {
+			if !e.iterate(runCtx, transitionCtx, t, int(ri.iterations[t.name])) {
 				return
 			}
-
-			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
-			case err == nil && canceled:
-				// The handler finished its work after the cancel landed. The cancel is still the
-				// run's outcome: Cancel has already answered its caller.
-				err = halt(cancel)
-			case err == nil:
-				continue
-			}
-
-			if errors.Is(err, ErrLeaseLost) {
-				// Halt without finalizers or FINISH: this node may no longer write to the run,
-				// and the new owner runs them at its own finish.
-				transitionLogger.WarnContext(ctx, "run lease lost, halting")
-				return
-			}
-
-			// The first halt is the run's outcome. Every transition after it is skipped, yet
-			// still sees the canceled context, and must not claim the halt as its own.
-			if request.Run().fsmErr.Err != nil {
-				continue
-			}
-
-			kind := outcomeKind(err)
-			m.instruments.observeRun(ctx, run, kind, runStart)
-			span.SetAttributes(outcomeAttrs(kind)...)
-			request.withError(RunErr{
-				Err:   err,
-				State: transitionName,
-			})
 		}
 		if request.Run().fsmErr.Err == nil {
 			m.instruments.observeRun(ctx, run, fsmv1.HaltKind_HALT_KIND_UNSPECIFIED, runStart)
@@ -857,6 +858,103 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 	<-ack
 	return
+}
+
+// execution is a run being driven through its transitions on this node.
+type execution struct {
+	m       *Manager
+	request AnyRequest
+	span    trace.Span
+
+	// run is the run as dispatched, which labels its metrics.
+	run      Run
+	runStart time.Time
+}
+
+// iterate runs a transition's iterations from first until the run moves on, and reports whether
+// it does: false when the run stopped.
+func (e *execution) iterate(runCtx, ctx context.Context, t *transition, first int) bool {
+	for iteration := first; ; iteration++ {
+		switch e.execute(runCtx, ctx, t, iteration) {
+		case stepStop:
+			return false
+		case stepNext:
+			return true
+		}
+	}
+}
+
+// execute runs one iteration of a transition (the only one unless it repeats) under ctx and
+// reports what the run does next. runCtx ends when the run is stopped short of an outcome.
+func (e *execution) execute(runCtx, ctx context.Context, t *transition, iteration int) step {
+	e.request.withTransition(t, ulid.Make(), iteration)
+	logger := e.request.Log()
+
+	if stopped(runCtx, logger) {
+		return stepStop
+	}
+
+	logger.DebugContext(ctx, "running transition")
+	_, err := t.impl(ctx, e.request)
+
+	if stopped(runCtx, logger) {
+		return stepStop
+	}
+
+	switch cancel, canceled := errors.AsType[*CancelError](context.Cause(ctx)); {
+	case succeeded(err) && canceled:
+		// The handler finished its work after the cancel landed. The cancel is still the run's
+		// outcome: Cancel has already answered its caller.
+		err = halt(cancel)
+	case succeeded(err):
+		return afterSuccess(t, errors.Is(err, errRepeatDone), e.request.Run())
+	}
+
+	if errors.Is(err, ErrLeaseLost) {
+		// Halt without finalizers or FINISH: this node may no longer write to the run, and the
+		// new owner runs them at its own finish.
+		logger.WarnContext(ctx, "run lease lost, halting")
+		return stepStop
+	}
+
+	// The first halt is the run's outcome. Every transition after it is skipped, yet still sees
+	// the canceled context, and must not claim the halt as its own.
+	if e.request.Run().fsmErr.Err != nil {
+		return stepNext
+	}
+
+	kind := outcomeKind(err)
+	e.m.instruments.observeRun(ctx, e.run, kind, e.runStart)
+	e.span.SetAttributes(outcomeAttrs(kind)...)
+	e.request.withError(RunErr{Err: err, State: t.name})
+	return stepNext
+}
+
+// succeeded reports whether a transition ended without error: it returned none, or its gate
+// answered RepeatDone.
+func succeeded(err error) bool {
+	return err == nil || errors.Is(err, errRepeatDone)
+}
+
+// step is what the run does after one execution of a transition.
+type step int
+
+const (
+	stepNext  step = iota // on to the next transition
+	stepAgain             // the transition's next iteration
+	stepStop              // stop without an outcome: a shutdown or a lost lease
+)
+
+// afterSuccess is the step after a transition that ended without error. It runs again when it
+// repeats, its gate did not answer RepeatDone, and it ran rather than being skipped after a halt.
+func afterSuccess(t *transition, repeatDone bool, run Run) step {
+	if !t.repeats || repeatDone {
+		return stepNext
+	}
+	if run.fsmErr.Err != nil {
+		return stepNext
+	}
+	return stepAgain
 }
 
 // stopped reports whether the run was ended short of an outcome by a shutdown or a lost lease.

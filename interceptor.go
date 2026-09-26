@@ -96,6 +96,7 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 					ResourceType: run.TypeName,
 					Action:       run.Action,
 					State:        run.CurrentState,
+					Iteration:    run.iteration(),
 				}
 			)
 
@@ -181,6 +182,9 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 						observe("ok")
 						return nil
 					}
+					if errors.Is(err, errRepeatDone) {
+						return backoff.Permanent(err)
+					}
 
 					switch kind := outcomeKind(err); {
 					case haltsRun(kind):
@@ -221,6 +225,7 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 									State:        run.CurrentState,
 									Error:        err.Error(),
 									RetryCount:   retryCount,
+									Iteration:    run.iteration(),
 								},
 							)
 						}
@@ -277,13 +282,15 @@ func haltOnCancel(ctx context.Context, err error) error {
 }
 
 func newTransitionSpan(ctx context.Context, tracer trace.Tracer, run Run) (context.Context, trace.Span) {
-	return tracer.Start(ctx, fmt.Sprintf("%s.%s", run.ResourceName, run.CurrentState), trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("fsm.action", run.Action),
-			attribute.String("fsm.state", run.CurrentState),
-			attribute.String("fsm.type", run.ResourceName),
-			attribute.String(fmt.Sprintf("%s.id", run.ResourceName), run.ID),
-			attribute.String(fmt.Sprintf("%s.version", run.ResourceName), run.StartVersion.String()),
-		),
-	)
+	attrs := []attribute.KeyValue{
+		attribute.String("fsm.action", run.Action),
+		attribute.String("fsm.state", run.CurrentState),
+		attribute.String("fsm.type", run.ResourceName),
+		attribute.String(fmt.Sprintf("%s.id", run.ResourceName), run.ID),
+		attribute.String(fmt.Sprintf("%s.version", run.ResourceName), run.StartVersion.String()),
+	}
+	if run.iterated {
+		attrs = append(attrs, attribute.Int("fsm.iteration", run.Iteration))
+	}
+	return tracer.Start(ctx, fmt.Sprintf("%s.%s", run.ResourceName, run.CurrentState), trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
 }

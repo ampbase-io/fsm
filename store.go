@@ -96,15 +96,33 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	return recordedRunErr(he.GetLastEvent()).Err
 }
 
-// nextState is the transition a run with the given definition and completed transitions is
-// executing or will execute next — the rule resume prunes by. Empty once every transition ran.
-func nextState(transitions, completed []string) string {
-	for _, name := range transitions {
-		if !slices.Contains(completed, name) {
-			return name
+// nextState is the transition a run is executing or will execute next: the one after the last
+// transition it completed, or that one again when it repeats, since only its predicate knows
+// whether another iteration follows. Empty once every transition ran.
+func nextState(transitions, completed []string, iterations map[string]uint32) string {
+	last := lastCompleted(transitions, completed)
+	if _, repeats := iterations[transitionAt(transitions, last)]; repeats {
+		return transitions[last]
+	}
+	return transitionAt(transitions, last+1)
+}
+
+// lastCompleted is the index in transitions of the last one completed, or -1 for none.
+func lastCompleted(transitions, completed []string) int {
+	for i := len(transitions) - 1; i >= 0; i-- {
+		if slices.Contains(completed, transitions[i]) {
+			return i
 		}
 	}
-	return ""
+	return -1
+}
+
+// transitionAt is the transition at i, or empty past either end.
+func transitionAt(transitions []string, i int) string {
+	if i < 0 || i >= len(transitions) {
+		return ""
+	}
+	return transitions[i]
 }
 
 var _ Store = (*boltStore)(nil)
@@ -393,6 +411,9 @@ type activeResource struct {
 
 	completedTransitions []string
 
+	// iterations counts the completed iterations of each repeated transition, by name.
+	iterations map[string]uint32
+
 	response []byte
 
 	retryCount uint64
@@ -507,6 +528,7 @@ func (s *boltStore) foldEvents(ctx context.Context, eventB *bbolt.Bucket, ae *fs
 			if event.GetResponse() != nil {
 				folded.response = event.GetResponse()
 			}
+			folded.iterations = recordIteration(folded.iterations, &event)
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
 			folded.completedTransitions = append(folded.completedTransitions, event.GetState())
 			folded.fsmError = recordedRunErr(&event)
@@ -533,7 +555,8 @@ func (s *boltStore) currentState(ctx context.Context, tx *bbolt.Tx, run Run) str
 		s.logger.ErrorContext(ctx, "failed to unmarshal active event", "error", err, "key", string(key))
 		return ""
 	}
-	return nextState(ae.GetTransitions(), s.foldEvents(ctx, tx.Bucket(eventsBucket), &ae).completedTransitions)
+	folded := s.foldEvents(ctx, tx.Bucket(eventsBucket), &ae)
+	return nextState(ae.GetTransitions(), folded.completedTransitions, folded.iterations)
 }
 
 // activeKey is a run's ACTIVE bucket key, <resource_type>#<resource_id>#<action>#<run_version>,

@@ -61,6 +61,10 @@ backend's distributed-execution design is the active work.
   event onto the manifest), `recordedRunErr` rebuilds the typed halt from either (fsm.go), with
   `outcomeKind` / `outcomeError` (error.go) as the classification. Every write and read goes
   through those, so `Wait` is typed cross-node.
+- `repeat.go` — `RepeatWhile`: a repeated transition's predicate is a gate inside retry and
+  outside the caller's interceptors; the run loop iterates it (`execution.iterate`), each
+  COMPLETE carries `iteration`, and resume starts it at the count folded from those events (the
+  manifest's `iterations` on the object backend).
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
   `proto/fsm/v1/`; generated code in `gen/`.
 - `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like

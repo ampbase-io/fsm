@@ -77,4 +77,9 @@ message RunManifest {
 
   // halt_kind classifies error, as on the StateEvent that recorded it.
   HaltKind halt_kind = 28;
+
+  // iterations counts the completed iterations of each repeated transition (RepeatWhile), by
+  // name: the index its next iteration runs at. completed_states lists a repeated transition once
+  // its first iteration completes, so resume reads this instead.
+  map<string, uint32> iterations = 29;
 }
