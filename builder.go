@@ -68,13 +68,16 @@ func (m *Manager) Register[R, W any](action string) *fsmStart[R, W] {
 		},
 	}
 
-	rc, err := determineCodec(m.logger, r)
+	// Probed through the pointer, as the codecs use the types: a generated protobuf message
+	// implements proto.Message on *T, so R registered as the value would otherwise fall through
+	// to JSON, and a Codec with pointer receivers would go unseen.
+	rc, err := determineCodec(m.logger, &r)
 	if err != nil {
 		fs.buildError = fmt.Errorf("unable to determine codec for Request type: %w", err)
 	}
 	fs.f.rCodec = rc
 
-	wc, err := determineCodec(m.logger, w)
+	wc, err := determineCodec(m.logger, &w)
 	if err != nil {
 		fs.buildError = errors.Join(fs.buildError, fmt.Errorf("unable to determine codec for Response type: %w", err))
 	}
