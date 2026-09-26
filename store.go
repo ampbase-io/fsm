@@ -98,16 +98,18 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 
 // resumeAt is the index in transitions a run executes next, and resumes at: the one after the
 // last transition it completed, or that one again when it recorded iterations, since only its
-// predicate knows whether another follows.
+// predicate knows whether another follows. A run completes its transitions in order and both
+// backends list them in completion order, so the last one listed is the furthest reached.
 func resumeAt(transitions, completed []string, iterations map[string]uint32) int {
-	last := lastCompleted(transitions, completed)
-	if last < 0 {
+	if len(completed) == 0 {
 		return 0
 	}
-	if _, repeats := iterations[transitions[last]]; repeats {
-		return last
+	last := completed[len(completed)-1]
+	i := slices.Index(transitions, last)
+	if _, repeats := iterations[last]; repeats {
+		return i
 	}
-	return last + 1
+	return i + 1
 }
 
 // nextState is the transition a run is executing or will execute next; empty once every
@@ -118,16 +120,6 @@ func nextState(transitions, completed []string, iterations map[string]uint32) st
 		return ""
 	}
 	return transitions[i]
-}
-
-// lastCompleted is the index in transitions of the last one completed, or -1 for none.
-func lastCompleted(transitions, completed []string) int {
-	for i := len(transitions) - 1; i >= 0; i-- {
-		if slices.Contains(completed, transitions[i]) {
-			return i
-		}
-	}
-	return -1
 }
 
 var _ Store = (*boltStore)(nil)
