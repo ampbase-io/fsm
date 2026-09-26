@@ -80,6 +80,7 @@ message RunManifest {
 
   // iterations counts the completed iterations of each repeated transition (RepeatWhile), by
   // name: the index its next iteration runs at. A transition's COMPLETE with zero
-  // iterations_completed removes its entry, so an entry means the transition may still have iterations to run.
+  // iterations_completed removes its entry, so an entry means the transition may still have
+  // iterations to run.
   map<string, uint32> iterations = 29;
 }

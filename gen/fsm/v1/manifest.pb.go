@@ -68,8 +68,9 @@ type RunManifest struct {
 	// halt_kind classifies error, as on the StateEvent that recorded it.
 	HaltKind HaltKind `protobuf:"varint,28,opt,name=halt_kind,json=haltKind,proto3,enum=fsm.v1.HaltKind" json:"halt_kind,omitempty"`
 	// iterations counts the completed iterations of each repeated transition (RepeatWhile), by
-	// name: the index its next iteration runs at. A transition's COMPLETE with no iteration removes
-	// its entry, so an entry means the transition may still have iterations to run.
+	// name: the index its next iteration runs at. A transition's COMPLETE with zero
+	// iterations_completed removes its entry, so an entry means the transition may still have
+	// iterations to run.
 	Iterations    map[string]uint32 `protobuf:"bytes,29,rep,name=iterations,proto3" json:"iterations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
