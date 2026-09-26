@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"time"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
@@ -518,23 +517,18 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 	}
 }
 
-// remaining is what a resumed run has left to execute, in order: every transition not completed,
-// and a repeated transition even once it has completed an iteration, since its predicate decides
-// at the recorded index whether it has more to run.
+// remaining is what a resumed run has left to execute: its recorded transitions from resumeAt
+// on, each as this definition registers it.
 func (m *Manager) remaining[R, W any](ctx context.Context, f *fsm, resource *activeResource) *immutable.List[*transition] {
+	recorded := resource.active.Transitions
 	remaining := immutable.NewList[*transition]()
-	for _, name := range resource.active.Transitions {
+	for _, name := range recorded[resumeAt(recorded, resource.completedTransitions, resource.iterations):] {
 		t, ok := f.registeredTransitions[transitionKey{action: f.action, typeName: f.typeName, name: name}]
-		switch {
-		case ok && t.repeats:
-			remaining = remaining.Append(t)
-		case slices.Contains(resource.completedTransitions, name):
-		case ok:
-			remaining = remaining.Append(t)
-		default:
+		if !ok {
 			m.logger.WarnContext(ctx, "transition did not exist", slog.Group("fsm", "version", resource.version.String(), "state", name))
-			remaining = remaining.Append(m.missing[R, W](f, name))
+			t = m.missing[R, W](f, name)
 		}
+		remaining = remaining.Append(t)
 	}
 	return remaining
 }
@@ -543,10 +537,7 @@ func (m *Manager) remaining[R, W any](ctx context.Context, f *fsm, resource *act
 // and records the transition complete.
 func (m *Manager) missing[R, W any](f *fsm, name string) *transition {
 	return newTransition(name, noOp, TransitionConfig[R, W]{
-		interceptors: []TransitionInterceptorFunc{
-			skipper(),
-			canceller(m.store, f.wCodec),
-		},
+		interceptors: []TransitionInterceptorFunc{canceller(m.store, f.wCodec)},
 	})
 }
 
@@ -829,6 +820,10 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		iter := ri.transitions.Iterator()
 		for !iter.Done() {
 			idx, t := iter.Next()
+			if idx != finisher && request.Run().fsmErr.Err != nil {
+				// A halted run goes straight to its finisher.
+				continue
+			}
 			transitionCtx := ctx
 			if idx == finisher {
 				transitionCtx = finalizerCtx
@@ -901,24 +896,27 @@ func (e *execution) execute(runCtx, ctx context.Context, t *transition, iteratio
 		return stepStop
 	}
 
-	switch cancel, canceled := errors.AsType[*CancelError](context.Cause(ctx)); {
-	case succeeded(err) && canceled:
+	if cancel, canceled := errors.AsType[*CancelError](context.Cause(ctx)); canceled && succeeded(err) {
 		// The handler finished its work after the cancel landed. The cancel is still the run's
 		// outcome: Cancel has already answered its caller.
 		err = halt(cancel)
-	case succeeded(err):
-		return afterSuccess(t, errors.Is(err, errRepeatDone), e.request.Run())
 	}
 
-	if errors.Is(err, ErrLeaseLost) {
+	switch {
+	case errors.Is(err, ErrLeaseLost):
 		// Halt without finalizers or FINISH: this node may no longer write to the run, and the
 		// new owner runs them at its own finish.
 		logger.WarnContext(ctx, "run lease lost, halting")
 		return stepStop
+	case errors.Is(err, errRepeatDone):
+		return stepNext
+	case err == nil && t.repeats:
+		return stepAgain
+	case err == nil:
+		return stepNext
 	}
 
-	// The first halt is the run's outcome. Every transition after it is skipped, yet still sees
-	// the canceled context, and must not claim the halt as its own.
+	// The first halt is the run's outcome: a finisher failing after one does not replace it.
 	if e.request.Run().fsmErr.Err != nil {
 		return stepNext
 	}
@@ -944,18 +942,6 @@ const (
 	stepAgain             // the transition's next iteration
 	stepStop              // stop without an outcome: a shutdown or a lost lease
 )
-
-// afterSuccess is the step after a transition that ended without error. It runs again when it
-// repeats, its gate did not answer RepeatDone, and it ran rather than being skipped after a halt.
-func afterSuccess(t *transition, repeatDone bool, run Run) step {
-	if !t.repeats || repeatDone {
-		return stepNext
-	}
-	if run.fsmErr.Err != nil {
-		return stepNext
-	}
-	return stepAgain
-}
 
 // stopped reports whether the run was ended short of an outcome by a shutdown or a lost lease.
 // Nothing more may be recorded; the run resumes where it left off.

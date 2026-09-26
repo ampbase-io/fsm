@@ -77,8 +77,8 @@ To("stage", stage, fsm.RepeatWhile(func(ctx context.Context, req *fsm.Request[Ro
   the repeated transition; any other error is retried under the transition's backoff, and the
   predicate is asked again before every retry.
 - **Each iteration is a transition to everything around it.** It runs under a fresh transition
-  version, through the transition's interceptors, with its own span. A `RepeatDone` runs no
-  interceptor and records nothing.
+  version, through the transition's interceptors, with its own span. A `RepeatDone` reaches
+  none of those interceptors and records no event.
 
 ## Cancellation
 

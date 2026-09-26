@@ -12,12 +12,15 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// iterations collects what a repeated transition saw, from the handler and interceptor sides.
+// iterations records what a repeated transition saw, from the handler and interceptor sides,
+// and how often the transition after it ran.
 type iterations struct {
 	mu       sync.Mutex
 	body     []int
 	seen     []int
 	versions []ulid.ULID
+
+	last atomic.Int32
 }
 
 func (it *iterations) ran(run Run) {
@@ -53,21 +56,19 @@ func fewerThan(n int) func(context.Context, *Request[orderReq, orderResp]) (Repe
 	}
 }
 
-// repeatingFSM registers first → stage (repeated under predicate) → last → done, recording the
-// stage's iterations and counting the runs of last.
-func repeatingFSM(t *testing.T, m *Manager, action string, it *iterations, lastRuns *atomic.Int32, predicate func(context.Context, *Request[orderReq, orderResp]) (Repeat, error)) Start[orderReq, orderResp] {
+// repeatingFSM registers first → stage (repeated under predicate) → last → done, recording into
+// it.
+func repeatingFSM(t *testing.T, m *Manager, action string, it *iterations, predicate func(context.Context, *Request[orderReq, orderResp]) (Repeat, error)) Start[orderReq, orderResp] {
 	t.Helper()
 
 	start, _, err := m.Register[orderReq, orderResp](action).
-		Start("first", func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			return nil, nil
-		}).
+		Start("first", okTransition).
 		To("stage", func(_ context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 			it.ran(req.Run())
 			return nil, nil
 		}, RepeatWhile(predicate), WithInterceptors[orderReq, orderResp](it.intercept)).
 		To("last", func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			lastRuns.Add(1)
+			it.last.Add(1)
 			return nil, nil
 		}).
 		End("done").
@@ -97,11 +98,8 @@ func TestRepeatWhileRunsEachIteration(t *testing.T) { runBackends(t, testRepeatW
 
 func testRepeatWhileRunsEachIteration(t *testing.T, b *backend) {
 	m, _ := b.newManager(nil)
-	var (
-		it       iterations
-		lastRuns atomic.Int32
-	)
-	start := repeatingFSM(t, m, "repeat", &it, &lastRuns, fewerThan(3))
+	var it iterations
+	start := repeatingFSM(t, m, "repeat", &it, fewerThan(3))
 
 	if _, err := startAndWait(t, m, start, "repeat-1"); err != nil {
 		t.Fatalf("run failed: %v", err)
@@ -115,7 +113,7 @@ func testRepeatWhileRunsEachIteration(t *testing.T, b *backend) {
 	if len(slices.Compact(versions)) != 3 {
 		t.Fatalf("expected a fresh transition version per iteration, got %v", versions)
 	}
-	if n := lastRuns.Load(); n != 1 {
+	if n := it.last.Load(); n != 1 {
 		t.Fatalf("expected the next transition to run once, ran %d times", n)
 	}
 }
@@ -126,11 +124,8 @@ func TestRepeatWhileNoIterations(t *testing.T) { runBackends(t, testRepeatWhileN
 
 func testRepeatWhileNoIterations(t *testing.T, b *backend) {
 	m, _ := b.newManager(nil)
-	var (
-		it       iterations
-		lastRuns atomic.Int32
-	)
-	start := repeatingFSM(t, m, "repeat-none", &it, &lastRuns, fewerThan(0))
+	var it iterations
+	start := repeatingFSM(t, m, "repeat-none", &it, fewerThan(0))
 
 	if _, err := startAndWait(t, m, start, "repeat-none-1"); err != nil {
 		t.Fatalf("run failed: %v", err)
@@ -139,7 +134,7 @@ func testRepeatWhileNoIterations(t *testing.T, b *backend) {
 	if body, seen, _ := it.snapshot(); len(body) != 0 || len(seen) != 0 {
 		t.Fatalf("expected no iteration, got body %v and interceptor %v", body, seen)
 	}
-	if n := lastRuns.Load(); n != 1 {
+	if n := it.last.Load(); n != 1 {
 		t.Fatalf("expected the next transition to run once, ran %d times", n)
 	}
 }
@@ -153,9 +148,8 @@ func TestRepeatWhilePredicateErrorRetries(t *testing.T) {
 func testRepeatWhilePredicateErrorRetries(t *testing.T, b *backend) {
 	m, _ := b.newManager(nil)
 	var (
-		it       iterations
-		lastRuns atomic.Int32
-		failed   atomic.Bool
+		it     iterations
+		failed atomic.Bool
 	)
 	flaky := func(ctx context.Context, req *Request[orderReq, orderResp]) (Repeat, error) {
 		if failed.CompareAndSwap(false, true) {
@@ -163,7 +157,7 @@ func testRepeatWhilePredicateErrorRetries(t *testing.T, b *backend) {
 		}
 		return fewerThan(1)(ctx, req)
 	}
-	start := repeatingFSM(t, m, "repeat-flaky", &it, &lastRuns, flaky)
+	start := repeatingFSM(t, m, "repeat-flaky", &it, flaky)
 
 	if _, err := startAndWait(t, m, start, "repeat-flaky-1"); err != nil {
 		t.Fatalf("run failed: %v", err)
@@ -205,11 +199,8 @@ func testRepeatWhilePredicateHalts(t *testing.T, b *backend) {
 
 	m, _ := b.newManager(nil)
 	for _, tc := range cases {
-		var (
-			it       iterations
-			lastRuns atomic.Int32
-		)
-		start := repeatingFSM(t, m, "repeat-halt-"+tc.name, &it, &lastRuns, tc.predicate)
+		var it iterations
+		start := repeatingFSM(t, m, "repeat-halt-"+tc.name, &it, tc.predicate)
 
 		version, err := startAndWait(t, m, start, "repeat-halt-"+tc.name)
 		if !tc.check(err) {
@@ -218,7 +209,7 @@ func testRepeatWhilePredicateHalts(t *testing.T, b *backend) {
 		if body, seen, _ := it.snapshot(); len(body) != 0 || len(seen) != 0 {
 			t.Fatalf("%s: expected no iteration, got body %v and interceptor %v", tc.name, body, seen)
 		}
-		if n := lastRuns.Load(); n != 0 {
+		if n := it.last.Load(); n != 0 {
 			t.Fatalf("%s: expected the run halted before the next transition, it ran %d times", tc.name, n)
 		}
 		he, err := m.History(context.Background(), version)
@@ -238,8 +229,7 @@ func TestRepeatWhileResumes(t *testing.T) { runBackends(t, testRepeatWhileResume
 func testRepeatWhileResumes(t *testing.T, b *backend) {
 	ctx := context.Background()
 	var (
-		mu    sync.Mutex
-		ran   []int
+		it    iterations
 		block atomic.Bool
 	)
 	block.Store(true)
@@ -248,16 +238,11 @@ func testRepeatWhileResumes(t *testing.T, b *backend) {
 
 	register := func(m *Manager) (Start[orderReq, orderResp], Resume) {
 		start, resume, err := m.Register[orderReq, orderResp]("repeat-resume").
-			Start("first", func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-				return nil, nil
-			}).
+			Start("first", okTransition).
 			To("stage", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-				iteration := req.Run().Iteration
-				mu.Lock()
-				ran = append(ran, iteration)
-				mu.Unlock()
-				entered <- iteration
-				if iteration == 1 && block.Load() {
+				it.ran(req.Run())
+				entered <- req.Run().Iteration
+				if req.Run().Iteration == 1 && block.Load() {
 					<-ctx.Done()
 					return nil, ctx.Err()
 				}
@@ -280,7 +265,7 @@ func testRepeatWhileResumes(t *testing.T, b *backend) {
 		t.Fatalf("failed to start FSM: %v", err)
 	}
 	for want := range 2 {
-		if got := <-entered; got != want {
+		if got := within(t, entered, 10*time.Second, "an iteration"); got != want {
 			t.Fatalf("expected iteration %d, got %d", want, got)
 		}
 	}
@@ -302,15 +287,9 @@ func testRepeatWhileResumes(t *testing.T, b *backend) {
 	if err := resume(ctx); err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("resumed run never finished")
-	}
+	within(t, done, 10*time.Second, "the resumed run to finish")
 
-	mu.Lock()
-	defer mu.Unlock()
-	if want := []int{0, 1, 1, 2}; !slices.Equal(ran, want) {
-		t.Fatalf("expected the resume to rerun the stopped iteration and go on, ran %v, want %v", ran, want)
+	if body, _, _ := it.snapshot(); !slices.Equal(body, []int{0, 1, 1, 2}) {
+		t.Fatalf("expected the resume to rerun the stopped iteration and go on, ran %v", body)
 	}
 }

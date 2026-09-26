@@ -17,8 +17,7 @@ type Repeat struct {
 type decision int
 
 const (
-	undecided decision = iota
-	decisionAgain
+	decisionAgain decision = iota + 1
 	decisionDone
 )
 
@@ -36,8 +35,8 @@ func RepeatDone() Repeat { return Repeat{decision: decisionDone} }
 // the unrecoverable errors halt the run, anything else is retried.
 //
 // Each iteration is recorded as its own COMPLETE event carrying its index, runs with a fresh
-// transition version, and passes through the transition's interceptors. A RepeatDone runs no
-// interceptor and records nothing.
+// transition version, and passes through the transition's interceptors. A RepeatDone reaches
+// none of those interceptors and records no event.
 func RepeatWhile[R, W any](predicate func(context.Context, *Request[R, W]) (Repeat, error)) Option[R, W] {
 	return repeatOption[R, W](predicate)
 }

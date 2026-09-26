@@ -96,15 +96,28 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	return recordedRunErr(he.GetLastEvent()).Err
 }
 
-// nextState is the transition a run is executing or will execute next: the one after the last
-// transition it completed, or that one again when it repeats, since only its predicate knows
-// whether another iteration follows. Empty once every transition ran.
-func nextState(transitions, completed []string, iterations map[string]uint32) string {
+// resumeAt is the index in transitions a run executes next, and resumes at: the one after the
+// last transition it completed, or that one again when it recorded iterations, since only its
+// predicate knows whether another follows.
+func resumeAt(transitions, completed []string, iterations map[string]uint32) int {
 	last := lastCompleted(transitions, completed)
-	if _, repeats := iterations[transitionAt(transitions, last)]; repeats {
-		return transitions[last]
+	if last < 0 {
+		return 0
 	}
-	return transitionAt(transitions, last+1)
+	if _, repeats := iterations[transitions[last]]; repeats {
+		return last
+	}
+	return last + 1
+}
+
+// nextState is the transition a run is executing or will execute next; empty once every
+// transition ran.
+func nextState(transitions, completed []string, iterations map[string]uint32) string {
+	i := resumeAt(transitions, completed, iterations)
+	if i >= len(transitions) {
+		return ""
+	}
+	return transitions[i]
 }
 
 // lastCompleted is the index in transitions of the last one completed, or -1 for none.
@@ -115,14 +128,6 @@ func lastCompleted(transitions, completed []string) int {
 		}
 	}
 	return -1
-}
-
-// transitionAt is the transition at i, or empty past either end.
-func transitionAt(transitions []string, i int) string {
-	if i < 0 || i >= len(transitions) {
-		return ""
-	}
-	return transitions[i]
 }
 
 var _ Store = (*boltStore)(nil)

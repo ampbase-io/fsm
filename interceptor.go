@@ -65,19 +65,6 @@ func finishEvent(run Run, state string) *fsmv1.StateEvent {
 	return event
 }
 
-// skipper will skip executing the next transition if the FSM has already errored.
-func skipper() TransitionInterceptorFunc {
-	return TransitionInterceptorFunc(func(next TransitionFunc) TransitionFunc {
-		return TransitionFunc(func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
-			if fsmErr := req.Run().fsmErr; fsmErr.Err != nil {
-				req.Log().DebugContext(ctx, "skipping transition due to previous error", "error", fsmErr.Err)
-				return nil, nil
-			}
-			return next(ctx, req)
-		})
-	})
-}
-
 // appender records a run's transition events — everything after START — and is all a transition
 // interceptor needs of a backend. START goes through Store.Start, which carries the start record.
 type appender interface {

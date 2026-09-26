@@ -232,12 +232,11 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 	return &fsmTransition[R, W]{s.transitionStep}
 }
 
-// builtins is the chain every non-final transition runs inside, outermost first: skip after a
-// halt, record the outcome, retry. A repeated transition adds its gate inside retry, so the
+// builtins is the chain every non-final transition runs inside, outermost first: record the
+// outcome, retry. A repeated transition adds its gate inside retry, so the
 // caller's interceptors run only for an iteration that runs.
 func (s *fsmTransition[R, W]) builtins() []TransitionInterceptorFunc {
 	chain := []TransitionInterceptorFunc{
-		skipper(),
 		canceller(s.m.store, s.f.wCodec),
 		retry(s.m.tracer, s.m.instruments, s.m.store),
 	}
