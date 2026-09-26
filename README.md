@@ -79,7 +79,7 @@ A run's outcome is typed on every node. `Wait` returns the same `*fsm.CancelErro
 `*fsm.AbortError` or `*fsm.UnrecoverableError` whether the run finished in this process, on
 another node, or before its record was archived, so `errors.AsType[*fsm.CancelError](err)` is
 the way to ask "was that a cancel?" — never the message text. The FINISH event `History`
-returns carries the same classification as `error_kind`, with `error_state` naming the
+returns carries the same classification as `halt_kind`, with `error_state` naming the
 transition the run halted in.
 
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the

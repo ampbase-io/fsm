@@ -194,14 +194,14 @@ func (e RunErr) stamp(event *fsmv1.StateEvent) {
 		return
 	}
 	event.Error = e.Err.Error()
-	event.ErrorKind = outcomeKind(e.Err)
+	event.HaltKind = outcomeKind(e.Err)
 	event.ErrorState = e.State
 }
 
 // outcomeRecord is the error triple a stamped StateEvent and the RunManifest both carry.
 type outcomeRecord interface {
 	GetError() string
-	GetErrorKind() string
+	GetHaltKind() fsmv1.HaltKind
 	GetErrorState() string
 }
 
@@ -210,10 +210,10 @@ type outcomeRecord interface {
 // kind and state count as well as the message, since a cancel with no reason records an empty
 // message.
 func recordedRunErr(r outcomeRecord) RunErr {
-	if r.GetError() == "" && r.GetErrorKind() == "" && r.GetErrorState() == "" {
+	if r.GetError() == "" && r.GetHaltKind() == fsmv1.HaltKind_HALT_KIND_UNSPECIFIED && r.GetErrorState() == "" {
 		return RunErr{}
 	}
-	return RunErr{Err: outcomeError(r.GetErrorKind(), r.GetError()), State: r.GetErrorState()}
+	return RunErr{Err: outcomeError(r.GetHaltKind(), r.GetError()), State: r.GetErrorState()}
 }
 
 // Run contains the information associated with an active FSM.
@@ -827,7 +827,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			})
 		}
 		if request.Run().fsmErr.Err == nil {
-			m.instruments.observeRun(ctx, run, kindOK, runStart)
+			m.instruments.observeRun(ctx, run, fsmv1.HaltKind_HALT_KIND_UNSPECIFIED, runStart)
 		}
 	}
 

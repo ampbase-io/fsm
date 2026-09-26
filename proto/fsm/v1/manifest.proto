@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package fsm.v1;
 
+import "fsm/v1/event.proto";
 import "fsm/v1/fsm.proto";
 
 // RunManifest is the per-run coordination object for the object storage backend. It is the
@@ -74,6 +75,6 @@ message RunManifest {
   // rather than reusing updated_at, so a later manifest CAS cannot move the retention clock.
   int64 completed_at = 27;
 
-  // error_kind classifies error, as on the StateEvent that recorded it.
-  string error_kind = 28;
+  // halt_kind classifies error, as on the StateEvent that recorded it.
+  HaltKind halt_kind = 28;
 }

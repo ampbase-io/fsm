@@ -602,7 +602,7 @@ func admissionQueue(m *fsmv1.RunManifest) string {
 // recordOutcome projects a stamped event's error triple onto the manifest: the one way the
 // manifest learns how a run halted, so it and the event log never disagree.
 func recordOutcome(m *fsmv1.RunManifest, event *fsmv1.StateEvent) {
-	m.Error, m.ErrorKind, m.ErrorState = event.GetError(), event.GetErrorKind(), event.GetErrorState()
+	m.Error, m.HaltKind, m.ErrorState = event.GetError(), event.GetHaltKind(), event.GetErrorState()
 }
 
 // runFromManifest rebuilds a Run from the manifest's materialized fields. The resource alias is

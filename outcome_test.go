@@ -75,18 +75,19 @@ func wantAbort(t *testing.T, where string, err error) {
 }
 
 // TestOutcomeError pins the rebuild of a recorded error from its kind: each kind that carries a
-// type classifies back to itself through a halt with the message preserved; handoff, an
-// unknown kind, and the empty kind of an older record rebuild as a plain error.
+// type classifies back to itself through a halt with the message preserved; handoff, a kind
+// this version does not know, and the unspecified kind of an older record rebuild as a plain
+// error.
 func TestOutcomeError(t *testing.T) {
-	cases := []struct{ kind, back string }{
-		{kindCanceled, kindCanceled},
-		{kindAbort, kindAbort},
-		{kindUnrecoverableSystem, kindUnrecoverableSystem},
-		{kindUnrecoverableUser, kindUnrecoverableUser},
-		{kindHandoff, kindError},
-		{kindError, kindError},
-		{"", kindError},
-		{"from-the-future", kindError},
+	cases := []struct{ kind, back fsmv1.HaltKind }{
+		{fsmv1.HaltKind_HALT_KIND_CANCELED, fsmv1.HaltKind_HALT_KIND_CANCELED},
+		{fsmv1.HaltKind_HALT_KIND_ABORT, fsmv1.HaltKind_HALT_KIND_ABORT},
+		{fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM, fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM},
+		{fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER, fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER},
+		{fsmv1.HaltKind_HALT_KIND_HANDOFF, fsmv1.HaltKind_HALT_KIND_ERROR},
+		{fsmv1.HaltKind_HALT_KIND_ERROR, fsmv1.HaltKind_HALT_KIND_ERROR},
+		{fsmv1.HaltKind_HALT_KIND_UNSPECIFIED, fsmv1.HaltKind_HALT_KIND_ERROR},
+		{fsmv1.HaltKind(99), fsmv1.HaltKind_HALT_KIND_ERROR},
 	}
 	for _, tc := range cases {
 		err := outcomeError(tc.kind, "msg")
@@ -101,7 +102,7 @@ func TestOutcomeError(t *testing.T) {
 	if err := recordedRunErr(&fsmv1.StateEvent{}).Err; err != nil {
 		t.Fatalf("expected an empty record to read as success, got %v", err)
 	}
-	got := recordedRunErr(&fsmv1.StateEvent{ErrorKind: kindCanceled, ErrorState: "a"})
+	got := recordedRunErr(&fsmv1.StateEvent{HaltKind: fsmv1.HaltKind_HALT_KIND_CANCELED, ErrorState: "a"})
 	if !isA[*CancelError](got.Err) || got.State != "a" {
 		t.Fatalf("expected a cancel with no reason to read as a cancel in its state, got %T %v in %q", got.Err, got.Err, got.State)
 	}

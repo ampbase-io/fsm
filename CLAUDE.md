@@ -56,7 +56,7 @@ backend's distributed-execution design is the active work.
 - `manager.go` / `fsm.go` / `builder.go` / `runner.go` / `interceptor.go` — the `Manager` API,
   run lifecycle, the fluent FSM builder, runners (queue/delay/run-after), and transition
   interceptors (retry, cancel, finish). A run's outcome is persisted as the `error` /
-  `error_kind` / `error_state` triple on the CANCEL and FINISH events and the manifest, through
+  `halt_kind` / `error_state` triple on the CANCEL and FINISH events and the manifest, through
   one writer and one reader: `RunErr.stamp` puts it on an event (`recordOutcome` projects the
   event onto the manifest), `recordedRunErr` rebuilds the typed halt from either (fsm.go), with
   `outcomeKind` / `outcomeError` (error.go) as the classification. Every write and read goes
