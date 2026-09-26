@@ -55,7 +55,12 @@ backend's distributed-execution design is the active work.
   payload, run-addressed subjects, no-op default.
 - `manager.go` / `fsm.go` / `builder.go` / `runner.go` / `interceptor.go` — the `Manager` API,
   run lifecycle, the fluent FSM builder, runners (queue/delay/run-after), and transition
-  interceptors (retry, cancel, finish).
+  interceptors (retry, cancel, finish). A run's outcome is persisted as the `error` /
+  `halt_kind` / `error_state` triple on the CANCEL and FINISH events and the manifest, through
+  one writer and one reader: `RunErr.stamp` puts it on an event (`recordOutcome` projects the
+  event onto the manifest), `recordedRunErr` rebuilds the typed halt from either (fsm.go), with
+  `outcomeKind` / `outcomeError` (error.go) as the classification. Every write and read goes
+  through those, so `Wait` is typed cross-node.
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
   `proto/fsm/v1/`; generated code in `gen/`.
 - `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like

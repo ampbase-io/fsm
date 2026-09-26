@@ -132,11 +132,7 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 // rather than a transient poll failure. Recorded outcomes are always nil or *haltError; a storage
 // read that aborted the wait is neither.
 func isRunOutcome(err error) bool {
-	if err == nil {
-		return true
-	}
-	_, ok := errors.AsType[*haltError](err)
-	return ok
+	return err == nil || isHalt(err)
 }
 
 // Cancel records a durable cancel for the run; the owning worker reacts. Canceling a terminal or

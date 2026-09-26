@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -76,16 +78,47 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	return i, errors.Join(errs...)
 }
 
-// observeRun records a run's outcome. kind is the error kind of an unrecoverable halt and is
-// omitted when empty.
-func (i *instruments) observeRun(ctx context.Context, run Run, status, kind string, start time.Time) {
-	attrs := []attribute.KeyValue{attrAction.String(run.Action), attrResource.String(run.ResourceName), attrStatus.String(status)}
-	if kind != "" {
-		attrs = append(attrs, attrErrorKind.String(kind))
-	}
+// observeRun records a run's outcome under its recorded kind (outcomeKind).
+func (i *instruments) observeRun(ctx context.Context, run Run, kind fsmv1.HaltKind, start time.Time) {
+	attrs := append([]attribute.KeyValue{attrAction.String(run.Action), attrResource.String(run.ResourceName)}, outcomeAttrs(kind)...)
 	set := metric.WithAttributeSet(attribute.NewSet(attrs...))
 	i.runs.Add(ctx, 1, set)
 	i.runDuration.Record(ctx, time.Since(start).Seconds(), set)
+}
+
+// outcomeAttrs is an outcome kind as the fsm.status and fsm.error.kind attributes, shared by the
+// run and transition metrics and their spans so a trace and a metric of the same run correlate.
+func outcomeAttrs(kind fsmv1.HaltKind) []attribute.KeyValue {
+	status, errorKind := runStatus(kind)
+	attrs := []attribute.KeyValue{attrStatus.String(status)}
+	if errorKind != "" {
+		attrs = append(attrs, attrErrorKind.String(errorKind))
+	}
+	return attrs
+}
+
+// runStatus maps a halt kind onto the fsm.status and fsm.error.kind values, which predate the
+// recorded kind and keep their spellings. A kind without a row reports its own name, so an
+// addition shows up in the metric rather than hiding under a neighbour.
+func runStatus(kind fsmv1.HaltKind) (status, errorKind string) {
+	switch kind {
+	case fsmv1.HaltKind_HALT_KIND_UNSPECIFIED:
+		return "ok", ""
+	case fsmv1.HaltKind_HALT_KIND_CANCELED:
+		return "canceled", ""
+	case fsmv1.HaltKind_HALT_KIND_ABORT:
+		return "abort", ""
+	case fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM:
+		return "unrecoverable", ErrorKindSystem
+	case fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER:
+		return "unrecoverable", ErrorKindUser
+	case fsmv1.HaltKind_HALT_KIND_HANDOFF:
+		return "fsm_handoff_error", ""
+	case fsmv1.HaltKind_HALT_KIND_ERROR:
+		return "error", ""
+	default:
+		return kind.String(), ""
+	}
 }
 
 // observeTransition records a transition attempt's outcome.

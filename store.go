@@ -85,19 +85,15 @@ var fsmSchema = &memdb.DBSchema{
 	},
 }
 
-// historyOutcome reports a completed run's terminal result from the store: a recorded error as a
-// haltError, and no record at all as the History error — the backend does not know the run, and
-// a caller must be able to tell that from a success.
+// historyOutcome reports a completed run's terminal result from the store: a recorded error
+// rebuilt with its type, and no record at all as the History error — the backend does not know
+// the run, and a caller must be able to tell that from a success.
 func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	he, err := s.History(ctx, version)
-	switch {
-	case err != nil:
+	if err != nil {
 		return err
-	case he.GetLastEvent().GetError() != "":
-		return &haltError{err: errors.New(he.GetLastEvent().GetError())}
-	default:
-		return nil
 	}
+	return recordedRunErr(he.GetLastEvent()).Err
 }
 
 var _ Store = (*boltStore)(nil)
@@ -458,10 +454,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 					}
 				case fsmv1.EventType_EVENT_TYPE_CANCEL:
 					completedTransitions = append(completedTransitions, event.GetState())
-					fsmError = RunErr{
-						Err:   errors.New(event.GetError()),
-						State: event.GetState(),
-					}
+					fsmError = recordedRunErr(&event)
 				case fsmv1.EventType_EVENT_TYPE_ERROR:
 					retryCount = event.GetRetryCount()
 				}

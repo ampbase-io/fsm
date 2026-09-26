@@ -50,6 +50,27 @@ message StateEvent {
   uint64 retry_count = 8;
 
   bytes run_version = 9;
+
+  // halt_kind classifies a halted run's error so the typed error is rebuilt the same on every
+  // node. Unspecified on success, and on records written before it was recorded.
+  HaltKind halt_kind = 10;
+
+  // error_state is the state the run halted in. On a FINISH event, state is the finisher's own.
+  string error_state = 11;
+}
+
+// HaltKind is how a run halted: the classification of the error recorded beside it.
+enum HaltKind {
+  // HALT_KIND_UNSPECIFIED is a run that did not halt, or a record from before kinds were
+  // recorded; its error, if any, carries no type.
+  HALT_KIND_UNSPECIFIED = 0;
+  HALT_KIND_CANCELED = 1;
+  HALT_KIND_ABORT = 2;
+  HALT_KIND_UNRECOVERABLE_SYSTEM = 3;
+  HALT_KIND_UNRECOVERABLE_USER = 4;
+  HALT_KIND_HANDOFF = 5;
+  // HALT_KIND_ERROR is a halt whose error is none of the types above.
+  HALT_KIND_ERROR = 6;
 }
 
 enum EventType {

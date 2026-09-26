@@ -61,9 +61,7 @@ func finishEvent(run Run, state string) *fsmv1.StateEvent {
 		Action:       run.Action,
 		State:        state,
 	}
-	if run.fsmErr.Err != nil {
-		event.Error = run.fsmErr.Err.Error()
-	}
+	run.fsmErr.stamp(event)
 	return event
 }
 
@@ -102,11 +100,11 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 			)
 
 			resp, err := next(ctx, req)
-			switch haltErr, isHalt := errors.AsType[*haltError](err); {
-			case isHalt:
+			switch haltErr, halted := errors.AsType[*haltError](err); {
+			case halted:
 				logger.InfoContext(ctx, "transition returned cancelable error, completing run", "error", haltErr.err)
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
-				event.Error = haltErr.Error()
+				RunErr{Err: haltErr, State: run.CurrentState}.stamp(event)
 			case err != nil:
 				return resp, err
 			default:
@@ -184,25 +182,12 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 						return nil
 					}
 
-					var (
-						_, isAbort          = errors.AsType[*AbortError](err)
-						ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
-						_, isHandoff        = errors.AsType[*HandoffError](err)
-					)
-					switch {
-					case isAbort:
-						observe("abort")
-						logger.ErrorContext(transitionCtx, "transition aborted", "error", err)
-						return backoff.Permanent(halt(err))
-					case isUnrecoverable:
-						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", ue.Kind.String()))
-						observe("unrecoverable")
-						logger.ErrorContext(transitionCtx, "reached unrecoverable error, canceling FSM", "error", err)
-						return backoff.Permanent(halt(err))
-					case isHandoff:
-						transitionSpan.SetAttributes(attribute.String("fsm.error_kind", "fsmHandoffError"))
-						observe("fsm_handoff_error")
-						logger.ErrorContext(transitionCtx, "reached fsm handoff error, canceling FSM", "error", err)
+					switch kind := outcomeKind(err); {
+					case haltsRun(kind):
+						transitionSpan.SetAttributes(outcomeAttrs(kind)...)
+						status, _ := runStatus(kind)
+						observe(status)
+						logger.ErrorContext(transitionCtx, "transition halted the run", "error", err, "kind", kind)
 						return backoff.Permanent(halt(err))
 					case errors.Is(err, ErrLeaseLost):
 						// Retrying a fenced write can never succeed; the run halts and the new
@@ -211,9 +196,9 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 						logger.WarnContext(transitionCtx, "run lease lost, halting", "error", err)
 						return backoff.Permanent(err)
 					case ctx.Err() != nil:
-						observe("canceled")
-						logger.InfoContext(transitionCtx, "transition canceled", "error", context.Cause(ctx))
-						return backoff.Permanent(haltOnCancel(ctx, err))
+						// Classified below, once, together with a cancel that lands in the sleep
+						// between attempts.
+						return backoff.Permanent(err)
 					default:
 						observe("error")
 						logger.WarnContext(transitionCtx, "transition failed, retrying", "error", err)
@@ -255,12 +240,29 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 				},
 			)
 
+			if endedByContext(ctx, err) {
+				observe("canceled")
+				logger.InfoContext(transitionCtx, "transition canceled", "error", context.Cause(ctx))
+				err = haltOnCancel(ctx, err)
+			}
+
 			transitionSpan.SetAttributes(attribute.Int("fsm.retry_count", int(retryCount)))
 			transitionSpan.End()
 
 			return resp, err
 		})
 	})
+}
+
+// endedByContext reports whether the transition's context, not an attempt, ended the retries:
+// err is then a bare error no attempt classified — RetryNotify's own ctx.Err() from its sleep,
+// or the last attempt's — rather than a halt an attempt recorded or a lost lease, which passes
+// through unrecorded. Such an end is the transition's outcome when an operator canceled it.
+func endedByContext(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	return !isHalt(err) && !errors.Is(err, ErrLeaseLost)
 }
 
 // haltOnCancel turns err into a halt carrying the operator's reason when ctx was ended by

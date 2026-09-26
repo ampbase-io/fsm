@@ -186,6 +186,46 @@ type RunErr struct {
 	State string
 }
 
+// stamp writes the run error onto an event — message, kind and state — so every record a
+// backend keeps rebuilds the same typed halt. A nil error stamps nothing: an empty triple is
+// success.
+func (e RunErr) stamp(event *fsmv1.StateEvent) {
+	if e.Err == nil {
+		return
+	}
+	event.Error = e.Err.Error()
+	event.HaltKind = outcomeKind(e.Err)
+	event.ErrorState = e.State
+}
+
+// outcomeRecord is the error triple a stamped StateEvent and the RunManifest both carry.
+type outcomeRecord interface {
+	GetError() string
+	GetHaltKind() fsmv1.HaltKind
+	GetErrorState() string
+}
+
+// halted reports whether the record holds a halt at all: any of the triple. The kind and state
+// count as well as the message, since a cancel with no reason records an empty message.
+func halted(r outcomeRecord) bool {
+	switch {
+	case r.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_UNSPECIFIED,
+		r.GetError() != "",
+		r.GetErrorState() != "":
+		return true
+	}
+	return false
+}
+
+// recordedRunErr is the one reader of a record's outcome, for both backends and every read
+// path: no halt is success, anything else the typed halt rebuilt from its kind.
+func recordedRunErr(r outcomeRecord) RunErr {
+	if !halted(r) {
+		return RunErr{}
+	}
+	return RunErr{Err: outcomeError(r.GetHaltKind(), r.GetError()), State: r.GetErrorState()}
+}
+
 // Run contains the information associated with an active FSM.
 type Run struct {
 	StartVersion ulid.ULID
@@ -788,31 +828,16 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				continue
 			}
 
-			var (
-				_, isAbort          = errors.AsType[*AbortError](err)
-				ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
-				_, isHandoff        = errors.AsType[*HandoffError](err)
-			)
-			switch {
-			case isAbort:
-				m.instruments.observeRun(ctx, run, "abort", "", runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", "abort"))
-			case isUnrecoverable:
-				kind := ue.Kind.String()
-				m.instruments.observeRun(ctx, run, "unrecoverable", kind, runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", kind))
-				transitionLogger.ErrorContext(ctx, "reached unrecoverable error, canceling FSM", "error", err)
-			case isHandoff:
-				m.instruments.observeRun(ctx, run, "fsm_handoff_error", "", runStart)
-				span.SetAttributes(attribute.String("fsm.error_kind", "handoff"))
-			}
+			kind := outcomeKind(err)
+			m.instruments.observeRun(ctx, run, kind, runStart)
+			span.SetAttributes(outcomeAttrs(kind)...)
 			request.withError(RunErr{
 				Err:   err,
 				State: transitionName,
 			})
 		}
 		if request.Run().fsmErr.Err == nil {
-			m.instruments.observeRun(ctx, run, "ok", "", runStart)
+			m.instruments.observeRun(ctx, run, fsmv1.HaltKind_HALT_KIND_UNSPECIFIED, runStart)
 		}
 	}
 

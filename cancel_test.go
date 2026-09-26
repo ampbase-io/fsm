@@ -446,11 +446,8 @@ func TestCancelRunningAcrossNodesViaBus(t *testing.T) {
 
 	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	switch err := m1.Wait(waitCtx, version); {
-	case err == nil:
-		t.Fatal("expected Wait to surface the cancellation")
-	case !strings.Contains(err.Error(), "stop from another node"):
-		t.Fatalf("expected the cancel cause from Wait, got %v", err)
+	if c, ok := errors.AsType[*CancelError](m1.Wait(waitCtx, version)); !ok || c.Reason != "stop from another node" {
+		t.Fatal("expected Wait to surface the typed cancel with its reason")
 	}
 }
 
@@ -536,11 +533,14 @@ func TestCancelDelayedRunBeforeExecution(t *testing.T) {
 	// deadline — the owner drives the queued run to terminal itself.
 	waitCtx, cancel := context.WithTimeout(ctx, delay/2)
 	defer cancel()
-	switch err := m.Wait(waitCtx, version); {
-	case err == nil:
-		t.Fatal("expected Wait to resolve with the cancellation, not success")
-	case !strings.Contains(err.Error(), "cancel before it runs"):
-		t.Fatalf("expected the cancel cause from Wait, got %v", err)
+	if c, ok := errors.AsType[*CancelError](m.Wait(waitCtx, version)); !ok || c.Reason != "cancel before it runs" {
+		t.Fatal("expected Wait to resolve with the typed cancel and its reason, not success")
+	}
+	// The RPC reports it as the run's outcome, not as a transient poll failure.
+	admin := &adminServer{m: m}
+	resp, err := admin.Wait(ctx, connect.NewRequest(&fsmv1.WaitRequest{Version: version.String()}))
+	if err != nil || resp.Msg.GetError() != "cancel before it runs" {
+		t.Fatalf("expected the admin Wait to report the cancel, got %v (err=%v)", resp, err)
 	}
 
 	// Past the original delay, confirm the transition never executed: dropping the lease at the

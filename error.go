@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 
+	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
+
 	"github.com/oklog/ulid/v2"
 )
 
@@ -55,7 +57,8 @@ func (e *CancelError) Error() string {
 }
 
 // haltError wraps the underlying error returned from a transition and signals the FSM to halt
-// execution.
+// execution. Every RunErr.Err a backend records or rebuilds is one, which is how the admin Wait
+// tells a run's outcome from a poll failure; a producer that records a bare error breaks that.
 type haltError struct {
 	err error
 }
@@ -153,4 +156,66 @@ func (e *UnrecoverableError) Error() string {
 
 func (e *UnrecoverableError) Unwrap() error {
 	return e.error
+}
+
+// isA reports whether err is, or wraps, a T.
+func isA[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
+	return ok
+}
+
+// isHalt reports whether err is a run's recorded halt rather than a transport or storage error.
+func isHalt(err error) bool { return isA[*haltError](err) }
+
+// outcomeKind classifies a run's recorded error into the kind recorded beside it, so the typed
+// error is rebuilt the same on every node; nil — no halt — is unspecified.
+func outcomeKind(err error) fsmv1.HaltKind {
+	switch ue, unrecoverable := errors.AsType[*UnrecoverableError](err); {
+	case err == nil:
+		return fsmv1.HaltKind_HALT_KIND_UNSPECIFIED
+	case isA[*CancelError](err):
+		return fsmv1.HaltKind_HALT_KIND_CANCELED
+	case isA[*AbortError](err):
+		return fsmv1.HaltKind_HALT_KIND_ABORT
+	case unrecoverable && ue.Kind == ErrorKindUser:
+		return fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER
+	case unrecoverable:
+		return fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM
+	case isA[*HandoffError](err):
+		return fsmv1.HaltKind_HALT_KIND_HANDOFF
+	default:
+		return fsmv1.HaltKind_HALT_KIND_ERROR
+	}
+}
+
+// haltsRun reports whether a transition error of this kind ends the run rather than being
+// retried: the kinds a handler halts with on purpose.
+func haltsRun(kind fsmv1.HaltKind) bool {
+	switch kind {
+	case fsmv1.HaltKind_HALT_KIND_ABORT,
+		fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM,
+		fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER,
+		fsmv1.HaltKind_HALT_KIND_HANDOFF:
+		return true
+	default:
+		return false
+	}
+}
+
+// outcomeError rebuilds a recorded run error from its kind and message, halt-wrapped as the run
+// loop records it. A kind this version does not know — including the unspecified kind of a
+// record written before kinds were recorded — is the message alone.
+func outcomeError(kind fsmv1.HaltKind, msg string) error {
+	switch kind {
+	case fsmv1.HaltKind_HALT_KIND_CANCELED:
+		return halt(&CancelError{Reason: msg})
+	case fsmv1.HaltKind_HALT_KIND_ABORT:
+		return halt(Abort(errors.New(msg)))
+	case fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_SYSTEM:
+		return halt(NewUnrecoverableSystemError(errors.New(msg)))
+	case fsmv1.HaltKind_HALT_KIND_UNRECOVERABLE_USER:
+		return halt(NewUnrecoverableUserError(errors.New(msg)))
+	default:
+		return halt(errors.New(msg))
+	}
 }

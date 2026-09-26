@@ -75,6 +75,13 @@ Those three are every cause the library sets. A later version may add one — al
 value, never an anonymous error — so treat a cause you do not recognize as a reason to stop, not
 as an operator's intent. A context an initializer derived can also end for reasons of its own.
 
+A run's outcome is typed on every node. `Wait` returns the same `*fsm.CancelError`,
+`*fsm.AbortError` or `*fsm.UnrecoverableError` whether the run finished in this process, on
+another node, or before its record was archived, so `errors.AsType[*fsm.CancelError](err)` is
+the way to ask "was that a cancel?" — never the message text. The FINISH event `History`
+returns carries the same classification as `halt_kind`, with `error_state` naming the
+transition the run halted in.
+
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the
 cancel calls for — start a compensating run and wait on it, say. It carries the values
 initializers put on the transitions' context but none of their cancellation, and no deadline:
@@ -172,7 +179,7 @@ come from the global tracer provider.
 
 | Instrument | Kind | Attributes |
 |---|---|---|
-| `fsm.run.completed` | counter | `fsm.action`, `fsm.resource`, `fsm.status`, `fsm.error.kind` |
+| `fsm.run.completed` | counter | `fsm.action`, `fsm.resource`, `fsm.status` (`ok`, `canceled`, `abort`, `unrecoverable`, `fsm_handoff_error`, `error`), `fsm.error.kind` |
 | `fsm.run.duration` (s) | histogram | same |
 | `fsm.transition.completed` | counter | `fsm.action`, `fsm.state`, `fsm.resource`, `fsm.status` |
 | `fsm.transition.duration` (s) | histogram | same |
