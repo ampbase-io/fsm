@@ -70,7 +70,8 @@ To("stage", stage, fsm.RepeatWhile(func(ctx context.Context, req *fsm.Request[Ro
 - **The predicate decides before every iteration, including the first.** It sees the index about
   to run in `req.Run().Iteration`; answering `RepeatDone` at zero runs no iteration. The zero
   `fsm.Repeat` is no decision and halts the run as an unrecoverable system error.
-- **Only the index is recorded.** Each iteration is its own COMPLETE event carrying its index. A
+- **Only the count is recorded.** Each iteration is its own COMPLETE event carrying
+  `iterations_completed`, its index plus one. A
   resumed run re-asks the predicate at the index after the last completed iteration, so the
   answer must follow from the request and the index alone.
 - **Its errors are the transition's.** `fsm.Abort` and the unrecoverable errors halt the run in
@@ -78,8 +79,8 @@ To("stage", stage, fsm.RepeatWhile(func(ctx context.Context, req *fsm.Request[Ro
   predicate is asked again before every retry.
 - **Each iteration is a transition to everything around it.** It runs under a fresh transition
   version, through the transition's interceptors, with its own span. A `RepeatDone` reaches
-  none of those interceptors; it records the transition finished, as a COMPLETE with no index,
-  so a resumed run does not re-enter it.
+  none of those interceptors; it records the transition finished, as a COMPLETE with zero
+  iterations completed, so a resumed run does not re-enter it.
 
 ## Cancellation
 

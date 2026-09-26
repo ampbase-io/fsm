@@ -79,7 +79,7 @@ message RunManifest {
   HaltKind halt_kind = 28;
 
   // iterations counts the completed iterations of each repeated transition (RepeatWhile), by
-  // name: the index its next iteration runs at. A transition's COMPLETE with no iteration removes
-  // its entry, so an entry means the transition may still have iterations to run.
+  // name: the index its next iteration runs at. A transition's COMPLETE with zero
+  // iterations_completed removes its entry, so an entry means the transition may still have iterations to run.
   map<string, uint32> iterations = 29;
 }

@@ -63,8 +63,8 @@ backend's distributed-execution design is the active work.
   through those, so `Wait` is typed cross-node.
 - `repeat.go` — `RepeatWhile`: a repeated transition's predicate is a gate inside retry and
   outside the caller's interceptors; the run loop iterates it (`execution.iterate`), each
-  COMPLETE carries `iteration`, a RepeatDone records a COMPLETE without one (which drops the
-  count), and resume starts at `resumeAt` with the count folded from those events (the
+  iteration's COMPLETE carries `iterations_completed`, a RepeatDone records a COMPLETE with zero
+  (which drops the count), and resume starts at `resumeAt` with the count folded from those events (the
   manifest's `iterations` on the object backend).
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
   `proto/fsm/v1/`; generated code in `gen/`.

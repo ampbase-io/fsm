@@ -34,9 +34,9 @@ func RepeatDone() Repeat { return Repeat{decision: decisionDone} }
 // every retry of the transition, and its error is classified as the transition's own: Abort and
 // the unrecoverable errors halt the run, anything else is retried.
 //
-// Each iteration is recorded as its own COMPLETE event carrying its index, runs with a fresh
+// Each iteration is recorded as its own COMPLETE event counting it, runs with a fresh
 // transition version, and passes through the transition's interceptors. A RepeatDone reaches
-// none of those interceptors; it records the transition finished, as a COMPLETE with no index.
+// none of those interceptors; it records the transition finished, as a COMPLETE counting none.
 func RepeatWhile[R, W any](predicate func(context.Context, *Request[R, W]) (Repeat, error)) Option[R, W] {
 	return repeatOption[R, W](predicate)
 }
@@ -50,7 +50,7 @@ func (o repeatOption[R, W]) apply(cfg *TransitionConfig[R, W]) *TransitionConfig
 
 // errRepeatDone is how a repeated transition's gate tells the run loop the predicate answered
 // RepeatDone. Retry passes it through, and the canceller records it as the transition's COMPLETE
-// with no iteration.
+// with zero iterations completed.
 var errRepeatDone = errors.New("fsm: repeat done")
 
 // repeater asks the predicate before every attempt at an iteration. It sits inside retry, so a
@@ -85,17 +85,18 @@ func (g gate[R, W]) run(ctx context.Context, req AnyRequest) (AnyResponse, error
 	return nil, NewUnrecoverableSystemError(fmt.Errorf("transition %s: RepeatWhile predicate returned no decision", req.Run().CurrentState))
 }
 
-// recordIteration folds a COMPLETE into counts. One carrying an iteration counts it, so the next
-// runs at the index after it; one without finishes the transition, repeated or not, and drops
-// any count it had.
+// recordIteration folds a COMPLETE into counts. One with iterations completed records the count,
+// which is the index the next iteration runs at; one without finishes the transition, repeated
+// or not, and drops any count it had.
 func recordIteration(counts map[string]uint32, event *fsmv1.StateEvent) map[string]uint32 {
-	if event.Iteration == nil {
+	n := event.GetIterationsCompleted()
+	if n == 0 {
 		delete(counts, event.GetState())
 		return counts
 	}
 	if counts == nil {
 		counts = map[string]uint32{}
 	}
-	counts[event.GetState()] = event.GetIteration() + 1
+	counts[event.GetState()] = n
 	return counts
 }

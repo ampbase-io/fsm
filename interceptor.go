@@ -83,7 +83,6 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 					ResourceType: run.TypeName,
 					Action:       run.Action,
 					State:        run.CurrentState,
-					Iteration:    run.iteration(),
 				}
 			)
 
@@ -94,13 +93,13 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
 				RunErr{Err: haltErr, State: run.CurrentState}.stamp(event)
 			case errors.Is(err, errRepeatDone):
-				// The predicate ended the repetition. A COMPLETE with no iteration records the
-				// transition finished, so resume and ListActive move past it.
-				event.Iteration = nil
+				// The predicate ended the repetition. The COMPLETE, with no iterations completed,
+				// records the transition finished, so resume and ListActive move past it.
 			case err != nil:
 				return resp, err
 			default:
 				logger.DebugContext(ctx, "transition completed successfully")
+				event.IterationsCompleted = run.iterationsCompleted()
 				if resp != nil && resp.Any() != nil {
 					b, err := codec.Marshal(resp.Any())
 					if err != nil {
@@ -216,7 +215,6 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 									State:        run.CurrentState,
 									Error:        err.Error(),
 									RetryCount:   retryCount,
-									Iteration:    run.iteration(),
 								},
 							)
 						}

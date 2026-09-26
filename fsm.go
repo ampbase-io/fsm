@@ -257,17 +257,18 @@ type Run struct {
 	// fsmErr is the error and originating state that caused the FSM to stop executing transitions.
 	fsmErr RunErr
 
-	// iterated is set while the run is in a RepeatWhile transition, so its records carry Iteration.
+	// iterated is set while the run is in a RepeatWhile transition, so its COMPLETE counts the
+	// iteration.
 	iterated bool
 }
 
-// iteration is the index a record of the run's current transition carries: set only in a
-// RepeatWhile transition.
-func (r Run) iteration() *uint32 {
+// iterationsCompleted is the count the COMPLETE of the run's current iteration records: its index
+// plus one in a RepeatWhile transition, zero in any other.
+func (r Run) iterationsCompleted() uint32 {
 	if !r.iterated {
-		return nil
+		return 0
 	}
-	return new(uint32(r.Iteration))
+	return uint32(r.Iteration) + 1
 }
 
 type fsm struct {
