@@ -437,6 +437,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 			if event.GetResponse() != nil {
 				m.LatestResponse = event.GetResponse()
 			}
+			m.Iterations = recordIteration(m.Iterations, event)
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
 			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
 			recordOutcome(m, event)
@@ -621,7 +622,7 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 		ID:           m.GetResourceId(),
 		StartVersion: version,
 		Action:       m.GetAction(),
-		CurrentState: nextState(m.GetTransitions(), m.GetCompletedStates()),
+		CurrentState: nextState(m.GetTransitions(), m.GetCompletedStates(), m.GetIterations()),
 		TypeName:     m.GetResourceType(),
 		Queue:        m.GetQueue(),
 		Parent:       parent,
@@ -767,6 +768,7 @@ func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
 		version:              version,
 		active:               activeEventFromManifest(m),
 		completedTransitions: m.GetCompletedStates(),
+		iterations:           m.GetIterations(),
 		response:             m.GetLatestResponse(),
 		retryCount:           m.GetRetryCount(),
 		fsmError:             recordedRunErr(m),

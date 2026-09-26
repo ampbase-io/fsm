@@ -122,6 +122,9 @@ message RunManifest {
 
   int64  created_at = 25;
   int64  updated_at = 26;
+  int64  completed_at = 27;     // Set on FINISH; the archive loop's retention clock
+  HaltKind halt_kind = 28;       // Classifies error
+  map<string, uint32> iterations = 29;  // Completed iterations of each repeated transition
 }
 ```
 
@@ -137,7 +140,7 @@ Body: Protobuf-encoded StateEvent
 
 If the write returns 412 (object already exists), the event was already written (e.g., retry after a crash). This is safe because events are idempotent by key. This idempotency requires the caller to derive the event version *before* the first write attempt and reuse it across retries; minting a fresh version per attempt would create a duplicate event under a new key.
 
-**Events are an audit trail, not the recovery source.** Because every COMPLETE/ERROR event also CAS-updates the run manifest, the manifest is a materialized view of the event log — `completed_states`, `latest_response`, `retry_count`, and `error`/`error_state` are exactly the fields recovery needs. Hot paths (resume, lease takeover) read only the manifest. Reading event *bodies* is reserved for latency-tolerant paths: admin/history views and reconciliation after a detected crash. This matters because object storage has no batch GET: listing a run's events costs one round trip per event body (~10–50 ms each on Tigris), which is acceptable for debugging but must never sit on the recovery path.
+**Events are an audit trail, not the recovery source.** Because every COMPLETE/ERROR event also CAS-updates the run manifest, the manifest is a materialized view of the event log — `completed_states`, `iterations`, `latest_response`, `retry_count`, and `error`/`error_state` are exactly the fields recovery needs. Hot paths (resume, lease takeover) read only the manifest. Reading event *bodies* is reserved for latency-tolerant paths: admin/history views and reconciliation after a detected crash. This matters because object storage has no batch GET: listing a run's events costs one round trip per event body (~10–50 ms each on Tigris), which is acceptable for debugging but must never sit on the recovery path.
 
 ### State Transition Flows
 
@@ -177,6 +180,7 @@ For queued runs, the lock key includes the run version (`locks/<type>/<id>/<acti
    GET fsm/runs/<run_ver>        [X-Tigris-Consistent: true]
    → read current ETag
    Modify: bump latest_event_key, event_count, append to completed_states
+           (and, for a repeated transition, count the iteration in iterations)
    PUT fsm/runs/<run_ver>        [If-Match: <etag>]
    → 412 means concurrent modification → re-read and retry
 ```

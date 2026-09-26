@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 
 	"github.com/benbjohnson/immutable"
 	"github.com/iancoleman/strcase"
@@ -103,6 +104,9 @@ type TransitionConfig[R, W any] struct {
 
 	// finalizers can only be configured when calling End.
 	finalizers []Finalizer[R, W]
+
+	// repeat is the RepeatWhile predicate, configured when calling To.
+	repeat func(context.Context, *Request[R, W]) (Repeat, error)
 }
 
 type Option[R, W any] interface {
@@ -210,15 +214,12 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 		return &fsmTransition[R, W]{s.transitionStep}
 	}
 
-	s.cfg.interceptors = []TransitionInterceptorFunc{
-		skipper(),
-		canceller(s.m.store, s.f.wCodec),
-		retry(s.m.tracer, s.m.instruments, s.m.store),
-	}
-
+	s.cfg.interceptors = nil
+	s.cfg.repeat = nil
 	for _, o := range opts {
 		o.apply(s.cfg)
 	}
+	s.cfg.interceptors = slices.Concat(s.builtins(), s.cfg.interceptors)
 
 	s.f.initializers = make([]InitializerFunc, 0, len(s.cfg.initializers))
 	for _, i := range s.cfg.initializers {
@@ -229,6 +230,20 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 	s.f.transitions = s.f.transitions.Append(name)
 
 	return &fsmTransition[R, W]{s.transitionStep}
+}
+
+// builtins is the chain every non-final transition runs inside, outermost first: record the
+// outcome, retry. A repeated transition adds its gate inside retry, so the
+// caller's interceptors run only for an iteration that runs.
+func (s *fsmTransition[R, W]) builtins() []TransitionInterceptorFunc {
+	chain := []TransitionInterceptorFunc{
+		canceller(s.m.store, s.f.wCodec),
+		retry(s.m.tracer, s.m.instruments, s.m.store),
+	}
+	if s.cfg.repeat == nil {
+		return chain
+	}
+	return append(chain, repeater(s.cfg.repeat))
 }
 
 // End sets the final state of the FSM and applies any options as a global option for the FSM.

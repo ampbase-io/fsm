@@ -53,6 +53,35 @@ the backend does not know.
 Request/response types are persisted with a protobuf codec when they implement `proto.Message`,
 with a custom codec when they implement `fsm.Codec`, and with JSON otherwise.
 
+## Repeating a transition
+
+`fsm.RepeatWhile` makes a transition run once per iteration its predicate allows, so a run whose
+length depends on its request keeps one fixed definition:
+
+```go
+To("stage", stage, fsm.RepeatWhile(func(ctx context.Context, req *fsm.Request[RolloutReq, Verdict]) (fsm.Repeat, error) {
+    if req.Run().Iteration < len(req.Msg.Stages) {
+        return fsm.RepeatAgain(), nil
+    }
+    return fsm.RepeatDone(), nil
+}))
+```
+
+- **The predicate decides before every iteration, including the first.** It sees the index about
+  to run in `req.Run().Iteration`; answering `RepeatDone` at zero runs no iteration. The zero
+  `fsm.Repeat` is no decision and halts the run as an unrecoverable system error.
+- **Only the count is recorded.** Each iteration is its own COMPLETE event carrying
+  `iterations_completed`, its index plus one. A
+  resumed run re-asks the predicate at the index after the last completed iteration, so the
+  answer must follow from the request and the index alone.
+- **Its errors are the transition's.** `fsm.Abort` and the unrecoverable errors halt the run in
+  the repeated transition; any other error is retried under the transition's backoff, and the
+  predicate is asked again before every retry.
+- **Each iteration is a transition to everything around it.** It runs under a fresh transition
+  version, through the transition's interceptors, with its own span. A `RepeatDone` reaches
+  none of those interceptors; it records the transition finished, as a COMPLETE with zero
+  iterations completed, so a resumed run does not re-enter it.
+
 ## Cancellation
 
 A transition's context ends for one of three reasons, and `context.Cause(ctx)` names which:
@@ -167,7 +196,8 @@ each queued dispatch are Debug; a retry is Warn; a halt or a storage failure is 
 
 A run's identity is one `fsm` group, keyed like its span and metric attributes so the three
 signals share a vocabulary: `fsm.action`, `fsm.type`, `fsm.alias`, `fsm.id`, `fsm.version`, and
-on a transition's lines `fsm.state` and `fsm.transition_version`. The JSON handler nests them
+on a transition's lines `fsm.state` and `fsm.transition_version`, and `fsm.iteration` in a
+repeated one. The JSON handler nests them
 under `"fsm"`; the text handler dots them. Outside the group: `sys` (`fsm` or `fsm-store`),
 `retry_count` on a retry's lines, and per-line keys such as `error`, `queue` and `key`.
 
@@ -188,6 +218,10 @@ come from the global tracer provider.
 | `fsm.lease.renewals` | counter | `fsm.lease.result` |
 | `fsm.queue.depth` | gauge | `fsm.queue` |
 | `fsm.queue.commits` | counter | `fsm.queue` |
+
+A run is recorded once, when its finisher returns, by the node that finishes it. Its duration
+runs from submission through its finalizers, whether it succeeded or halted. A run resumed after a
+crash is counted by the node that resumes it, not the one that stopped.
 
 A transition can run for hours, so the duration histograms carry explicit bucket advice up to
 4 h for an SDK with no View. The recommended configuration is a base-2 exponential histogram,
