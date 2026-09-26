@@ -219,6 +219,10 @@ come from the global tracer provider.
 | `fsm.queue.depth` | gauge | `fsm.queue` |
 | `fsm.queue.commits` | counter | `fsm.queue` |
 
+A run is recorded once, when its finisher returns, by the node that finishes it. Its duration
+runs from submission through its finalizers, whether it succeeded or halted. A run resumed after a
+crash is counted by the node that resumes it, not the one that stopped.
+
 A transition can run for hours, so the duration histograms carry explicit bucket advice up to
 4 h for an SDK with no View. The recommended configuration is a base-2 exponential histogram,
 which fits any range at a fixed cost; the library's own tests run under this View:

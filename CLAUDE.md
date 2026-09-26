@@ -62,7 +62,7 @@ backend's distributed-execution design is the active work.
   `outcomeKind` / `outcomeError` (error.go) as the classification. Every write and read goes
   through those, so `Wait` is typed cross-node.
 - `repeat.go` — `RepeatWhile`: a repeated transition's predicate is a gate inside retry and
-  outside the caller's interceptors; the run loop iterates it (`execution.iterate`), each
+  outside the caller's interceptors; the run loop iterates it (`iterate`), each
   iteration's COMPLETE carries `iterations_completed`, a RepeatDone records a COMPLETE with zero
   (which drops the count), and resume starts at `resumeAt` with the count folded from those events (the
   manifest's `iterations` on the object backend).

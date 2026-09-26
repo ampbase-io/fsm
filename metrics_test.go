@@ -165,7 +165,13 @@ func testRunMetrics(t *testing.T, b *backend) {
 		t.Fatal("expected the canceled run to report its cancel")
 	}
 
-	metrics := collect(t, reader)
+	// A run is observed as its last act, once its finisher returns: just after Wait sees FINISH.
+	// The canceled run is the last, so its count means every instrument below has been recorded.
+	var metrics map[string]metricdata.Metrics
+	eventually(t, 5*time.Second, func() bool {
+		metrics = collect(t, reader)
+		return counterValue(t, metrics, "fsm.run.completed", attrStatus, "canceled") == 1
+	}, "expected the canceled run observed")
 	for status, want := range map[string]int64{"ok": 1, "abort": 1, "canceled": 1} {
 		if got := counterValue(t, metrics, "fsm.run.completed", attrStatus, status); got != want {
 			t.Fatalf("expected %d run(s) completed %s, got %d", want, status, got)

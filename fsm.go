@@ -817,7 +817,6 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		// The finisher is always the last transition, on a fresh start and on a resume alike.
 		finisher := ri.transitions.Len() - 1
 
-		e := &execution{m: m, request: request, span: span, run: run, runStart: runStart}
 		iter := ri.transitions.Iterator()
 		for !iter.Done() {
 			idx, t := iter.Next()
@@ -829,12 +828,16 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 			if idx == finisher {
 				transitionCtx = finalizerCtx
 			}
-			if !e.iterate(runCtx, transitionCtx, t, int(ri.iterations[t.name])) {
+			if !iterate(runCtx, transitionCtx, request, t, int(ri.iterations[t.name])) {
 				return
 			}
 		}
-		if request.Run().fsmErr.Err == nil {
-			m.instruments.observeRun(ctx, run, fsmv1.HaltKind_HALT_KIND_UNSPECIFIED, runStart)
+
+		// The run's outcome is observed once, by the node that finishes it.
+		kind := outcomeKind(request.Run().fsmErr.Err)
+		m.instruments.observeRun(ctx, run, kind, runStart)
+		if kind != fsmv1.HaltKind_HALT_KIND_UNSPECIFIED {
+			span.SetAttributes(outcomeAttrs(kind)...)
 		}
 	}
 
@@ -856,22 +859,11 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 	return
 }
 
-// execution is a run being driven through its transitions on this node.
-type execution struct {
-	m       *Manager
-	request AnyRequest
-	span    trace.Span
-
-	// run is the run as dispatched, which labels its metrics.
-	run      Run
-	runStart time.Time
-}
-
 // iterate runs a transition's iterations from first until the run moves on, and reports whether
 // it does: false when the run stopped.
-func (e *execution) iterate(runCtx, ctx context.Context, t *transition, first int) bool {
+func iterate(runCtx, ctx context.Context, req AnyRequest, t *transition, first int) bool {
 	for iteration := first; ; iteration++ {
-		switch e.execute(runCtx, ctx, t, iteration) {
+		switch execute(runCtx, ctx, req, t, iteration) {
 		case stepStop:
 			return false
 		case stepNext:
@@ -881,17 +873,18 @@ func (e *execution) iterate(runCtx, ctx context.Context, t *transition, first in
 }
 
 // execute runs one iteration of a transition (the only one unless it repeats) under ctx and
-// reports what the run does next. runCtx ends when the run is stopped short of an outcome.
-func (e *execution) execute(runCtx, ctx context.Context, t *transition, iteration int) step {
-	e.request.withTransition(t, ulid.Make(), iteration)
-	logger := e.request.Log()
+// reports what the run does next; a halt it records on req. runCtx ends when the run is stopped
+// short of an outcome.
+func execute(runCtx, ctx context.Context, req AnyRequest, t *transition, iteration int) step {
+	req.withTransition(t, ulid.Make(), iteration)
+	logger := req.Log()
 
 	if stopped(runCtx, logger) {
 		return stepStop
 	}
 
 	logger.DebugContext(ctx, "running transition")
-	_, err := t.impl(ctx, e.request)
+	_, err := t.impl(ctx, req)
 
 	if stopped(runCtx, logger) {
 		return stepStop
@@ -918,14 +911,11 @@ func (e *execution) execute(runCtx, ctx context.Context, t *transition, iteratio
 	}
 
 	// The first halt is the run's outcome: a finisher failing after one does not replace it.
-	if e.request.Run().fsmErr.Err != nil {
+	if req.Run().fsmErr.Err != nil {
 		return stepNext
 	}
 
-	kind := outcomeKind(err)
-	e.m.instruments.observeRun(ctx, e.run, kind, e.runStart)
-	e.span.SetAttributes(outcomeAttrs(kind)...)
-	e.request.withError(RunErr{Err: err, State: t.name})
+	req.withError(RunErr{Err: err, State: t.name})
 	return stepNext
 }
 
