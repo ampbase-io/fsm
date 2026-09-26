@@ -332,6 +332,11 @@ type transitionKey struct {
 	name string
 }
 
+// transitionKey identifies f's transition of this name in its registered transitions.
+func (f *fsm) transitionKey(name string) transitionKey {
+	return transitionKey{action: f.action, typeName: f.typeName, name: name}
+}
+
 type transition struct {
 	name string
 
@@ -524,7 +529,7 @@ func (m *Manager) remaining[R, W any](ctx context.Context, f *fsm, resource *act
 	recorded := resource.active.Transitions
 	remaining := immutable.NewList[*transition]()
 	for _, name := range recorded[resumeAt(recorded, resource.completedTransitions, resource.iterations):] {
-		t, ok := f.registeredTransitions[transitionKey{action: f.action, typeName: f.typeName, name: name}]
+		t, ok := f.registeredTransitions[f.transitionKey(name)]
 		if !ok {
 			m.logger.WarnContext(ctx, "transition did not exist", slog.Group("fsm", "version", resource.version.String(), "state", name))
 			t = m.missing[R, W](f, name)
@@ -629,11 +634,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		iter := f.transitions.Iterator()
 		for !iter.Done() {
 			_, value := iter.Next()
-			transitions = transitions.Append(f.registeredTransitions[transitionKey{
-				action:   f.action,
-				typeName: f.typeName,
-				name:     value,
-			}])
+			transitions = transitions.Append(f.registeredTransitions[f.transitionKey(value)])
 		}
 
 		startedRun, err := m.persistStart(ctx, f, id, runVersion, resource, &startOpt, false)
