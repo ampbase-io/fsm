@@ -89,14 +89,14 @@ func (g gate[R, W]) run(ctx context.Context, req AnyRequest) (AnyResponse, error
 // which is the index the next iteration runs at; one without finishes the transition, repeated
 // or not, and drops any count it had.
 func recordIteration(counts map[string]uint32, event *fsmv1.StateEvent) map[string]uint32 {
-	n := event.GetIterationsCompleted()
-	if n == 0 {
-		delete(counts, event.GetState())
-		return counts
-	}
 	if counts == nil {
 		counts = map[string]uint32{}
 	}
-	counts[event.GetState()] = n
+	switch n := event.GetIterationsCompleted(); n {
+	case 0:
+		delete(counts, event.GetState())
+	default:
+		counts[event.GetState()] = n
+	}
 	return counts
 }
