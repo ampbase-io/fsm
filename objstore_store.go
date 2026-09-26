@@ -299,17 +299,20 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		return err
 	}
 
-	// 4. Create the manifest, leased to this node.
+	// 4. Record the parent-child relationship. Before the manifest, so the link can only be
+	// missing from a run that does not exist: everything up to here is provisional (a crash
+	// leaves a lock the reaper deletes, and ActiveChildren skips a child with no manifest),
+	// while a failure after the manifest would leave a live run its parent can never find.
+	if err := s.linkParent(ctx, run.Parent, run.StartVersion); err != nil {
+		return err
+	}
+
+	// 5. Create the manifest, leased to this node: the run exists from here.
 	manifestBytes, err := s.startManifest(ctx, run, event, start, eventKey, runVersionBytes)
 	if err != nil {
 		return err
 	}
-	if err := s.createRunManifest(ctx, run, lockKey, manifestBytes, start.Unowned); err != nil {
-		return err
-	}
-
-	// 5. Record the parent-child relationship.
-	return s.linkParent(ctx, run.Parent, run.StartVersion)
+	return s.createRunManifest(ctx, run, lockKey, manifestBytes, start.Unowned)
 }
 
 // startManifest materializes a new run's initial manifest. By default it is leased to this node

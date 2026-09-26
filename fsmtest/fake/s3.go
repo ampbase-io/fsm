@@ -43,6 +43,7 @@ type S3 struct {
 	LostPuts int
 
 	failDelete string
+	failPut    string
 	prePut     func(key string)
 
 	puts               int
@@ -84,12 +85,20 @@ func (f *S3) Client() *s3.Client {
 	})
 }
 
-// SetFailDelete makes a DELETE of exactly key answer 500, to exercise a cleanup that fails partway
+// SetFailDelete makes a DELETE of exactly key be refused, to exercise a cleanup that fails partway
 // through its deletes; an empty key clears it.
 func (f *S3) SetFailDelete(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failDelete = key
+}
+
+// SetFailPut makes a PUT of exactly key be refused, to exercise a multi-object write that fails
+// partway through; an empty key clears it.
+func (f *S3) SetFailPut(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failPut = key
 }
 
 // SetPrePut arms (or, with nil, disarms) a hook that runs just before a PUT is applied, outside
@@ -172,6 +181,10 @@ func (f *S3) Handler(bucket string) http.Handler {
 // Conflicts refuses before applying, LostPuts refuses after. Callers hold f.mu.
 func (f *S3) put(w http.ResponseWriter, r *http.Request, key string) {
 	f.puts++
+	if f.failPut != "" && key == f.failPut {
+		w.WriteHeader(http.StatusForbidden) // a client error: the SDK's retryer does not stretch the test
+		return
+	}
 	ifNoneMatch, ifMatch := r.Header.Get("If-None-Match") == "*", r.Header.Get("If-Match")
 	conditional := ifNoneMatch || ifMatch != ""
 	if conditional && f.Conflicts > 0 {
@@ -203,7 +216,7 @@ func (f *S3) put(w http.ResponseWriter, r *http.Request, key string) {
 // del removes a key, or fails it when it is the armed failDelete. Callers hold f.mu.
 func (f *S3) del(w http.ResponseWriter, key string) {
 	if f.failDelete != "" && key == f.failDelete {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusForbidden) // a client error: the SDK's retryer does not stretch the test
 		return
 	}
 	delete(f.objects, key)

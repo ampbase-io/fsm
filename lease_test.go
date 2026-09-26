@@ -534,6 +534,52 @@ func TestAdoptRunManifest(t *testing.T) {
 	}
 }
 
+// TestStartLinksParentBeforeManifest pins the START order for a child run: the parent link is
+// written before the manifest, so a link can only be missing from a run that does not exist,
+// and a link without a manifest is inert — never a live, lock-holding run its parent cannot
+// find. (A failed START leaves its lock for the reaper either way; that is not new.)
+func TestStartLinksParentBeforeManifest(t *testing.T) {
+	h := newLeaseHarness(t)
+	ctx := context.Background()
+	s := h.store("node-a", 10*time.Second)
+	parent := startRun(t, s, "parent-1")
+	childOf := func(id string) Run {
+		return Run{ID: id, StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq", Parent: parent.StartVersion}
+	}
+	noActiveChildren := func(when string) {
+		t.Helper()
+		children, err := s.ActiveChildren(ctx, parent.StartVersion)
+		if err != nil {
+			t.Fatalf("ActiveChildren failed: %v", err)
+		}
+		if len(children) != 0 {
+			t.Fatalf("expected no active children %s, got %v", when, children)
+		}
+	}
+
+	// The link write fails: no manifest was written, so the run does not exist.
+	unlinked := childOf("child-unlinked")
+	h.s3.SetFailPut(s.childKey(parent.StartVersion, unlinked.StartVersion))
+	if err := appendStarted(s, unlinked); err == nil {
+		t.Fatal("expected Start to fail when the parent link cannot be written")
+	}
+	if !objectGone(t, s, s.manifestKey(unlinked.StartVersion)) {
+		t.Fatal("expected no manifest for a run whose link failed")
+	}
+	noActiveChildren("after a failed link")
+
+	// The manifest write fails after the link: the link is inert until the run exists.
+	linked := childOf("child-linked")
+	h.s3.SetFailPut(s.manifestKey(linked.StartVersion))
+	if err := appendStarted(s, linked); err == nil {
+		t.Fatal("expected Start to fail when the manifest cannot be written")
+	}
+	if objectGone(t, s, s.childKey(parent.StartVersion, linked.StartVersion)) {
+		t.Fatal("expected the link written before the manifest")
+	}
+	noActiveChildren("for a link without a manifest")
+}
+
 // TestStartRetryAfterFinishRejected covers the manifest-adopt path: a crash-retry of a START
 // whose run already completed must not re-execute the run, and must leave no lock behind.
 func TestStartRetryAfterFinishRejected(t *testing.T) {
