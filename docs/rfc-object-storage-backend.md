@@ -152,12 +152,18 @@ If the write returns 412 (object already exists), the event was already written 
 2. Write START event:
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
 
-3. Write run manifest:
+3. Write the index marker:
+   PUT fsm/index/<type>/<id>/<action>/<run_ver>     [If-None-Match: *]
+
+4. Link the parent, if any:
+   PUT fsm/children/<parent_ver>/<run_ver>           [If-None-Match: *]
+
+5. Write run manifest:
    PUT fsm/runs/<run_ver>        [If-None-Match: *]
    Body: RunManifest { status: "pending", owner_node: self, ... }
 ```
 
-All three operations use `If-None-Match: *`, making them individually idempotent. If step 2 or 3 fails after step 1 succeeds, a recovery scan (on startup or periodic) detects orphaned locks by checking whether a corresponding manifest exists.
+Every operation uses `If-None-Match: *`, making them individually idempotent, and the manifest is last: the run exists once it does, and nothing before it is load-bearing on its own. If a step fails after the lock is taken, a recovery scan (on startup or periodic) detects orphaned locks by checking whether a corresponding manifest exists; an index marker or parent link without a manifest is inert, since readers skip a child whose manifest is missing. The link precedes the manifest for that reason — written after it, a failure would leave a live run its parent can never find.
 
 For queued runs, the lock key includes the run version (`locks/<type>/<id>/<action>/<run_version>`) to allow multiple runs for the same resource.
 
