@@ -53,6 +53,26 @@ the backend does not know.
 Request/response types are persisted with a protobuf codec when they implement `proto.Message`,
 with a custom codec when they implement `fsm.Codec`, and with JSON otherwise.
 
+## Interceptors
+
+An interceptor wraps a transition's handler: it sees the request before and the response and
+error after. `fsm.WithInterceptors` attaches interceptors to one transition, and
+`fsm.InterceptAll`, passed to `End`, attaches them to every transition declared with `Start` or
+`To`:
+
+```go
+Start("reserve", reserve).
+To("create_flag", createFlag, fsm.WithInterceptors[Req, Resp](timing)).
+End("done", fsm.InterceptAll[Req, Resp](audit)).
+```
+
+- **They run once per attempt.** Both kinds run inside the retry, so a retried transition calls
+  them again, and a retryable error reaches them before it is retried. An error an interceptor
+  returns is retried like the handler's.
+- **FSM-wide interceptors run outside a transition's own.** In the example, `audit` sees
+  `create_flag`'s request before `timing` does.
+- **The finisher runs none of them,** and neither does a `RepeatDone`.
+
 ## Repeating a transition
 
 `fsm.RepeatWhile` makes a transition run once per iteration its predicate allows, so a run whose

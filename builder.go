@@ -33,7 +33,23 @@ type transitionStep[R, W any] struct {
 
 	cfg *TransitionConfig[R, W]
 
+	// pending is every transition declared with Start or To, in order. End builds them, once the
+	// interceptors every transition runs inside are known.
+	pending []declaration[R, W]
+
 	buildError error
+}
+
+// declares reports whether f already has a transition of this name.
+func (f *fsm) declares(name string) bool {
+	return slices.Contains(f.transitionSlice(), name)
+}
+
+// declaration is a Start or To transition as declared.
+type declaration[R, W any] struct {
+	name string
+	body Transition[R, W]
+	cfg  TransitionConfig[R, W]
 }
 
 type nameable interface {
@@ -107,6 +123,10 @@ type TransitionConfig[R, W any] struct {
 
 	// repeat is the RepeatWhile predicate, configured when calling To.
 	repeat func(context.Context, *Request[R, W]) (Repeat, error)
+
+	// every is the interceptors configured when calling End for every transition but the
+	// finisher.
+	every []TransitionInterceptorFunc
 }
 
 type Option[R, W any] interface {
@@ -162,6 +182,20 @@ func WithInterceptors[R, W any](i ...TransitionInterceptorFunc) StartOption[R, W
 	return interceptorOption[R, W](i)
 }
 
+type everyOption[R, W any] []TransitionInterceptorFunc
+
+func (o everyOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *TransitionConfig[R, W] {
+	cfg.every = append(cfg.every, o...)
+	return cfg
+}
+
+// InterceptAll adds interceptors to every transition declared with Start or To, passed once to
+// End instead of to each. They run as WithInterceptors do, once per attempt inside the retry,
+// and outside the transition's own interceptors. The finisher is not intercepted.
+func InterceptAll[R, W any](i ...TransitionInterceptorFunc) EndOption[R, W] {
+	return everyOption[R, W](i)
+}
+
 type finalizerOption[R, W any] []Finalizer[R, W]
 
 func (o finalizerOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *TransitionConfig[R, W] {
@@ -203,12 +237,7 @@ func (s *fsmStart[R, W]) Start(name string, transition Transition[R, W], startOp
 
 // To sets the next state of the FSM and applies any options to the transition.
 func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts ...Option[R, W]) *fsmTransition[R, W] {
-	tk := transitionKey{
-		action:   s.f.action,
-		typeName: s.f.typeName,
-		name:     name,
-	}
-	if _, ok := s.f.registeredTransitions[tk]; ok {
+	if s.f.declares(name) {
 		s.m.logger.Error("transition already registered", "transition", name)
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("transition %s already registered", name))
 		return &fsmTransition[R, W]{s.transitionStep}
@@ -219,31 +248,42 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 	for _, o := range opts {
 		o.apply(s.cfg)
 	}
-	s.cfg.interceptors = slices.Concat(s.builtins(), s.cfg.interceptors)
 
 	s.f.initializers = make([]InitializerFunc, 0, len(s.cfg.initializers))
 	for _, i := range s.cfg.initializers {
 		s.f.initializers = append(s.f.initializers, newInitializer(i))
 	}
 
-	s.f.registeredTransitions[tk] = newTransition(name, transition, *s.cfg)
+	s.pending = append(s.pending, declaration[R, W]{name: name, body: transition, cfg: *s.cfg})
 	s.f.transitions = s.f.transitions.Append(name)
 
 	return &fsmTransition[R, W]{s.transitionStep}
 }
 
-// builtins is the chain every non-final transition runs inside, outermost first: record the
-// outcome, retry. A repeated transition adds its gate inside retry, so the
-// caller's interceptors run only for an iteration that runs.
-func (s *fsmTransition[R, W]) builtins() []TransitionInterceptorFunc {
-	chain := []TransitionInterceptorFunc{
-		canceller(s.m.store, s.f.wCodec),
-		retry(s.m.tracer, s.m.instruments, s.m.store),
+// build makes a declared transition, its interceptors outermost first: record the outcome,
+// retry, a repeated transition's gate, the interceptors every transition runs inside, and its
+// own. The gate sits inside retry and outside the caller's interceptors, so they run only for
+// an iteration that runs.
+func (s *fsmTransition[R, W]) build(d declaration[R, W], every []TransitionInterceptorFunc) *transition {
+	d.cfg.interceptors = slices.Concat(
+		[]TransitionInterceptorFunc{
+			canceller(s.m.store, s.f.wCodec),
+			retry(s.m.tracer, s.m.instruments, s.m.store),
+		},
+		repeatGate(d.cfg.repeat),
+		every,
+		d.cfg.interceptors,
+	)
+	return newTransition(d.name, d.body, d.cfg)
+}
+
+// repeatGate is a repeated transition's gate as its place in the chain: none for a transition
+// that does not repeat.
+func repeatGate[R, W any](predicate func(context.Context, *Request[R, W]) (Repeat, error)) []TransitionInterceptorFunc {
+	if predicate == nil {
+		return nil
 	}
-	if s.cfg.repeat == nil {
-		return chain
-	}
-	return append(chain, repeater(s.cfg.repeat))
+	return []TransitionInterceptorFunc{repeater(predicate)}
 }
 
 // End sets the final state of the FSM and applies any options as a global option for the FSM.
@@ -261,12 +301,7 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		return &fsmEnd[R, W]{s.transitionStep}
 	}
 
-	tk := transitionKey{
-		action:   s.f.action,
-		typeName: s.f.typeName,
-		name:     name,
-	}
-	if _, ok := s.f.registeredTransitions[tk]; ok {
+	if s.f.declares(name) {
 		s.m.logger.Error("transition already registered", "transition", name)
 		s.buildError = errors.Join(s.buildError, fmt.Errorf("transition %s already registered", name))
 		return &fsmEnd[R, W]{s.transitionStep}
@@ -281,12 +316,16 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		opt.applyEnd(&cfg)
 	}
 
+	for _, d := range s.pending {
+		s.f.registeredTransitions[s.f.transitionKey(d.name)] = s.build(d, cfg.every)
+	}
+
 	finalizers := make([]FinalizerFunc, 0, len(cfg.finalizers))
 	for _, f := range cfg.finalizers {
 		finalizers = append(finalizers, newFinalizer(f))
 	}
 
-	s.f.registeredTransitions[tk] = newTransition(name, s.m.finisher[R, W](finalizers), cfg)
+	s.f.registeredTransitions[s.f.transitionKey(name)] = newTransition(name, s.m.finisher[R, W](finalizers), cfg)
 	s.f.transitions = s.f.transitions.Append(name)
 	s.f.endState = name
 	s.f.resumeOne = s.m.resumeOne[R, W](s.f)
