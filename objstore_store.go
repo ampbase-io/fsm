@@ -618,6 +618,7 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 		ID:           m.GetResourceId(),
 		StartVersion: version,
 		Action:       m.GetAction(),
+		CurrentState: nextState(m.GetTransitions(), m.GetCompletedStates()),
 		TypeName:     m.GetResourceType(),
 		Queue:        m.GetQueue(),
 		Parent:       parent,

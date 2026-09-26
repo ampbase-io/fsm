@@ -27,8 +27,10 @@ message ActiveFSM {
 
   RunState run_state = 5;
 
+  // transition_version is unset: a transition's version exists only on the node executing it.
   string transition_version = 6;
 
+  // current_state is the transition the run is executing or will execute next, as recorded.
   string current_state = 7;
 
   string queue = 8;

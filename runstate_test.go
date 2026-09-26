@@ -2,11 +2,13 @@ package fsm
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
+	"connectrpc.com/connect"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -194,6 +196,68 @@ func TestObjectActiveCrossManager(t *testing.T) {
 	}
 }
 
+// TestListActiveReportsProgress verifies current_state follows the run: a run blocked in its
+// second transition is listed there, on the store and over the RPC, read off the record rather
+// than the executing node's memory — so a peer's listing says the same.
+func TestListActiveReportsProgress(t *testing.T) { runBackends(t, testListActiveReportsProgress) }
+
+func testListActiveReportsProgress(t *testing.T, b *backend) {
+	m, _ := b.newManager(nil)
+	ctx := context.Background()
+
+	entered := make(chan struct{}, 1)
+	block := make(chan struct{})
+	defer close(block)
+	start, _, err := m.Register[orderReq, orderResp]("progress").
+		Start("first", func(context.Context, *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			return nil, nil
+		}).
+		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			select {
+			case <-block:
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done").
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+	version, err := start(ctx, "progress-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	<-entered
+
+	states, err := m.store.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("failed to list active runs: %v", err)
+	}
+	i := slices.IndexFunc(states, func(rs runSnapshot) bool { return rs.StartVersion == version })
+	if i < 0 {
+		t.Fatalf("expected the run in ListActive, got %v", states)
+	}
+	if states[i].CurrentState != "second" {
+		t.Fatalf("expected the run listed in second, got %q", states[i].CurrentState)
+	}
+
+	admin := &adminServer{m: m}
+	resp, err := admin.ListActive(ctx, connect.NewRequest(&fsmv1.ListActiveRequest{}))
+	if err != nil {
+		t.Fatalf("ListActive failed: %v", err)
+	}
+	j := slices.IndexFunc(resp.Msg.GetActive(), func(af *fsmv1.ActiveFSM) bool { return af.GetVersion() == version.String() })
+	if j < 0 {
+		t.Fatalf("expected the run in the admin listing, got %v", resp.Msg.GetActive())
+	}
+	if af := resp.Msg.GetActive()[j]; af.GetCurrentState() != "second" || af.GetTransitionVersion() != "" {
+		t.Fatalf("expected the admin listing to report second and no transition version, got %+v", af)
+	}
+}
+
 func TestListActive(t *testing.T) { runBackends(t, testListActive) }
 
 func testListActive(t *testing.T, b *backend) {
@@ -227,6 +291,9 @@ func testListActive(t *testing.T, b *backend) {
 		}
 		if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
 			t.Fatal("expected a non-terminal run state")
+		}
+		if rs.CurrentState != "created" {
+			t.Fatalf("expected the run listed in the state it is executing, got %q", rs.CurrentState)
 		}
 	}
 	if !found {
