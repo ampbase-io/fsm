@@ -65,10 +65,15 @@ message WaitRequest {
 
 message WaitResponse {
   // Wait returns only once the run is terminal, so terminality is implicit; the outcome is the
-  // error (empty on success) and the result. There is no separate run-state field: it would be a
-  // constant.
+  // error and its kind (unspecified on success), the state the run halted in, and the result.
   string error = 1;   // run error, empty on success
   bytes result = 2;   // marshaled W response; opaque, decoded by the client
+
+  // halt_kind classifies error, as recorded: what a client switches on instead of the text.
+  HaltKind halt_kind = 3;
+
+  // error_state is the transition the run halted in; empty on success.
+  string error_state = 4;
 }
 
 message CancelRequest {

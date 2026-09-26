@@ -129,6 +129,9 @@ func testCancelRecordsStoppingState(t *testing.T, b *backend) {
 	if waitResp.Msg.GetError() != "operator says stop" {
 		t.Fatalf("expected the cancel reason from Wait, got %q", waitResp.Msg.GetError())
 	}
+	if waitResp.Msg.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_CANCELED || waitResp.Msg.GetErrorState() != "a" {
+		t.Fatalf("expected Wait to report a cancel in state a, got %v in %q", waitResp.Msg.GetHaltKind(), waitResp.Msg.GetErrorState())
+	}
 
 	store, ok := m.store.(*objectStore)
 	if !ok {

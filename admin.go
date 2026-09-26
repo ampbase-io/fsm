@@ -121,10 +121,17 @@ func (s *adminServer) Wait(ctx context.Context, req *connect.Request[fsmv1.WaitR
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	resp := &fsmv1.WaitResponse{Result: result}
-	if waitErr != nil {
-		resp.Error = waitErr.Error()
+	resp := &fsmv1.WaitResponse{Result: result, HaltKind: outcomeKind(waitErr)}
+	if waitErr == nil {
+		return connect.NewResponse(resp), nil
 	}
+	// The halting state is on the record, not the error; only a halted run pays the read.
+	history, err := s.m.History(ctx, version)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	resp.Error = waitErr.Error()
+	resp.ErrorState = history.GetLastEvent().GetErrorState()
 	return connect.NewResponse(resp), nil
 }
 

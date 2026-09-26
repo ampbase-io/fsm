@@ -82,6 +82,9 @@ func testControlStartWait(t *testing.T, b *backend) {
 	if waitResp.Msg.GetError() != "" {
 		t.Fatalf("run completed with error: %s", waitResp.Msg.GetError())
 	}
+	if waitResp.Msg.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_UNSPECIFIED || waitResp.Msg.GetErrorState() != "" {
+		t.Fatalf("expected no halt reported for a successful run, got %v in %q", waitResp.Msg.GetHaltKind(), waitResp.Msg.GetErrorState())
+	}
 
 	var got orderResp
 	if err := json.Unmarshal(waitResp.Msg.GetResult(), &got); err != nil {
