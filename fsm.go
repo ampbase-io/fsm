@@ -205,12 +205,22 @@ type outcomeRecord interface {
 	GetErrorState() string
 }
 
+// halted reports whether the record holds a halt at all: any of the triple. The kind and state
+// count as well as the message, since a cancel with no reason records an empty message.
+func halted(r outcomeRecord) bool {
+	switch {
+	case r.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_UNSPECIFIED,
+		r.GetError() != "",
+		r.GetErrorState() != "":
+		return true
+	}
+	return false
+}
+
 // recordedRunErr is the one reader of a record's outcome, for both backends and every read
-// path: an empty triple is success, anything else the typed halt rebuilt from its kind. The
-// kind and state count as well as the message, since a cancel with no reason records an empty
-// message.
+// path: no halt is success, anything else the typed halt rebuilt from its kind.
 func recordedRunErr(r outcomeRecord) RunErr {
-	if r.GetError() == "" && r.GetHaltKind() == fsmv1.HaltKind_HALT_KIND_UNSPECIFIED && r.GetErrorState() == "" {
+	if !halted(r) {
 		return RunErr{}
 	}
 	return RunErr{Err: outcomeError(r.GetHaltKind(), r.GetError()), State: r.GetErrorState()}

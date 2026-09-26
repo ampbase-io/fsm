@@ -240,10 +240,7 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 				},
 			)
 
-			// A cancel that ends the context is the transition's outcome whether the attempt
-			// returned after it or RetryNotify's sleep did (its own bare ctx error, which no
-			// attempt saw); a shutdown or a lost lease passes through unrecorded.
-			if ctx.Err() != nil && err != nil && !isHalt(err) && !errors.Is(err, ErrLeaseLost) {
+			if endedByContext(ctx, err) {
 				observe("canceled")
 				logger.InfoContext(transitionCtx, "transition canceled", "error", context.Cause(ctx))
 				err = haltOnCancel(ctx, err)
@@ -255,6 +252,17 @@ func retry(tracer trace.Tracer, instruments *instruments, store appender) Transi
 			return resp, err
 		})
 	})
+}
+
+// endedByContext reports whether the transition's context, not an attempt, ended the retries:
+// err is then a bare error no attempt classified — RetryNotify's own ctx.Err() from its sleep,
+// or the last attempt's — rather than a halt an attempt recorded or a lost lease, which passes
+// through unrecorded. Such an end is the transition's outcome when an operator canceled it.
+func endedByContext(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	return !isHalt(err) && !errors.Is(err, ErrLeaseLost)
 }
 
 // haltOnCancel turns err into a halt carrying the operator's reason when ctx was ended by
