@@ -395,7 +395,8 @@ type StateEvent struct {
 	// error_state is the state the run halted in. On a FINISH event, state is the finisher's own.
 	ErrorState string `protobuf:"bytes,11,opt,name=error_state,json=errorState,proto3" json:"error_state,omitempty"`
 	// iteration is which run of a repeated transition (RepeatWhile) the event records, from zero.
-	// Unset for a transition that does not repeat.
+	// Unset for a transition that does not repeat, and on the COMPLETE a repeated transition
+	// records when its predicate answers RepeatDone.
 	Iteration     *uint32 `protobuf:"varint,12,opt,name=iteration,proto3,oneof" json:"iteration,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

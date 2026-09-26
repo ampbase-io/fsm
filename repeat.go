@@ -36,7 +36,7 @@ func RepeatDone() Repeat { return Repeat{decision: decisionDone} }
 //
 // Each iteration is recorded as its own COMPLETE event carrying its index, runs with a fresh
 // transition version, and passes through the transition's interceptors. A RepeatDone reaches
-// none of those interceptors and records no event.
+// none of those interceptors; it records the transition finished, as a COMPLETE with no index.
 func RepeatWhile[R, W any](predicate func(context.Context, *Request[R, W]) (Repeat, error)) Option[R, W] {
 	return repeatOption[R, W](predicate)
 }
@@ -49,7 +49,8 @@ func (o repeatOption[R, W]) apply(cfg *TransitionConfig[R, W]) *TransitionConfig
 }
 
 // errRepeatDone is how a repeated transition's gate tells the run loop the predicate answered
-// RepeatDone. It passes through the canceller and retry unrecorded.
+// RepeatDone. Retry passes it through, and the canceller records it as the transition's COMPLETE
+// with no iteration.
 var errRepeatDone = errors.New("fsm: repeat done")
 
 // repeater asks the predicate before every attempt at an iteration. It sits inside retry, so a
@@ -84,10 +85,12 @@ func (g gate[R, W]) run(ctx context.Context, req AnyRequest) (AnyResponse, error
 	return nil, NewUnrecoverableSystemError(fmt.Errorf("transition %s: RepeatWhile predicate returned no decision", req.Run().CurrentState))
 }
 
-// recordIteration counts a completed iteration of a repeated transition into counts, so its next
-// iteration runs at the index after the event's. An event with no iteration is not one.
+// recordIteration folds a COMPLETE into counts. One carrying an iteration counts it, so the next
+// runs at the index after it; one without finishes the transition, repeated or not, and drops
+// any count it had.
 func recordIteration(counts map[string]uint32, event *fsmv1.StateEvent) map[string]uint32 {
 	if event.Iteration == nil {
+		delete(counts, event.GetState())
 		return counts
 	}
 	if counts == nil {

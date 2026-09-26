@@ -78,7 +78,8 @@ To("stage", stage, fsm.RepeatWhile(func(ctx context.Context, req *fsm.Request[Ro
   predicate is asked again before every retry.
 - **Each iteration is a transition to everything around it.** It runs under a fresh transition
   version, through the transition's interceptors, with its own span. A `RepeatDone` reaches
-  none of those interceptors and records no event.
+  none of those interceptors; it records the transition finished, as a COMPLETE with no index,
+  so a resumed run does not re-enter it.
 
 ## Cancellation
 

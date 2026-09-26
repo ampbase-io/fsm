@@ -59,7 +59,8 @@ message StateEvent {
   string error_state = 11;
 
   // iteration is which run of a repeated transition (RepeatWhile) the event records, from zero.
-  // Unset for a transition that does not repeat.
+  // Unset for a transition that does not repeat, and on the COMPLETE a repeated transition
+  // records when its predicate answers RepeatDone.
   optional uint32 iteration = 12;
 }
 

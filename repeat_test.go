@@ -293,3 +293,74 @@ func testRepeatWhileResumes(t *testing.T, b *backend) {
 		t.Fatalf("expected the resume to rerun the stopped iteration and go on, ran %v", body)
 	}
 }
+
+// TestRepeatWhileFinishedMovesOn verifies a repeated transition's RepeatDone is recorded: while
+// the next transition runs, ListActive reports that one, and a resume moves past the finished
+// transition even on a definition where it no longer repeats, rather than running it again.
+func TestRepeatWhileFinishedMovesOn(t *testing.T) { runBackends(t, testRepeatWhileFinishedMovesOn) }
+
+func testRepeatWhileFinishedMovesOn(t *testing.T, b *backend) {
+	ctx := context.Background()
+	var block atomic.Bool
+	block.Store(true)
+	entered := make(chan struct{}, 2)
+	done := make(chan struct{}, 1)
+
+	register := func(m *Manager, it *iterations, opts ...Option[orderReq, orderResp]) (Start[orderReq, orderResp], Resume) {
+		start, resume, err := m.Register[orderReq, orderResp]("repeat-finished").
+			Start("first", okTransition).
+			To("stage", func(_ context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+				it.ran(req.Run())
+				return nil, nil
+			}, opts...).
+			To("next", func(ctx context.Context, _ *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+				entered <- struct{}{}
+				if block.Load() {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				return nil, nil
+			}).
+			End("done", WithFinalizers(func(context.Context, *Request[orderReq, orderResp], RunErr) {
+				done <- struct{}{}
+			})).
+			Build(ctx)
+		if err != nil {
+			t.Fatalf("failed to build FSM: %v", err)
+		}
+		return start, resume
+	}
+
+	var repeated iterations
+	m1, stop1 := b.newManager(nil)
+	start, _ := register(m1, &repeated, RepeatWhile(fewerThan(2)))
+	version, err := start(ctx, "repeat-finished-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the transition after the repeat")
+
+	states, err := m1.store.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("failed to list active runs: %v", err)
+	}
+	i := slices.IndexFunc(states, func(rs runSnapshot) bool { return rs.StartVersion == version })
+	if i < 0 || states[i].CurrentState != "next" {
+		t.Fatalf("expected the run listed in next once stage finished, got %+v", states)
+	}
+
+	stop1()
+	block.Store(false)
+
+	var plain iterations
+	m2, _ := b.newManager(nil)
+	_, resume := register(m2, &plain)
+	if err := resume(ctx); err != nil {
+		t.Fatalf("failed to resume: %v", err)
+	}
+	within(t, done, 10*time.Second, "the resumed run to finish")
+
+	if body, _, _ := plain.snapshot(); len(body) != 0 {
+		t.Fatalf("expected the finished stage not to run again on resume, it ran %d times", len(body))
+	}
+}

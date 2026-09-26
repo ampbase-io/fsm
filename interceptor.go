@@ -93,6 +93,10 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				logger.InfoContext(ctx, "transition returned cancelable error, completing run", "error", haltErr.err)
 				event.Type = fsmv1.EventType_EVENT_TYPE_CANCEL
 				RunErr{Err: haltErr, State: run.CurrentState}.stamp(event)
+			case errors.Is(err, errRepeatDone):
+				// The predicate ended the repetition. A COMPLETE with no iteration records the
+				// transition finished, so resume and ListActive move past it.
+				event.Iteration = nil
 			case err != nil:
 				return resp, err
 			default:
