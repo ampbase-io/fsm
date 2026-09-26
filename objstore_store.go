@@ -436,9 +436,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 			}
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
 			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
-			m.Error = event.GetError()
-			m.ErrorKind = event.GetErrorKind()
-			m.ErrorState = event.GetState()
+			recordOutcome(m, event)
 		case fsmv1.EventType_EVENT_TYPE_ERROR:
 			m.RetryCount = event.GetRetryCount()
 		}
@@ -480,9 +478,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		// (appendMidRun), so RunResult reads it from the terminal manifest, race-free and
 		// cross-node. The FINISH event still carries that same response for the history record.
 		if run.fsmErr.Err != nil {
-			m.Error = run.fsmErr.Err.Error()
-			m.ErrorKind = outcomeKind(run.fsmErr.Err)
-			m.ErrorState = run.fsmErr.State
+			recordOutcome(m, event)
 		}
 		return nil
 	})
@@ -603,15 +599,10 @@ func admissionQueue(m *fsmv1.RunManifest) string {
 	return m.GetQueue()
 }
 
-// manifestRunErr rebuilds the run error recorded in the manifest.
-func manifestRunErr(m *fsmv1.RunManifest) RunErr {
-	if m.GetErrorState() == "" {
-		return RunErr{}
-	}
-	return RunErr{
-		Err:   outcomeError(m.GetErrorKind(), m.GetError()),
-		State: m.GetErrorState(),
-	}
+// recordOutcome projects a stamped event's error triple onto the manifest: the one way the
+// manifest learns how a run halted, so it and the event log never disagree.
+func recordOutcome(m *fsmv1.RunManifest, event *fsmv1.StateEvent) {
+	m.Error, m.ErrorKind, m.ErrorState = event.GetError(), event.GetErrorKind(), event.GetErrorState()
 }
 
 // runFromManifest rebuilds a Run from the manifest's materialized fields. The resource alias is
@@ -630,7 +621,7 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 		TypeName:     m.GetResourceType(),
 		Queue:        m.GetQueue(),
 		Parent:       parent,
-		fsmErr:       manifestRunErr(m),
+		fsmErr:       recordedRunErr(m),
 	}
 }
 
@@ -774,7 +765,7 @@ func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
 		completedTransitions: m.GetCompletedStates(),
 		response:             m.GetLatestResponse(),
 		retryCount:           m.GetRetryCount(),
-		fsmError:             manifestRunErr(m),
+		fsmError:             recordedRunErr(m),
 	}
 }
 
@@ -857,7 +848,7 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		case finishInFlight:
 			return false, nil
 		}
-		outcome = recordedOutcome(manifest.GetErrorKind(), manifest.GetError())
+		outcome = recordedRunErr(manifest).Err
 		return true, nil
 	}
 
@@ -901,7 +892,7 @@ func (s *objectStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
 		active = append(active, runSnapshot{
 			Run:   runFromManifest(e.version, e.manifest),
 			State: e.manifest.GetStatus(),
-			Error: manifestRunErr(e.manifest),
+			Error: recordedRunErr(e.manifest),
 		})
 	}
 	return active, nil

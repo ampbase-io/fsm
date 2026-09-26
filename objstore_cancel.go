@@ -11,7 +11,7 @@ import (
 
 // cancelBeforeExecState labels the terminal state recorded for a run canceled before it began
 // executing: no transition was in flight, so there is no real state to attribute the cancel to,
-// but the manifest needs a non-empty error state for the cause to survive (manifestRunErr).
+// so the record names this label as where it stopped.
 const cancelBeforeExecState = "canceled"
 
 func (s *objectStore) cancelKey(version ulid.ULID) string {

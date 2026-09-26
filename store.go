@@ -93,8 +93,7 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	if err != nil {
 		return err
 	}
-	last := he.GetLastEvent()
-	return recordedOutcome(last.GetErrorKind(), last.GetError())
+	return recordedRunErr(he.GetLastEvent()).Err
 }
 
 var _ Store = (*boltStore)(nil)
@@ -455,10 +454,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 					}
 				case fsmv1.EventType_EVENT_TYPE_CANCEL:
 					completedTransitions = append(completedTransitions, event.GetState())
-					fsmError = RunErr{
-						Err:   outcomeError(event.GetErrorKind(), event.GetError()),
-						State: event.GetState(),
-					}
+					fsmError = recordedRunErr(&event)
 				case fsmv1.EventType_EVENT_TYPE_ERROR:
 					retryCount = event.GetRetryCount()
 				}

@@ -352,7 +352,7 @@ func TestArchivedFailedRunPreservesError(t *testing.T) {
 		t.Fatal("archived failed run reported success; its error was lost when the manifest was reaped")
 	case err.Error() != "boom":
 		t.Fatalf("expected the run's error preserved through archival, got %v", err)
-	case !func() bool { _, ok := errors.AsType[*AbortError](err); return ok }():
+	case !isA[*AbortError](err):
 		t.Fatalf("expected the run's error typed through archival, got %T", err)
 	}
 }

@@ -76,21 +76,27 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	return i, errors.Join(errs...)
 }
 
-// observeRun records a run's outcome under its recorded kind (outcomeKind), split into the
-// status attribute and, for an unrecoverable halt, the error kind.
+// observeRun records a run's outcome under its recorded kind (outcomeKind).
 func (i *instruments) observeRun(ctx context.Context, run Run, kind string, start time.Time) {
-	status, errorKind := runStatus(kind)
-	attrs := []attribute.KeyValue{attrAction.String(run.Action), attrResource.String(run.ResourceName), attrStatus.String(status)}
-	if errorKind != "" {
-		attrs = append(attrs, attrErrorKind.String(errorKind))
-	}
+	attrs := append([]attribute.KeyValue{attrAction.String(run.Action), attrResource.String(run.ResourceName)}, outcomeAttrs(kind)...)
 	set := metric.WithAttributeSet(attribute.NewSet(attrs...))
 	i.runs.Add(ctx, 1, set)
 	i.runDuration.Record(ctx, time.Since(start).Seconds(), set)
 }
 
-// runStatus maps an outcome kind onto the fsm.status and fsm.error.kind attributes, which
-// predate the recorded kind and keep their values.
+// outcomeAttrs is an outcome kind as the fsm.status and fsm.error.kind attributes, shared by the
+// run and transition metrics and their spans so a trace and a metric of the same run correlate.
+func outcomeAttrs(kind string) []attribute.KeyValue {
+	status, errorKind := runStatus(kind)
+	attrs := []attribute.KeyValue{attrStatus.String(status)}
+	if errorKind != "" {
+		attrs = append(attrs, attrErrorKind.String(errorKind))
+	}
+	return attrs
+}
+
+// runStatus maps an outcome kind onto the fsm.status and fsm.error.kind values, which predate
+// the recorded kind and keep their spellings.
 func runStatus(kind string) (status, errorKind string) {
 	switch kind {
 	case kindOK:

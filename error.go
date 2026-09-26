@@ -55,7 +55,8 @@ func (e *CancelError) Error() string {
 }
 
 // haltError wraps the underlying error returned from a transition and signals the FSM to halt
-// execution.
+// execution. Every RunErr.Err a backend records or rebuilds is one, which is how the admin Wait
+// tells a run's outcome from a poll failure; a producer that records a bare error breaks that.
 type haltError struct {
 	err error
 }
@@ -155,11 +156,14 @@ func (e *UnrecoverableError) Unwrap() error {
 	return e.error
 }
 
-// isHalt reports whether err is a run's recorded halt rather than a transport or storage error.
-func isHalt(err error) bool {
-	_, ok := errors.AsType[*haltError](err)
+// isA reports whether err is, or wraps, a T.
+func isA[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
 	return ok
 }
+
+// isHalt reports whether err is a run's recorded halt rather than a transport or storage error.
+func isHalt(err error) bool { return isA[*haltError](err) }
 
 // Outcome kinds: how a halted run ended, recorded beside its error so the typed error is
 // rebuilt the same on every node. A successful run records none.
@@ -175,27 +179,32 @@ const (
 
 // outcomeKind classifies a run's recorded error into its kind; nil is kindOK.
 func outcomeKind(err error) string {
-	var (
-		_, isCancel         = errors.AsType[*CancelError](err)
-		_, isAbort          = errors.AsType[*AbortError](err)
-		ue, isUnrecoverable = errors.AsType[*UnrecoverableError](err)
-		_, isHandoff        = errors.AsType[*HandoffError](err)
-	)
-	switch {
+	switch ue, unrecoverable := errors.AsType[*UnrecoverableError](err); {
 	case err == nil:
 		return kindOK
-	case isCancel:
+	case isA[*CancelError](err):
 		return kindCanceled
-	case isAbort:
+	case isA[*AbortError](err):
 		return kindAbort
-	case isUnrecoverable && ue.Kind == ErrorKindUser:
+	case unrecoverable && ue.Kind == ErrorKindUser:
 		return kindUnrecoverableUser
-	case isUnrecoverable:
+	case unrecoverable:
 		return kindUnrecoverableSystem
-	case isHandoff:
+	case isA[*HandoffError](err):
 		return kindHandoff
 	default:
 		return kindError
+	}
+}
+
+// haltsRun reports whether a transition error of this kind ends the run rather than being
+// retried: the kinds a handler halts with on purpose.
+func haltsRun(kind string) bool {
+	switch kind {
+	case kindAbort, kindUnrecoverableSystem, kindUnrecoverableUser, kindHandoff:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -207,7 +216,7 @@ func outcomeError(kind, msg string) error {
 	case kindCanceled:
 		return halt(&CancelError{Reason: msg})
 	case kindAbort:
-		return halt(&AbortError{err: errors.New(msg)})
+		return halt(Abort(errors.New(msg)))
 	case kindUnrecoverableSystem:
 		return halt(NewUnrecoverableSystemError(errors.New(msg)))
 	case kindUnrecoverableUser:
@@ -215,14 +224,4 @@ func outcomeError(kind, msg string) error {
 	default:
 		return halt(errors.New(msg))
 	}
-}
-
-// recordedOutcome is outcomeError for a record that may hold no error at all: a success reads
-// as nil. The kind is checked as well as the message, since a cancel with no reason records an
-// empty message.
-func recordedOutcome(kind, msg string) error {
-	if kind == kindOK && msg == "" {
-		return nil
-	}
-	return outcomeError(kind, msg)
 }

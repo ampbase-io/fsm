@@ -149,45 +149,19 @@ func testRunMetrics(t *testing.T, b *backend) {
 	entered := make(chan struct{}, 1)
 	start, _, err := m.Register[orderReq, orderResp]("measured").
 		Start("first", pass).
-		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			switch req.Msg.Name {
-			case "abort":
-				return nil, Abort(errors.New("boom"))
-			case "cancel":
-				entered <- struct{}{}
-				<-ctx.Done()
-				return nil, ctx.Err()
-			default:
-				return nil, nil
-			}
-		}).
+		To("second", haltByName(entered)).
 		End("done").
 		Build(ctx)
 	if err != nil {
 		t.Fatalf("failed to build FSM: %v", err)
 	}
-	waitFor := func(id, name string) error {
-		version, err := start(ctx, id, NewRequest(&orderReq{Name: name}, &orderResp{}))
-		if err != nil {
-			t.Fatalf("failed to start FSM: %v", err)
-		}
-		if name == "cancel" {
-			<-entered
-			if err := m.Cancel(ctx, version, "measured stop"); err != nil {
-				t.Fatalf("cancel failed: %v", err)
-			}
-		}
-		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		return m.Wait(waitCtx, version)
-	}
-	if err := waitFor("measured-ok", "ok"); err != nil {
+	if _, err := runHalting(t, m, start, entered, "measured-ok", "pass", ""); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	if err := waitFor("measured-abort", "abort"); err == nil {
+	if _, err := runHalting(t, m, start, entered, "measured-abort", "abort", ""); err == nil {
 		t.Fatal("expected the aborting run to fail")
 	}
-	if err := waitFor("measured-cancel", "cancel"); err == nil {
+	if _, err := runHalting(t, m, start, entered, "measured-cancel", "cancel", "measured stop"); err == nil {
 		t.Fatal("expected the canceled run to report its cancel")
 	}
 

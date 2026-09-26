@@ -186,6 +186,36 @@ type RunErr struct {
 	State string
 }
 
+// stamp writes the run error onto an event — message, kind and state — so every record a
+// backend keeps rebuilds the same typed halt. A nil error stamps nothing: an empty triple is
+// success.
+func (e RunErr) stamp(event *fsmv1.StateEvent) {
+	if e.Err == nil {
+		return
+	}
+	event.Error = e.Err.Error()
+	event.ErrorKind = outcomeKind(e.Err)
+	event.ErrorState = e.State
+}
+
+// outcomeRecord is the error triple a stamped StateEvent and the RunManifest both carry.
+type outcomeRecord interface {
+	GetError() string
+	GetErrorKind() string
+	GetErrorState() string
+}
+
+// recordedRunErr is the one reader of a record's outcome, for both backends and every read
+// path: an empty triple is success, anything else the typed halt rebuilt from its kind. The
+// kind and state count as well as the message, since a cancel with no reason records an empty
+// message.
+func recordedRunErr(r outcomeRecord) RunErr {
+	if r.GetError() == "" && r.GetErrorKind() == "" && r.GetErrorState() == "" {
+		return RunErr{}
+	}
+	return RunErr{Err: outcomeError(r.GetErrorKind(), r.GetError()), State: r.GetErrorState()}
+}
+
 // Run contains the information associated with an active FSM.
 type Run struct {
 	StartVersion ulid.ULID
@@ -766,21 +796,20 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 				return
 			}
 
+			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
+			case err == nil && canceled:
+				// The handler finished its work after the cancel landed. The cancel is still the
+				// run's outcome: Cancel has already answered its caller.
+				err = halt(cancel)
+			case err == nil:
+				continue
+			}
+
 			if errors.Is(err, ErrLeaseLost) {
 				// Halt without finalizers or FINISH: this node may no longer write to the run,
 				// and the new owner runs them at its own finish.
 				transitionLogger.WarnContext(ctx, "run lease lost, halting")
 				return
-			}
-
-			switch cancel, canceled := errors.AsType[*CancelError](context.Cause(transitionCtx)); {
-			case canceled && !isHalt(err):
-				// The cancel is the run's outcome whether the handler finished its work after
-				// it landed or a retry's sleep returned the bare context error: Cancel has
-				// already answered its caller.
-				err = halt(cancel)
-			case err == nil:
-				continue
 			}
 
 			// The first halt is the run's outcome. Every transition after it is skipped, yet
@@ -791,10 +820,7 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 			kind := outcomeKind(err)
 			m.instruments.observeRun(ctx, run, kind, runStart)
-			span.SetAttributes(attribute.String("fsm.error_kind", kind))
-			if _, unrecoverable := errors.AsType[*UnrecoverableError](err); unrecoverable {
-				transitionLogger.ErrorContext(ctx, "reached unrecoverable error, canceling FSM", "error", err)
-			}
+			span.SetAttributes(outcomeAttrs(kind)...)
 			request.withError(RunErr{
 				Err:   err,
 				State: transitionName,
