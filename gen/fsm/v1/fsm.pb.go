@@ -163,17 +163,19 @@ func (x *FSM) GetTransitions() []string {
 }
 
 type ActiveFSM struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	Id                string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Action            string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
-	Version           string                 `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
-	Error             string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
-	RunState          RunState               `protobuf:"varint,5,opt,name=run_state,json=runState,proto3,enum=fsm.v1.RunState" json:"run_state,omitempty"`
-	TransitionVersion string                 `protobuf:"bytes,6,opt,name=transition_version,json=transitionVersion,proto3" json:"transition_version,omitempty"`
-	CurrentState      string                 `protobuf:"bytes,7,opt,name=current_state,json=currentState,proto3" json:"current_state,omitempty"`
-	Queue             string                 `protobuf:"bytes,8,opt,name=queue,proto3" json:"queue,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Id       string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Action   string                 `protobuf:"bytes,2,opt,name=action,proto3" json:"action,omitempty"`
+	Version  string                 `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
+	Error    string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	RunState RunState               `protobuf:"varint,5,opt,name=run_state,json=runState,proto3,enum=fsm.v1.RunState" json:"run_state,omitempty"`
+	// transition_version is unset: a transition's version exists only on the node executing it.
+	TransitionVersion string `protobuf:"bytes,6,opt,name=transition_version,json=transitionVersion,proto3" json:"transition_version,omitempty"`
+	// current_state is the transition the run is executing or will execute next, as recorded.
+	CurrentState  string `protobuf:"bytes,7,opt,name=current_state,json=currentState,proto3" json:"current_state,omitempty"`
+	Queue         string `protobuf:"bytes,8,opt,name=queue,proto3" json:"queue,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ActiveFSM) Reset() {

@@ -96,6 +96,17 @@ func historyOutcome(ctx context.Context, s Store, version ulid.ULID) error {
 	return recordedRunErr(he.GetLastEvent()).Err
 }
 
+// nextState is the transition a run with the given definition and completed transitions is
+// executing or will execute next — the rule resume prunes by. Empty once every transition ran.
+func nextState(transitions, completed []string) string {
+	for _, name := range transitions {
+		if !slices.Contains(completed, name) {
+			return name
+		}
+	}
+	return ""
+}
+
 var _ Store = (*boltStore)(nil)
 
 type boltStore struct {
@@ -428,46 +439,9 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 				continue
 			}
 
-			// EVENT Bucket
-			// <resource_id>#<action>#<run_version>
-			eventPrefix := bytes.Join([][]byte{[]byte(ae.GetResourceId()), []byte(ae.GetAction()), ae.StartVersion, emptyPrefix}, keySeparator)
-			eventCursor := eventB.Cursor()
-			logger.DebugContext(ctx, "iterating events", "start_event", string(ae.StartEvent), "event_prefix", string(eventPrefix))
-			var (
-				completedTransitions []string
-				response             []byte
-				retryCount           uint64
-				fsmError             RunErr
-			)
-			for eventKey, eventValue := eventCursor.Seek(ae.StartEvent); eventKey != nil && bytes.HasPrefix(eventKey, eventPrefix); eventKey, eventValue = eventCursor.Next() {
-				var event fsmv1.StateEvent
-				if err := proto.Unmarshal(eventValue, &event); err != nil {
-					logger.ErrorContext(ctx, "failed to unmarshal event", "error", err)
-					continue
-				}
-
-				switch event.Type {
-				case fsmv1.EventType_EVENT_TYPE_COMPLETE:
-					completedTransitions = append(completedTransitions, event.GetState())
-					if event.GetResponse() != nil {
-						response = event.GetResponse()
-					}
-				case fsmv1.EventType_EVENT_TYPE_CANCEL:
-					completedTransitions = append(completedTransitions, event.GetState())
-					fsmError = recordedRunErr(&event)
-				case fsmv1.EventType_EVENT_TYPE_ERROR:
-					retryCount = event.GetRetryCount()
-				}
-			}
-
-			activeEvents = append(activeEvents, &activeResource{
-				version:              version,
-				active:               &ae,
-				completedTransitions: completedTransitions,
-				response:             response,
-				retryCount:           retryCount,
-				fsmError:             fsmError,
-			})
+			resource := s.foldEvents(ctx, eventB, &ae)
+			resource.version = version
+			activeEvents = append(activeEvents, &resource)
 		}
 
 		return nil
@@ -508,6 +482,73 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 	txn.Commit()
 
 	return activeEvents, nil
+}
+
+// foldEvents walks a run's recorded events from its START and returns what resume needs from
+// them: the transitions completed, the latest response, the retry count and any halt.
+func (s *boltStore) foldEvents(ctx context.Context, eventB *bbolt.Bucket, ae *fsmv1.ActiveEvent) activeResource {
+	// EVENT Bucket
+	// <resource_id>#<action>#<run_version>
+	eventPrefix := bytes.Join([][]byte{[]byte(ae.GetResourceId()), []byte(ae.GetAction()), ae.StartVersion, emptyPrefix}, keySeparator)
+	s.logger.DebugContext(ctx, "iterating events", "start_event", string(ae.StartEvent), "event_prefix", string(eventPrefix))
+
+	folded := activeResource{active: ae}
+	cursor := eventB.Cursor()
+	for eventKey, eventValue := cursor.Seek(ae.StartEvent); eventKey != nil && bytes.HasPrefix(eventKey, eventPrefix); eventKey, eventValue = cursor.Next() {
+		var event fsmv1.StateEvent
+		if err := proto.Unmarshal(eventValue, &event); err != nil {
+			s.logger.ErrorContext(ctx, "failed to unmarshal event", "error", err, "key", string(eventKey))
+			continue
+		}
+
+		switch event.Type {
+		case fsmv1.EventType_EVENT_TYPE_COMPLETE:
+			folded.completedTransitions = append(folded.completedTransitions, event.GetState())
+			if event.GetResponse() != nil {
+				folded.response = event.GetResponse()
+			}
+		case fsmv1.EventType_EVENT_TYPE_CANCEL:
+			folded.completedTransitions = append(folded.completedTransitions, event.GetState())
+			folded.fsmError = recordedRunErr(&event)
+		case fsmv1.EventType_EVENT_TYPE_ERROR:
+			folded.retryCount = event.GetRetryCount()
+		}
+	}
+	return folded
+}
+
+// currentState is the transition a run is executing or will execute next, read off its record
+// the way resume reads it, so the answer is the same after a restart as before one.
+func (s *boltStore) currentState(ctx context.Context, tx *bbolt.Tx, run Run) string {
+	key, err := activeKey(run)
+	if err != nil {
+		return ""
+	}
+	v := tx.Bucket(activeBucket).Get(key)
+	if v == nil {
+		return ""
+	}
+	var ae fsmv1.ActiveEvent
+	if err := proto.Unmarshal(v, &ae); err != nil {
+		s.logger.ErrorContext(ctx, "failed to unmarshal active event", "error", err, "key", string(key))
+		return ""
+	}
+	return nextState(ae.GetTransitions(), s.foldEvents(ctx, tx.Bucket(eventsBucket), &ae).completedTransitions)
+}
+
+// activeKey is a run's ACTIVE bucket key, <resource_type>#<resource_id>#<action>#<run_version>,
+// with the zero version for a run that is not queue-gated: only one such run per resource is
+// active at a time, while queued runs stack.
+func activeKey(run Run) ([]byte, error) {
+	version := ulid.ULID{}
+	if run.Queue != "" {
+		version = run.StartVersion
+	}
+	versionBytes, err := version.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Join([][]byte{[]byte(run.TypeName), []byte(run.ID), []byte(run.Action), versionBytes}, keySeparator), nil
 }
 
 // ActiveRuns answers from the in-memory index. resourceType is unused because memdb rows are
@@ -606,7 +647,15 @@ func (s *boltStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
 		}
 		active = append(active, rs)
 	}
-	return active, nil
+
+	// The row records no progress; the state each run is in comes off its record.
+	err = s.db.View(func(tx *bbolt.Tx) error {
+		for i := range active {
+			active[i].CurrentState = s.currentState(ctx, tx, active[i].Run)
+		}
+		return nil
+	})
+	return active, err
 }
 
 func (s *boltStore) SetRunning(ctx context.Context, run Run) error {
@@ -714,19 +763,10 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 	// <resource_id>#<action>#<run_version>#<event_version>
 	eventKey := bytes.Join([][]byte{eventIdentifier, event.GetRunVersion(), version}, keySeparator)
 
-	// ACTIVE Bucket
-	// <resource_name>#<resource_id>#<action>#<run_version_or_empty>
-	activeKeyVersion := ulid.ULID{}
-	if run.Queue != "" {
-		activeKeyVersion = run.StartVersion
-	}
-
-	activeKeyVersionBytes, err := activeKeyVersion.MarshalText()
+	aeEventKey, err := activeKey(run)
 	if err != nil {
 		return ulid.ULID{}, err
 	}
-
-	aeEventKey := bytes.Join([][]byte{[]byte(event.GetResourceType()), eventIdentifier, activeKeyVersionBytes}, keySeparator)
 	parentBytes := optionalVersionBytes(run.Parent)
 	var aeEventBytes []byte
 	if event.GetType() == fsmv1.EventType_EVENT_TYPE_START {

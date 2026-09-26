@@ -54,9 +54,6 @@ func (s *adminServer) ListActive(ctx context.Context, _ *connect.Request[fsmv1.L
 			CurrentState: rs.CurrentState,
 			Queue:        rs.Queue,
 		}
-		if rs.TransitionVersion.Compare(ulid.ULID{}) != 0 {
-			af.TransitionVersion = rs.TransitionVersion.String()
-		}
 		// TODO - What should we do about Error.State here?
 		if rs.Error.Err != nil {
 			af.Error = rs.Error.Err.Error()
