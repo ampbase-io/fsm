@@ -43,6 +43,9 @@ const (
 	// A single subject (the version rides in RunEvent.run_version) keeps subscription static,
 	// matching the RFC's "every worker subscribes and checks the version against its running set".
 	subjectCancel = "fsm.run.cancel"
+	// subjectSignal is a broadcast like subjectCancel: every worker hears it and pulls its signal
+	// sweep forward, and only the node executing the run delivers.
+	subjectSignal = "fsm.run.signal"
 )
 
 // doneSubject addresses the completion of a single run; a waiter subscribes to it to be
@@ -77,22 +80,22 @@ func busIsLive(b EventBus) bool {
 	return !noop
 }
 
-// subscribeSignal turns a subscription into a coalescing wakeup channel: the callback does a
+// subscribeWakeup turns a subscription into a coalescing wakeup channel: the callback does a
 // non-blocking send into a size-1 buffer, so a burst of events collapses to a single pending
 // wakeup and never blocks the bus. A failed subscription logs and returns a no-op unsubscribe,
 // leaving the caller on its polling floor. The internal fast paths — WaitRun's done wait, the
 // claim wakeup, the cancel sweep — consume it and ignore the payload, routing on the subject.
-func subscribeSignal(bus EventSubscriber, subject string, logger *slog.Logger) (<-chan struct{}, func()) {
-	signal := make(chan struct{}, 1)
+func subscribeWakeup(bus EventSubscriber, subject string, logger *slog.Logger) (<-chan struct{}, func()) {
+	wake := make(chan struct{}, 1)
 	unsubscribe, err := bus.Subscribe(subject, func(*fsmv1.RunEvent) {
 		select {
-		case signal <- struct{}{}:
+		case wake <- struct{}{}:
 		default:
 		}
 	})
 	if err != nil {
 		logger.Warn("event subscribe failed, relying on the polling floor", "error", err, "subject", subject)
-		return signal, func() {}
+		return wake, func() {}
 	}
-	return signal, unsubscribe
+	return wake, unsubscribe
 }

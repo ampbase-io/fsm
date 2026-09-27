@@ -63,6 +63,23 @@ message StateEvent {
   // Zero on every other event, including the COMPLETE a repeated transition records when its
   // predicate answers RepeatDone, which marks the transition finished.
   uint32 iterations_completed = 12;
+
+  // signal is, on a SIGNAL event, the signal the run accepted.
+  Signal signal = 13;
+
+  // consumed_signals is, on a COMPLETE, the IDs of the signals the transition received, now
+  // consumed.
+  repeated string consumed_signals = 14;
+}
+
+// Signal is a named message sent to a run: its ID (a ULID minted when it was accepted), its
+// name as declared on the run's FSM, and its payload encoded with that declaration's codec.
+message Signal {
+  string id = 1;
+
+  string name = 2;
+
+  bytes payload = 3;
 }
 
 // HaltKind is how a run halted: the classification of the error recorded beside it.
@@ -86,6 +103,8 @@ enum EventType {
   EVENT_TYPE_COMPLETE = 3;
   EVENT_TYPE_FINISH = 4;
   EVENT_TYPE_CANCEL = 5;
+  // EVENT_TYPE_SIGNAL records a signal the run accepted; it is written by the accepting node.
+  EVENT_TYPE_SIGNAL = 6;
 }
 
 message HistoryEvent {
@@ -103,6 +122,7 @@ enum RunEventKind {
   RUN_EVENT_KIND_TRANSITION = 2; // a durable transition; see RunEvent.type
   RUN_EVENT_KIND_DONE = 3; // a run's finish cleanup completed; waiters may resolve
   RUN_EVENT_KIND_CANCEL = 4; // a cancel was requested (broadcast)
+  RUN_EVENT_KIND_SIGNAL = 5; // a signal was accepted (broadcast)
 }
 
 // RunEvent is the payload published on the event bus for a run-lifecycle event. It is a

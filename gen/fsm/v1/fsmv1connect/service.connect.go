@@ -44,6 +44,8 @@ const (
 	FSMServiceWaitProcedure = "/fsm.v1.FSMService/Wait"
 	// FSMServiceCancelProcedure is the fully-qualified name of the FSMService's Cancel RPC.
 	FSMServiceCancelProcedure = "/fsm.v1.FSMService/Cancel"
+	// FSMServiceSignalProcedure is the fully-qualified name of the FSMService's Signal RPC.
+	FSMServiceSignalProcedure = "/fsm.v1.FSMService/Signal"
 	// FSMServiceRunsProcedure is the fully-qualified name of the FSMService's Runs RPC.
 	FSMServiceRunsProcedure = "/fsm.v1.FSMService/Runs"
 	// FSMServiceHistoryProcedure is the fully-qualified name of the FSMService's History RPC.
@@ -61,6 +63,9 @@ type FSMServiceClient interface {
 	Wait(context.Context, *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error)
 	// Cancel records a durable cancel for the run; the owning worker reacts.
 	Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error)
+	// Signal records a signal for the run once its name and payload match the run's FSM; the
+	// owning worker delivers it.
+	Signal(context.Context, *connect.Request[v1.SignalRequest]) (*connect.Response[v1.SignalResponse], error)
 	// Runs lists the versions of every run recorded for a resource id, oldest first.
 	Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error)
 	// History returns the archived terminal record for a completed run.
@@ -108,6 +113,12 @@ func NewFSMServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...
 			connect.WithSchema(fSMServiceMethods.ByName("Cancel")),
 			connect.WithClientOptions(opts...),
 		),
+		signal: connect.NewClient[v1.SignalRequest, v1.SignalResponse](
+			httpClient,
+			baseURL+FSMServiceSignalProcedure,
+			connect.WithSchema(fSMServiceMethods.ByName("Signal")),
+			connect.WithClientOptions(opts...),
+		),
 		runs: connect.NewClient[v1.RunsRequest, v1.RunsResponse](
 			httpClient,
 			baseURL+FSMServiceRunsProcedure,
@@ -130,6 +141,7 @@ type fSMServiceClient struct {
 	start          *connect.Client[v1.StartRequest, v1.StartResponse]
 	wait           *connect.Client[v1.WaitRequest, v1.WaitResponse]
 	cancel         *connect.Client[v1.CancelRequest, v1.CancelResponse]
+	signal         *connect.Client[v1.SignalRequest, v1.SignalResponse]
 	runs           *connect.Client[v1.RunsRequest, v1.RunsResponse]
 	history        *connect.Client[v1.HistoryRequest, v1.HistoryEvent]
 }
@@ -159,6 +171,11 @@ func (c *fSMServiceClient) Cancel(ctx context.Context, req *connect.Request[v1.C
 	return c.cancel.CallUnary(ctx, req)
 }
 
+// Signal calls fsm.v1.FSMService.Signal.
+func (c *fSMServiceClient) Signal(ctx context.Context, req *connect.Request[v1.SignalRequest]) (*connect.Response[v1.SignalResponse], error) {
+	return c.signal.CallUnary(ctx, req)
+}
+
 // Runs calls fsm.v1.FSMService.Runs.
 func (c *fSMServiceClient) Runs(ctx context.Context, req *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error) {
 	return c.runs.CallUnary(ctx, req)
@@ -180,6 +197,9 @@ type FSMServiceHandler interface {
 	Wait(context.Context, *connect.Request[v1.WaitRequest]) (*connect.Response[v1.WaitResponse], error)
 	// Cancel records a durable cancel for the run; the owning worker reacts.
 	Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error)
+	// Signal records a signal for the run once its name and payload match the run's FSM; the
+	// owning worker delivers it.
+	Signal(context.Context, *connect.Request[v1.SignalRequest]) (*connect.Response[v1.SignalResponse], error)
 	// Runs lists the versions of every run recorded for a resource id, oldest first.
 	Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error)
 	// History returns the archived terminal record for a completed run.
@@ -223,6 +243,12 @@ func NewFSMServiceHandler(svc FSMServiceHandler, opts ...connect.HandlerOption) 
 		connect.WithSchema(fSMServiceMethods.ByName("Cancel")),
 		connect.WithHandlerOptions(opts...),
 	)
+	fSMServiceSignalHandler := connect.NewUnaryHandler(
+		FSMServiceSignalProcedure,
+		svc.Signal,
+		connect.WithSchema(fSMServiceMethods.ByName("Signal")),
+		connect.WithHandlerOptions(opts...),
+	)
 	fSMServiceRunsHandler := connect.NewUnaryHandler(
 		FSMServiceRunsProcedure,
 		svc.Runs,
@@ -247,6 +273,8 @@ func NewFSMServiceHandler(svc FSMServiceHandler, opts ...connect.HandlerOption) 
 			fSMServiceWaitHandler.ServeHTTP(w, r)
 		case FSMServiceCancelProcedure:
 			fSMServiceCancelHandler.ServeHTTP(w, r)
+		case FSMServiceSignalProcedure:
+			fSMServiceSignalHandler.ServeHTTP(w, r)
 		case FSMServiceRunsProcedure:
 			fSMServiceRunsHandler.ServeHTTP(w, r)
 		case FSMServiceHistoryProcedure:
@@ -278,6 +306,10 @@ func (UnimplementedFSMServiceHandler) Wait(context.Context, *connect.Request[v1.
 
 func (UnimplementedFSMServiceHandler) Cancel(context.Context, *connect.Request[v1.CancelRequest]) (*connect.Response[v1.CancelResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Cancel is not implemented"))
+}
+
+func (UnimplementedFSMServiceHandler) Signal(context.Context, *connect.Request[v1.SignalRequest]) (*connect.Response[v1.SignalResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("fsm.v1.FSMService.Signal is not implemented"))
 }
 
 func (UnimplementedFSMServiceHandler) Runs(context.Context, *connect.Request[v1.RunsRequest]) (*connect.Response[v1.RunsResponse], error) {

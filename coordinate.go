@@ -111,15 +111,19 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 	defer wake.Stop()
 	wakeArmed := false
 
-	pending, unsubscribePending := subscribeSignal(m.bus, subjectPending, m.logger)
+	pending, unsubscribePending := subscribeWakeup(m.bus, subjectPending, m.logger)
 	defer unsubscribePending()
 
 	// A cancel is a broadcast: every worker hears it and sweeps, and its owned-intersection —
 	// not the subject — decides which node reacts. The heartbeat sweep is the correctness floor;
 	// this event just pulls it forward. No jitter: the sweep touches only runs this node owns,
 	// so there is no CAS herd to stagger.
-	canceled, unsubscribeCancel := subscribeSignal(m.bus, subjectCancel, m.logger)
+	canceled, unsubscribeCancel := subscribeWakeup(m.bus, subjectCancel, m.logger)
 	defer unsubscribeCancel()
+
+	// A signal is a broadcast like a cancel; the executing node's sweep delivers it.
+	signaled, unsubscribeSignal := subscribeWakeup(m.bus, subjectSignal, m.logger)
+	defer unsubscribeSignal()
 
 	// runClaim scans for claimable runs unless the manager is shutting down, in which case it
 	// reports false so the loop returns without starting a pass it won't wait out.
@@ -152,6 +156,7 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 			lc.extendLeases(ctx)
 			m.cancelUnleased(lc)
 			m.sweepCancellations(ctx, lc)
+			m.sweepSignals(ctx)
 		case <-claim.C:
 			if !runClaim() {
 				return
@@ -170,6 +175,8 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 			armWake()
 		case <-canceled:
 			m.sweepCancellations(ctx, lc)
+		case <-signaled:
+			m.sweepSignals(ctx)
 		}
 	}
 }

@@ -156,6 +156,27 @@ func (s *adminServer) Cancel(ctx context.Context, req *connect.Request[fsmv1.Can
 	return connect.NewResponse(&fsmv1.CancelResponse{}), nil
 }
 
+// Signal records a signal for the run once its name and payload match the run's FSM, and returns
+// its ID. A finished or unknown run reports CodeNotFound; an undeclared name or a payload that does
+// not decode as its declared type, CodeInvalidArgument.
+func (s *adminServer) Signal(ctx context.Context, req *connect.Request[fsmv1.SignalRequest]) (*connect.Response[fsmv1.SignalResponse], error) {
+	version, err := ulid.Parse(req.Msg.GetVersion())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+
+	id, err := s.m.SendSignal(ctx, version, req.Msg.GetName(), req.Msg.GetPayload())
+	switch {
+	case errors.Is(err, ErrFsmNotFound), errors.Is(err, errFSMNotRegistered):
+		return nil, connect.NewError(connect.CodeNotFound, err)
+	case errors.Is(err, errSignalNotDeclared), errors.Is(err, errInvalidSignal):
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	case err != nil:
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&fsmv1.SignalResponse{Id: id.String()}), nil
+}
+
 // Runs lists the versions of every run recorded for a resource id, oldest first.
 func (s *adminServer) Runs(ctx context.Context, req *connect.Request[fsmv1.RunsRequest]) (*connect.Response[fsmv1.RunsResponse], error) {
 	runs, err := s.m.Runs(ctx, req.Msg.GetId())

@@ -17,7 +17,7 @@ import (
 
 // blockingFSM registers a single-transition FSM whose transition signals entered and then blocks
 // until block is closed (or the run is canceled).
-func blockingFSM(t *testing.T, m *Manager, action string, entered chan<- struct{}, block <-chan struct{}) Start[orderReq, orderResp] {
+func blockingFSM(t *testing.T, m *Manager, action string, entered chan<- struct{}, block <-chan struct{}, opts ...EndOption[orderReq, orderResp]) Start[orderReq, orderResp] {
 	t.Helper()
 
 	start, _, err := m.Register[orderReq, orderResp](action).
@@ -30,7 +30,7 @@ func blockingFSM(t *testing.T, m *Manager, action string, entered chan<- struct{
 				return nil, ctx.Err()
 			}
 		}).
-		End("done").
+		End("done", opts...).
 		Build(context.Background())
 	if err != nil {
 		t.Fatalf("failed to build %s FSM: %v", action, err)

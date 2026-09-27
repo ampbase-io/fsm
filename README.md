@@ -138,6 +138,55 @@ the run's lease is held until its finalizers return, so that wait may take minut
 still ends on `ErrShutdown` and `ErrLeaseLost`, and a finalizer runs again if the run is resumed
 before it finished.
 
+## Signals
+
+A signal is a named, typed message sent to a running run, read by whichever transition asks for
+that name. Declare each signal once, accept it on the FSM, send it from any node, and receive it
+in a transition:
+
+```go
+var Advance = fsm.NewSignal[Command]("advance")
+
+End("done", fsm.WithSignals[Req, Resp](Advance))
+
+id, err := Advance.Send(ctx, m, version, &Command{Reason: "looks good"})
+
+// in a transition
+select {
+case adv := <-Advance.Receive(req): // adv.ID, adv.SentAt, adv.Msg (*Command)
+case <-ctx.Done():
+}
+```
+
+- **Delivered at least once.** A signal is consumed when the transition that received it records
+  its COMPLETE. A retry, a restart or a takeover before then receives it again with the same ID,
+  so a handler that must act once dedupes on the ID.
+- **Only a receive consumes.** A transition that never reads a name consumes none of its signals
+  by completing; they wait for a transition that reads them, and are discarded when the run
+  finishes.
+- **Ordered by ID, best effort.** Signals accepted close together on different nodes can arrive
+  out of ID order, so dedupe on the set of applied IDs, never on the highest one.
+- **Refused at the door.** A finished or unknown run refuses with `ErrFsmNotFound`. A name the
+  FSM did not accept, or a payload that does not decode, refuses with an error (`InvalidArgument`
+  over the `Signal` RPC). The sending `Manager` must have the run's FSM registered to check them.
+  A signal never ends a run; that is what `Cancel` is for.
+
+`Send` takes a `SignalSender`, which the `Manager` is through its `SendSignal`, so a handler that
+sends can be tested with a fake. A transition body that receives can be tested with `MockSignals`:
+
+```go
+req := fsm.MockRequest(fsm.NewRequest(&Req{}, &Resp{}), logger, fsm.Run{})
+sigs := fsm.MockSignals(req, Advance)
+defer sigs.Close()
+sigs.Deliver(Advance, &Command{Reason: "looks good"})
+resp, err := observe(ctx, req)
+consumed := sigs.Received() // what the transition's COMPLETE would consume
+```
+
+On the object storage backend a signal sent on one node reaches the run's owner within one
+heartbeat, sooner with an event bus. [docs/rfc-addendum-signals.md](docs/rfc-addendum-signals.md)
+has the design.
+
 ## Storage backends
 
 State is persisted through a `Store` interface with two implementations, selected by `Config`

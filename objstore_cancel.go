@@ -28,15 +28,8 @@ func (s *objectStore) cancelPrefix() string {
 // ErrFsmNotFound. The owner reacts via its sweep or the broadcast; requestCancel never drives
 // the run itself, so a cancel accepted on any node reaches whichever node owns the run.
 func (s *objectStore) requestCancel(ctx context.Context, version ulid.ULID, cause error) error {
-	manifest, _, err := s.getManifest(ctx, version)
-	switch {
-	case errors.Is(err, ErrFsmNotFound):
-		return ErrFsmNotFound
-	case err != nil:
+	if _, err := s.liveRun(ctx, version); err != nil {
 		return err
-	}
-	if manifestTerminal(manifest) {
-		return ErrFsmNotFound
 	}
 
 	switch err := s.putIfAbsent(ctx, s.cancelKey(version), []byte(cause.Error())); {
@@ -47,7 +40,7 @@ func (s *objectStore) requestCancel(ctx context.Context, version ulid.ULID, caus
 	}
 
 	if busIsLive(s.bus) {
-		s.publishSignal(subjectCancel, fsmv1.RunEventKind_RUN_EVENT_KIND_CANCEL, version, cause.Error())
+		s.publishControl(subjectCancel, fsmv1.RunEventKind_RUN_EVENT_KIND_CANCEL, version, cause.Error())
 	}
 	return nil
 }
