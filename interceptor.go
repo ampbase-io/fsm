@@ -36,6 +36,7 @@ func (m *Manager) finisher[R, W any](finalizers []FinalizerFunc) func(context.Co
 		if run.fsmErr.Err == nil {
 			event.Response = req.response
 		}
+		event.DiscardedSignals = m.discardedSignals(ctx, run, req.mailbox())
 
 		if _, err := m.store.Append(ctx, run, event); err != nil {
 			logger.ErrorContext(ctx, "failed to append complete event", "error", err)

@@ -649,6 +649,51 @@ func TestMockSignals(t *testing.T) {
 	}
 }
 
+// TestSignalDiscardedAtFinish verifies a run's FINISH, as History returns it, lists the signals it
+// accepted and never read, and not those it read.
+func TestSignalDiscardedAtFinish(t *testing.T) { runBackends(t, testSignalDiscardedAtFinish) }
+
+func testSignalDiscardedAtFinish(t *testing.T, b *backend) {
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	start, _, err := m.Register[orderReq, orderResp]("signal-discarded").
+		Start("wait", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			select {
+			case <-testAdvance.Receive(req):
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done", acceptTestSignals()).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+	version := startOrder(t, start, "signal-11")
+	within(t, entered, 10*time.Second, "the transition")
+
+	pause, err := testPause.Send(ctx, m, version, &command{})
+	if err != nil {
+		t.Fatalf("send pause: %v", err)
+	}
+	if _, err := testAdvance.Send(ctx, m, version, &command{}); err != nil {
+		t.Fatalf("send advance: %v", err)
+	}
+	waitRun(t, m, version)
+
+	he, err := m.History(ctx, version)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if got := he.GetLastEvent().GetDiscardedSignals(); !slices.Equal(got, []string{pause.String()}) {
+		t.Fatalf("expected only the unread pause listed discarded, got %v", got)
+	}
+}
+
 func checkStage(stage int) error {
 	if stage != 3 {
 		return errors.New("unexpected stage")

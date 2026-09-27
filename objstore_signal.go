@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
@@ -89,6 +90,22 @@ func (s *objectStore) pendingSignalIDs(ctx context.Context, version ulid.ULID) (
 		ids = append(ids, strings.TrimPrefix(key, s.signalPrefix(version)))
 	}
 	return ids, nil
+}
+
+// unreadSignalIDs returns the run's pending markers that the manifest does not record consumed: a
+// marker whose delete failed is listed but was read, so it is not unread.
+func (s *objectStore) unreadSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error) {
+	ids, err := s.pendingSignalIDs(ctx, version)
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	manifest, _, err := s.getManifest(ctx, version)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(ids, func(id string) bool {
+		return slices.Contains(manifest.GetConsumedSignals(), id)
+	}), nil
 }
 
 // signal reads one pending signal's marker.

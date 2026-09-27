@@ -163,7 +163,8 @@ case <-ctx.Done():
   so a handler that must act once dedupes on the ID.
 - **Only a receive consumes.** A transition that never reads a name consumes none of its signals
   by completing; they wait for a transition that reads them, and are discarded when the run
-  finishes.
+  finishes. The FINISH event, as `History` returns it, lists their IDs (`discarded_signals`),
+  best effort, so a consumer can record the drop.
 - **Ordered by ID, best effort.** Signals accepted close together on different nodes can arrive
   out of ID order, so dedupe on the set of applied IDs, never on the highest one.
 - **Refused at the door.** A finished or unknown run refuses with `ErrFsmNotFound`. A name the
