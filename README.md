@@ -188,6 +188,23 @@ On the object storage backend a signal sent on one node reaches the run's owner 
 heartbeat, sooner with an event bus. [docs/rfc-addendum-signals.md](docs/rfc-addendum-signals.md)
 has the design.
 
+## Serving the control API
+
+A process that does not embed a `Manager` starts, waits on, cancels and signals runs through the
+Connect-RPC service in `gen/fsm/v1/fsmv1connect`. The manager serves it on its admin unix socket
+(`Config.AdminSocketPath`). To serve it on a listener of your own, mount `ServiceHandler`:
+
+```go
+path, handler := m.ServiceHandler(connect.WithInterceptors(auth))
+mux := http.NewServeMux()
+mux.Handle(path, handler)
+```
+
+- **fsm does no authentication.** Whoever reaches the handler can start, cancel and signal runs,
+  so guard a network listener, with an interceptor or in front of it.
+- **`Wait` holds its request open until the run finishes.** Give the server write and idle
+  timeouts long enough for your longest run, or have clients retry `Wait`.
+
 ## Storage backends
 
 State is persisted through a `Store` interface with two implementations, selected by `Config`

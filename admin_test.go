@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
+	"github.com/ampbase-io/fsm/gen/fsm/v1/fsmv1connect"
 
 	"connectrpc.com/connect"
 	"github.com/oklog/ulid/v2"
@@ -530,4 +534,96 @@ func startDetailVersion(connErr *connect.Error) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// TestServiceHandlerOverHTTP verifies the service a caller mounts from ServiceHandler on its own
+// listener serves the control API end to end, through the generated client, against the object
+// backend: a run started over it executes on the worker, takes a signal and finishes; Wait and
+// History report it; a second run is canceled over it.
+func TestServiceHandlerOverHTTP(t *testing.T) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		cfg.ClaimInterval = 50 * time.Millisecond
+		cfg.HeartbeatPeriod = 50 * time.Millisecond
+	})
+	m, _ := b.newManager(nil)
+	ctx := context.Background()
+	_, _, err := m.Register[orderReq, orderResp]("service").
+		Start("wait", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			select {
+			case adv := <-testAdvance.Receive(req):
+				return NewResponse(&orderResp{Status: adv.Msg.Note}), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done", WithSignals[orderReq, orderResp](testAdvance)).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	// A caller's handler options reach the service: this interceptor counts every call it serves.
+	var calls atomic.Int32
+	count := connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			calls.Add(1)
+			return next(ctx, req)
+		}
+	})
+	path, handler := m.ServiceHandler(connect.WithInterceptors(count))
+	mux := http.NewServeMux()
+	mux.Handle(path, handler)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := fsmv1connect.NewFSMServiceClient(server.Client(), server.URL)
+
+	start := func(id string) string {
+		t.Helper()
+		resp, err := client.Start(ctx, connect.NewRequest(&fsmv1.StartRequest{
+			TypeName: "orderReq", Action: "service", Id: id, Resource: []byte(`{"Name":"x"}`),
+		}))
+		if err != nil {
+			t.Fatalf("start %s: %v", id, err)
+		}
+		return resp.Msg.GetVersion()
+	}
+	wait := func(version string) *fsmv1.WaitResponse {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		resp, err := client.Wait(waitCtx, connect.NewRequest(&fsmv1.WaitRequest{Version: version}))
+		if err != nil {
+			t.Fatalf("wait %s: %v", version, err)
+		}
+		return resp.Msg
+	}
+
+	finished := start("svc-1")
+	if _, err := client.Signal(ctx, connect.NewRequest(&fsmv1.SignalRequest{
+		Version: finished, Name: "advance", Payload: []byte(`{"Note":"go"}`),
+	})); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	if w := wait(finished); w.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_UNSPECIFIED || w.GetError() != "" {
+		t.Fatalf("expected the signaled run to succeed, got %+v", w)
+	}
+	history, err := client.History(ctx, connect.NewRequest(&fsmv1.HistoryRequest{RunVersion: finished}))
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if history.Msg.GetLastEvent().GetType() != fsmv1.EventType_EVENT_TYPE_FINISH {
+		t.Fatalf("expected the history to end in FINISH, got %v", history.Msg.GetLastEvent().GetType())
+	}
+
+	canceled := start("svc-2")
+	if _, err := client.Cancel(ctx, connect.NewRequest(&fsmv1.CancelRequest{Version: canceled, Cause: "stop"})); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if w := wait(canceled); w.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_CANCELED {
+		t.Fatalf("expected the second run canceled, got %+v", w)
+	}
+	// Two Starts, a Signal, two Waits, a History and a Cancel.
+	if n := calls.Load(); n != 7 {
+		t.Fatalf("expected the caller's interceptor on all 7 calls, saw %d", n)
+	}
 }

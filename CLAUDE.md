@@ -79,8 +79,9 @@ backend's distributed-execution design is the active work.
   puts them back on offer each attempt. `MockSignals` is the seam for a body under test. The object sender writes the SIGNAL event and
   a `signals/<version>/<id>` marker, never the manifest; the owner finds markers on the heartbeat
   sweep or the `fsm.run.signal` broadcast.
-- `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
-  `proto/fsm/v1/`; generated code in `gen/`.
+- `admin.go` — the Connect-RPC service (control API and admin listings). `Manager.ServiceHandler`
+  returns it as a path and handler for a consumer's own listener; the admin unix socket serves the
+  same one. Proto sources in `proto/fsm/v1/`; generated code in `gen/`.
 - `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like
   the tracer (`Manager`, `retry`, `objectStore`); attribute keys and bucket advice live there.
 - `fsmtest/fake` — the in-memory S3 (`fake.S3`, with fault hooks and counters) and EventBus
