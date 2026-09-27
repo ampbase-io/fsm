@@ -70,11 +70,13 @@ backend's distributed-execution design is the active work.
   iteration's COMPLETE carries `iterations_completed`, a RepeatDone records a COMPLETE with zero
   (which drops the count), and resume starts at `resumeAt` with the count folded from those events (the
   manifest's `iterations` on the object backend).
-- `signal.go` / `mailbox.go` / `objstore_signal.go` / `store_signal.go` — signals. `Manager.signal`
-  is the one send path (Send and the RPC). A run whose FSM accepts signals gets a `mailbox`: one
-  goroutine offering each name's head on an unbuffered channel, so only a completed receive
-  counts; the canceller records those IDs on COMPLETE (`consumed_signals`), and an interceptor
-  inside retry puts them back on offer each attempt. The object sender writes the SIGNAL event and
+- `signal.go` / `mailbox.go` / `objstore_signal.go` / `store_signal.go` — signals.
+  `Manager.SendSignal` is the one send path (`Signal.Send` through `SignalSender`, and the RPC).
+  A run whose FSM accepts signals gets a `mailbox` routing to one typed `outlet[T]` goroutine per
+  name, which owns that name's state and offers its head on an unbuffered channel in a plain
+  `select` (no reflect, no lock), so only a completed receive counts. The canceller records those
+  IDs on COMPLETE (`consumed_signals`), and an interceptor inside retry, outside the repeat gate,
+  puts them back on offer each attempt. `MockSignals` is the seam for a body under test. The object sender writes the SIGNAL event and
   a `signals/<version>/<id>` marker, never the manifest; the owner finds markers on the heartbeat
   sweep or the `fsm.run.signal` broadcast.
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in

@@ -3,7 +3,6 @@ package fsm
 import (
 	"context"
 	"log/slog"
-	"reflect"
 	"slices"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
@@ -11,105 +10,53 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// mailbox delivers one executing run's signals to its transitions. One goroutine owns its state and
-// offers, on every accepted name's unbuffered channel at once, the oldest signal of that name not
-// yet received in this attempt, so a signal counts as received only when a handler's receive
-// completes. Every other method hands that goroutine a function to run: the state needs no lock,
-// and what COMPLETE reads as received is never behind a receive that already happened.
+// mailbox routes one executing run's signals to an outlet per accepted name. Each outlet is a
+// goroutine that owns its name's state and offers the oldest signal of that name not yet received
+// in this attempt on its unbuffered channel, so a signal counts as received only when a handler's
+// receive completes. Every other call hands an outlet an op, which it applies before offering
+// again: no state is shared, so nothing needs a lock, and what an outlet reports as received is
+// never behind a receive that already happened.
 //
 // A run whose FSM accepts no signals has a nil mailbox; close, outlet, received and consume, the
 // methods every run reaches, accept one.
 type mailbox struct {
-	outlets map[string]delivery
-	ctrl    chan func(*mailboxState)
+	outlets map[string]anyOutlet
 	done    chan struct{}
 	logger  *slog.Logger
 }
 
-// mailboxState is what the delivery goroutine owns.
-type mailboxState struct {
-	// pending holds every offered signal not yet consumed, by ID.
-	pending map[string]pendingSignal
-
-	// consumed holds the IDs a COMPLETE has recorded consumed, so a marker whose delete failed
-	// is never offered again.
-	consumed map[string]struct{}
-
-	// received holds the IDs handlers received during the current attempt, in order.
-	received []string
+// anyOutlet is an outlet of any payload type, as the mailbox routes to it.
+type anyOutlet interface {
+	// start runs the outlet's goroutine until done closes.
+	start(done <-chan struct{}, consumed []string, logger *slog.Logger)
+	offer(sig *fsmv1.Signal)
+	beginAttempt()
+	received() []string
+	consume(ids []string)
+	// unseen returns the ids the outlet neither holds nor has consumed.
+	unseen(ids []string) []string
 }
 
-// seen reports whether the mailbox already holds the signal, or has consumed it.
-func (st *mailboxState) seen(id string) bool {
-	_, pending := st.pending[id]
-	_, consumed := st.consumed[id]
-	return pending || consumed
-}
-
-// pendingSignal is a pending signal and its receiver's value, decoded once when offered.
-type pendingSignal struct {
-	sig   *fsmv1.Signal
-	value reflect.Value
-}
-
-// delivery is one accepted signal's channel for one run.
-type delivery interface {
-	channel() reflect.Value
-	// value is the signal as its receiver's Received value.
-	value(sig *fsmv1.Signal) (reflect.Value, error)
-}
-
-type outlet[T any] struct {
-	codec Codec
-	ch    chan Received[T]
-}
-
-func (o *outlet[T]) channel() reflect.Value { return reflect.ValueOf(o.ch) }
-
-func (o *outlet[T]) value(sig *fsmv1.Signal) (reflect.Value, error) {
-	id, err := ulid.Parse(sig.GetId())
-	if err != nil {
-		return reflect.Value{}, err
-	}
-	var msg T
-	if err := o.codec.Unmarshal(sig.GetPayload(), &msg); err != nil {
-		return reflect.Value{}, err
-	}
-	return reflect.ValueOf(Received[T]{ID: id, SentAt: ulid.Time(id.Time()), Msg: &msg}), nil
-}
-
-// newMailbox starts the delivery goroutine for a run whose FSM accepts signals, seeded with the
-// IDs the run has already consumed. It returns nil for one that accepts none.
+// newMailbox starts an outlet for each signal a run's FSM accepts, each seeded with the IDs the
+// run has already consumed. It returns nil for a run whose FSM accepts none.
 func newMailbox(accepted map[string]AnySignal, consumed []string, logger *slog.Logger) *mailbox {
 	if len(accepted) == 0 {
 		return nil
 	}
 	mb := &mailbox{
-		outlets: make(map[string]delivery, len(accepted)),
-		ctrl:    make(chan func(*mailboxState)),
+		outlets: make(map[string]anyOutlet, len(accepted)),
 		done:    make(chan struct{}),
 		logger:  logger,
 	}
 	for name, s := range accepted {
-		mb.outlets[name] = s.newOutlet()
+		o := s.newOutlet()
+		o.start(mb.done, consumed, logger)
+		mb.outlets[name] = o
 	}
-	st := &mailboxState{pending: map[string]pendingSignal{}, consumed: map[string]struct{}{}}
-	for _, id := range consumed {
-		st.consumed[id] = struct{}{}
-	}
-	go mb.deliver(st)
 	return mb
 }
 
-// The delivery goroutine's select: the control channel, the run's end, then one send per name
-// with a signal on offer.
-const (
-	selectCtrl = iota
-	selectDone
-	selectFirstSend
-)
-
-// close stops the delivery goroutine when the run ends.
+// close stops the outlets when the run ends.
 func (mb *mailbox) close() {
 	if mb == nil {
 		return
@@ -117,71 +64,8 @@ func (mb *mailbox) close() {
 	close(mb.done)
 }
 
-// deliver is the mailbox's goroutine: it offers each name's head and applies control functions
-// until the run ends.
-func (mb *mailbox) deliver(st *mailboxState) {
-	for {
-		cases, heads := mb.cases(st)
-		chosen, recv, _ := reflect.Select(cases)
-		switch chosen {
-		case selectCtrl:
-			recv.Interface().(func(*mailboxState))(st)
-		case selectDone:
-			return
-		default:
-			st.received = append(st.received, heads[chosen-selectFirstSend])
-		}
-	}
-}
-
-// cases is the delivery goroutine's select, laid out as the select constants say; heads holds the
-// IDs of its sends, in case order.
-func (mb *mailbox) cases(st *mailboxState) (cases []reflect.SelectCase, heads []string) {
-	cases = []reflect.SelectCase{
-		selectCtrl: {Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.ctrl)},
-		selectDone: {Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.done)},
-	}
-	for name, o := range mb.outlets {
-		p, ok := st.head(name)
-		if !ok {
-			continue
-		}
-		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectSend, Chan: o.channel(), Send: p.value})
-		heads = append(heads, p.sig.GetId())
-	}
-	return cases, heads
-}
-
-// head is the oldest pending signal of name not received in this attempt.
-func (st *mailboxState) head(name string) (pendingSignal, bool) {
-	var (
-		head  pendingSignal
-		found bool
-	)
-	for id, p := range st.pending {
-		if p.sig.GetName() != name || slices.Contains(st.received, id) {
-			continue
-		}
-		if !found || id < head.sig.GetId() {
-			head, found = p, true
-		}
-	}
-	return head, found
-}
-
-// do runs f on the delivery goroutine and waits for it; once the run has ended it does nothing.
-func (mb *mailbox) do(f func(*mailboxState)) {
-	ran := make(chan struct{})
-	select {
-	case mb.ctrl <- func(st *mailboxState) { f(st); close(ran) }:
-	case <-mb.done:
-		return
-	}
-	<-ran
-}
-
-// outlet returns the delivery of an accepted signal name.
-func (mb *mailbox) outlet(name string) (delivery, bool) {
+// outlet returns the outlet of an accepted signal name.
+func (mb *mailbox) outlet(name string) (anyOutlet, bool) {
 	if mb == nil {
 		return nil, false
 	}
@@ -189,44 +73,26 @@ func (mb *mailbox) outlet(name string) (delivery, bool) {
 	return o, ok
 }
 
-// offer adds signals to the pending set, decoded, skipping any already pending or consumed. A
-// signal that does not decode was validated when accepted, so its record is corrupt: it is
-// logged and never offered.
+// offer routes each signal to its name's outlet. A signal whose name the running definition does
+// not accept, left by an earlier one, is logged and never offered.
 func (mb *mailbox) offer(sigs ...*fsmv1.Signal) {
-	mb.do(func(st *mailboxState) {
-		for _, sig := range sigs {
-			if st.seen(sig.GetId()) {
-				continue
-			}
-			o, ok := mb.outlets[sig.GetName()]
-			if !ok {
-				// Accepted under a definition that declared the name, since changed.
-				mb.logger.Error("signal name not accepted by this run's FSM, not offering it", "signal", sig.GetId(), "name", sig.GetName())
-				continue
-			}
-			v, err := o.value(sig)
-			if err != nil {
-				mb.logger.Error("failed to decode signal, not offering it", "error", err, "signal", sig.GetId(), "name", sig.GetName())
-				continue
-			}
-			st.pending[sig.GetId()] = pendingSignal{sig: sig, value: v}
+	for _, sig := range sigs {
+		o, ok := mb.outlets[sig.GetName()]
+		if !ok {
+			mb.logger.Error("signal name not accepted by this run's FSM, not offering it", "signal", sig.GetId(), "name", sig.GetName())
+			continue
 		}
-	})
+		o.offer(sig)
+	}
 }
 
-// refresh reads, and offers, the run's pending signals among ids that the mailbox has not seen.
+// refresh reads, and offers, the run's pending signals among ids that no outlet has seen.
 func (mb *mailbox) refresh(ctx context.Context, store signalStore, version ulid.ULID, ids []string) {
-	var unseen []string
-	mb.do(func(st *mailboxState) {
-		for _, id := range ids {
-			if !st.seen(id) {
-				unseen = append(unseen, id)
-			}
-		}
-	})
-
-	sigs := make([]*fsmv1.Signal, 0, len(unseen))
-	for _, id := range unseen {
+	for _, o := range mb.outlets {
+		ids = o.unseen(ids)
+	}
+	sigs := make([]*fsmv1.Signal, 0, len(ids))
+	for _, id := range ids {
 		sig, err := store.signal(ctx, version, id)
 		if err != nil {
 			mb.logger.ErrorContext(ctx, "failed to read pending signal", "error", err, versionAttr(version), "signal", id)
@@ -240,7 +106,9 @@ func (mb *mailbox) refresh(ctx context.Context, store signalStore, version ulid.
 // beginAttempt puts every signal received in a failed attempt back on offer: a retried
 // transition receives the unconsumed signals again.
 func (mb *mailbox) beginAttempt() {
-	mb.do(func(st *mailboxState) { st.received = nil })
+	for _, o := range mb.outlets {
+		o.beginAttempt()
+	}
 }
 
 // received returns the IDs handlers received in the current attempt, which the transition's
@@ -250,7 +118,9 @@ func (mb *mailbox) received() []string {
 		return nil
 	}
 	var ids []string
-	mb.do(func(st *mailboxState) { ids = slices.Clone(st.received) })
+	for _, o := range mb.outlets {
+		ids = append(ids, o.received()...)
+	}
 	return ids
 }
 
@@ -259,10 +129,206 @@ func (mb *mailbox) consume(ids []string) {
 	if mb == nil || len(ids) == 0 {
 		return
 	}
-	mb.do(func(st *mailboxState) {
-		for _, id := range ids {
-			delete(st.pending, id)
-			st.consumed[id] = struct{}{}
+	for _, o := range mb.outlets {
+		o.consume(ids)
+	}
+}
+
+// outlet delivers one accepted signal name's signals for one run. Its goroutine alone touches
+// pending, consumed and received; everything else reaches them through ops.
+type outlet[T any] struct {
+	codec Codec
+	ch    chan Received[T]
+	ops   chan outletOp
+
+	// replies carries received's answer. It is allocated once, since only the run's own
+	// goroutine asks.
+	replies chan []string
+
+	done   <-chan struct{}
+	logger *slog.Logger
+
+	// pending holds this name's offered signals not yet consumed, decoded, by ID.
+	pending map[string]Received[T]
+
+	// consumed holds the IDs a COMPLETE recorded consumed, so a marker whose delete failed is
+	// never offered again.
+	consumed map[string]struct{}
+
+	// taken holds the IDs handlers received during the current attempt, in order.
+	taken []string
+}
+
+type opKind int
+
+const (
+	opOffer opKind = iota
+	opBegin
+	opConsume
+	opReceived
+	opUnseen
+)
+
+// outletOp is one call handed to an outlet's goroutine.
+type outletOp struct {
+	kind  opKind
+	sig   *fsmv1.Signal
+	ids   []string
+	reply chan []string
+}
+
+func newOutlet[T any](codec Codec) *outlet[T] {
+	return &outlet[T]{
+		codec:    codec,
+		ch:       make(chan Received[T]),
+		ops:      make(chan outletOp),
+		replies:  make(chan []string),
+		pending:  map[string]Received[T]{},
+		consumed: map[string]struct{}{},
+	}
+}
+
+func (o *outlet[T]) start(done <-chan struct{}, consumed []string, logger *slog.Logger) {
+	o.done, o.logger = done, logger
+	for _, id := range consumed {
+		o.consumed[id] = struct{}{}
+	}
+	go o.run()
+}
+
+// run offers the head signal while applying ops, until the run ends. With nothing to offer the
+// send case is on a nil channel, which never proceeds.
+func (o *outlet[T]) run() {
+	for {
+		send, id, head := o.offering()
+		select {
+		case send <- head:
+			o.taken = append(o.taken, id)
+		case op := <-o.ops:
+			o.apply(op)
+		case <-o.done:
+			return
 		}
-	})
+	}
+}
+
+// offering is the channel to offer the head signal on, with its ID and value: the oldest pending
+// signal not received in this attempt, or a nil channel when there is none.
+func (o *outlet[T]) offering() (chan<- Received[T], string, Received[T]) {
+	var head string
+	for id := range o.pending {
+		if slices.Contains(o.taken, id) {
+			continue
+		}
+		if head == "" || id < head {
+			head = id
+		}
+	}
+	if head == "" {
+		return nil, "", Received[T]{}
+	}
+	return o.ch, head, o.pending[head]
+}
+
+func (o *outlet[T]) apply(op outletOp) {
+	switch op.kind {
+	case opOffer:
+		o.add(op.sig)
+	case opBegin:
+		o.taken = nil
+	case opConsume:
+		for _, id := range op.ids {
+			if _, ours := o.pending[id]; ours {
+				delete(o.pending, id)
+				o.consumed[id] = struct{}{}
+			}
+		}
+	case opReceived:
+		o.reply(op.reply, o.taken)
+	case opUnseen:
+		o.reply(op.reply, o.unseenOf(op.ids))
+	}
+}
+
+// add decodes and holds a signal the outlet has not seen. A signal that does not decode was
+// validated when accepted, so its record is corrupt: it is logged and never offered.
+func (o *outlet[T]) add(sig *fsmv1.Signal) {
+	if o.seen(sig.GetId()) {
+		return
+	}
+	id, err := ulid.Parse(sig.GetId())
+	if err != nil {
+		o.logger.Error("malformed signal ID, not offering it", "error", err, "signal", sig.GetId())
+		return
+	}
+	var msg T
+	if err := o.codec.Unmarshal(sig.GetPayload(), &msg); err != nil {
+		o.logger.Error("failed to decode signal, not offering it", "error", err, "signal", sig.GetId(), "name", sig.GetName())
+		return
+	}
+	o.pending[sig.GetId()] = Received[T]{ID: id, SentAt: ulid.Time(id.Time()), Msg: &msg}
+}
+
+// seen reports whether the outlet holds the signal, or has consumed it.
+func (o *outlet[T]) seen(id string) bool {
+	_, pending := o.pending[id]
+	_, consumed := o.consumed[id]
+	return pending || consumed
+}
+
+func (o *outlet[T]) unseenOf(ids []string) []string {
+	var unseen []string
+	for _, id := range ids {
+		if !o.seen(id) {
+			unseen = append(unseen, id)
+		}
+	}
+	return unseen
+}
+
+// reply answers an op, unless the run has ended.
+func (o *outlet[T]) reply(to chan []string, ids []string) {
+	select {
+	case to <- ids:
+	case <-o.done:
+	}
+}
+
+// do hands an op to the goroutine. An unbuffered send completes only when the goroutine takes the
+// op, and it applies the op before offering again. Once the run has ended it does nothing.
+func (o *outlet[T]) do(op outletOp) bool {
+	select {
+	case o.ops <- op:
+		return true
+	case <-o.done:
+		return false
+	}
+}
+
+// ask hands the goroutine an op that answers, and waits for the answer.
+func (o *outlet[T]) ask(op outletOp) []string {
+	if !o.do(op) {
+		return nil
+	}
+	select {
+	case ids := <-op.reply:
+		return ids
+	case <-o.done:
+		return nil
+	}
+}
+
+func (o *outlet[T]) offer(sig *fsmv1.Signal) { o.do(outletOp{kind: opOffer, sig: sig}) }
+
+func (o *outlet[T]) beginAttempt() { o.do(outletOp{kind: opBegin}) }
+
+func (o *outlet[T]) consume(ids []string) { o.do(outletOp{kind: opConsume, ids: ids}) }
+
+func (o *outlet[T]) received() []string {
+	return o.ask(outletOp{kind: opReceived, reply: o.replies})
+}
+
+// unseen asks with a reply channel of its own: the sweep and a run's start may ask at once.
+func (o *outlet[T]) unseen(ids []string) []string {
+	return o.ask(outletOp{kind: opUnseen, ids: ids, reply: make(chan []string)})
 }

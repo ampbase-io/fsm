@@ -102,8 +102,8 @@ func (s Signal[T]) check(payload []byte) error {
 	return nil
 }
 
-func (s Signal[T]) newOutlet() delivery {
-	return &outlet[T]{codec: s.codec, ch: make(chan Received[T])}
+func (s Signal[T]) newOutlet() anyOutlet {
+	return newOutlet[T](s.codec)
 }
 
 // AnySignal is a Signal of any payload type: what WithSignals takes and an FSM holds.
@@ -112,8 +112,8 @@ type AnySignal interface {
 	declErr() error
 	// check decodes payload as the signal's type, refusing one that does not.
 	check(payload []byte) error
-	// newOutlet makes the signal's delivery channel for one run.
-	newOutlet() delivery
+	// newOutlet makes the signal's outlet for one run.
+	newOutlet() anyOutlet
 }
 
 type signalsOption[R, W any] []AnySignal
