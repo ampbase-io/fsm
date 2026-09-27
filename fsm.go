@@ -37,6 +37,9 @@ type Request[R, W any] struct {
 	// holds the codec) so the finisher can record it in the terminal record without a codec of
 	// its own.
 	response []byte
+
+	// signals delivers the run's signals; nil for a run whose FSM accepts none.
+	signals *mailbox
 }
 
 func (r *Request[_, _]) Any() any {
@@ -119,6 +122,10 @@ func (r *Request[_, _]) setResponse(b []byte) {
 	r.response = b
 }
 
+func (r *Request[_, _]) mailbox() *mailbox { return r.signals }
+
+func (r *Request[_, _]) withMailbox(mb *mailbox) { r.signals = mb }
+
 // NewRequest creates a new request to be used for starting a FSM.
 func NewRequest[R, W any](msg *R, w *W) *Request[R, W] {
 	return &Request[R, W]{
@@ -143,6 +150,10 @@ type AnyRequest interface {
 	withLeaseEpoch(int64)
 
 	setResponse([]byte)
+
+	mailbox() *mailbox
+
+	withMailbox(*mailbox)
 }
 
 // MockRequest takes an fsm request and customizes it with logger and run
@@ -301,6 +312,9 @@ type fsm struct {
 	// single-process backend uses it, where no claim loop exists to execute a persisted run.
 	// Registered at End().
 	startFromBytes func(context.Context, string, []byte, ...StartOptionsFn) (ulid.ULID, error)
+
+	// signals are the signals the FSM's runs accept, by name. Set at End().
+	signals map[string]AnySignal
 }
 
 // startEvent builds the START event for a run of f with the given id.
@@ -518,7 +532,13 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		request := NewRequest(&req, &w)
 		request.run = r
 
-		run(ctx, request, m, runner, &runInstance{initializers: f.initializers, transitions: remainingTransitions, iterations: resource.iterations})
+		run(ctx, request, m, runner, &runInstance{
+			initializers:    f.initializers,
+			transitions:     remainingTransitions,
+			iterations:      resource.iterations,
+			signals:         f.signals,
+			consumedSignals: resource.consumedSignals,
+		})
 		return nil
 	}
 }
@@ -644,7 +664,7 @@ func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, r
 		}
 		request.run = startedRun
 
-		run(ctx, request, m, r, &runInstance{initializers: f.initializers, transitions: transitions})
+		run(ctx, request, m, r, &runInstance{initializers: f.initializers, transitions: transitions, signals: f.signals})
 
 		return runVersion, nil
 	}
@@ -718,6 +738,11 @@ type runInstance struct {
 	// iterations is where each repeated transition resumes: the number of its iterations already
 	// completed. Nil on a fresh start.
 	iterations map[string]uint32
+
+	// signals are the signals the run's FSM accepts, and consumedSignals the IDs its transitions
+	// have already consumed, where the backend keeps them.
+	signals         map[string]AnySignal
+	consumedSignals []string
 }
 
 func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runInstance) {
@@ -777,9 +802,14 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		runCtx, stop := context.WithCancelCause(ctx)
 		ctx, cancel := context.WithCancelCause(runCtx)
 
+		mb, closeMailbox := newMailbox(ri.signals, ri.consumedSignals, logger)
+		defer closeMailbox()
+		request.withMailbox(mb)
+
 		m.mu.Lock()
-		m.running[runVersion] = runHandle{cancel: cancel, stop: stop}
+		m.running[runVersion] = runHandle{cancel: cancel, stop: stop, mailbox: mb}
 		m.mu.Unlock()
+		m.loadSignals(ctx, runVersion, mb)
 
 		// A lease-coordinated run may have lost ownership before reaching execution — a
 		// delayed or queued dispatch can trail its claim by arbitrarily long. Stop before

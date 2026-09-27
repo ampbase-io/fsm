@@ -83,4 +83,8 @@ message RunManifest {
   // iterations_completed removes its entry, so an entry means the transition may still have
   // iterations to run.
   map<string, uint32> iterations = 29;
+
+  // consumed_signals are the IDs of the signals the run's transitions have consumed. A pending
+  // marker whose ID is here is never offered again, even if deleting it failed.
+  repeated string consumed_signals = 30;
 }

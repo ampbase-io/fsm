@@ -10,6 +10,8 @@ backend's distributed-execution design is the active work.
   `events/`, leases.
 - `docs/rfc-object-storage-addendum-distributed-execution.md` — RPC ingress, the EventBus, and
   subject-addressed cancel.
+- `docs/rfc-addendum-signals.md` — signals: typed handles, at-least-once delivery consumed at
+  COMPLETE, the `signals/` markers, and the sender-never-writes-the-manifest rule.
 
 ## Hard constraints
 - **Object storage is the only required dependency.** No broker/queue/DB in `go.mod`. The
@@ -68,6 +70,13 @@ backend's distributed-execution design is the active work.
   iteration's COMPLETE carries `iterations_completed`, a RepeatDone records a COMPLETE with zero
   (which drops the count), and resume starts at `resumeAt` with the count folded from those events (the
   manifest's `iterations` on the object backend).
+- `signal.go` / `mailbox.go` / `objstore_signal.go` / `store_signal.go` — signals. `Manager.signal`
+  is the one send path (Send and the RPC). A run whose FSM accepts signals gets a `mailbox`: one
+  goroutine offering each name's head on an unbuffered channel, so only a completed receive
+  counts; the canceller records those IDs on COMPLETE (`consumed_signals`), and an interceptor
+  inside retry puts them back on offer each attempt. The object sender writes the SIGNAL event and
+  a `signals/<version>/<id>` marker, never the manifest; the owner finds markers on the heartbeat
+  sweep or the `fsm.run.signal` broadcast.
 - `admin.go` — the Connect-RPC admin service, served on a unix socket. Proto sources in
   `proto/fsm/v1/`; generated code in `gen/`.
 - `metrics.go` — the OTel `instruments`, built once in `New` from the Meter and threaded like

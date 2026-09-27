@@ -19,6 +19,9 @@ service FSMService {
   rpc Wait(WaitRequest) returns (WaitResponse) {}
   // Cancel records a durable cancel for the run; the owning worker reacts.
   rpc Cancel(CancelRequest) returns (CancelResponse) {}
+  // Signal records a signal for the run once its name and payload match the run's FSM; the
+  // owning worker delivers it.
+  rpc Signal(SignalRequest) returns (SignalResponse) {}
   // Runs lists the versions of every run recorded for a resource id, oldest first.
   rpc Runs(RunsRequest) returns (RunsResponse) {}
   // History returns the archived terminal record for a completed run.
@@ -82,6 +85,16 @@ message CancelRequest {
 }
 
 message CancelResponse {}
+
+message SignalRequest {
+  string version = 1;
+  string name = 2;
+  bytes payload = 3;
+}
+message SignalResponse {
+  // id is the accepted signal's ID.
+  string id = 1;
+}
 
 message RunsRequest {
   string id = 1;

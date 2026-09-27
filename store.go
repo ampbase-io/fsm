@@ -167,6 +167,9 @@ func newStore(logger *slog.Logger, tracer trace.Tracer, path string) (*boltStore
 		if _, err := tx.CreateBucketIfNotExists(childrenBucket); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(signalsBucket); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
 		return nil, err
@@ -410,6 +413,10 @@ type activeResource struct {
 
 	// iterations counts the completed iterations of each repeated transition, by name.
 	iterations map[string]uint32
+
+	// consumedSignals are the IDs of signals the run's transitions consumed, where the backend
+	// keeps a pending signal after consuming it.
+	consumedSignals []string
 
 	response []byte
 
@@ -893,10 +900,12 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 			if err := eventB.Put(eventKey, eventBytes); err != nil {
 				return err
 			}
-
-			return nil
+			return consumeSignals(tx, run.StartVersion, event.GetConsumedSignals())
 		case fsmv1.EventType_EVENT_TYPE_FINISH:
 			if err := eventB.Put(eventKey, eventBytes); err != nil {
+				return err
+			}
+			if err := discardSignals(tx, run.StartVersion); err != nil {
 				return err
 			}
 

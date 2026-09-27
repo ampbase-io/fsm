@@ -79,6 +79,18 @@ type Store interface {
 	SetRunning(ctx context.Context, run Run) error
 	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
 	ForgetRun(run Run) error
+
+	// Signals.
+
+	// signalTarget returns the run a signal is addressed to, refusing a terminal or unknown run
+	// with ErrFsmNotFound.
+	signalTarget(ctx context.Context, version ulid.ULID) (Run, error)
+	// recordSignal durably records a validated signal: its SIGNAL event and its pending entry.
+	recordSignal(ctx context.Context, run Run, sig *fsmv1.Signal) error
+	// signalIDs returns the IDs of every pending signal, by run, oldest first.
+	signalIDs(ctx context.Context) (map[ulid.ULID][]string, error)
+	// signal reads one pending signal.
+	signal(ctx context.Context, version ulid.ULID, id string) (*fsmv1.Signal, error)
 }
 
 // cancelRecorder is a backend whose cancels are durable and cluster-visible. A backend without it
@@ -129,6 +141,9 @@ type runHandle struct {
 	// stop ends the run short of an outcome — a shutdown or a lost lease — recording nothing, so
 	// it resumes where it left off.
 	stop context.CancelCauseFunc
+
+	// mailbox delivers the run's signals; nil for a run whose FSM accepts none.
+	mailbox *mailbox
 }
 
 type fsmKey struct {

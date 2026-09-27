@@ -47,7 +47,7 @@ func (s *objectStore) requestCancel(ctx context.Context, version ulid.ULID, caus
 	}
 
 	if busIsLive(s.bus) {
-		s.publishSignal(subjectCancel, fsmv1.RunEventKind_RUN_EVENT_KIND_CANCEL, version, cause.Error())
+		s.publishBroadcast(subjectCancel, fsmv1.RunEventKind_RUN_EVENT_KIND_CANCEL, version, cause.Error())
 	}
 	return nil
 }

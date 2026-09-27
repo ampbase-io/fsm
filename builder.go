@@ -127,6 +127,9 @@ type TransitionConfig[R, W any] struct {
 	// every is the interceptors configured when calling End for every transition but the
 	// finisher.
 	every []TransitionInterceptorFunc
+
+	// signals are the signals the FSM's runs accept, configured when calling End.
+	signals []AnySignal
 }
 
 type Option[R, W any] interface {
@@ -271,10 +274,26 @@ func (s *fsmTransition[R, W]) build(d declaration[R, W], every []TransitionInter
 			retry(s.m.tracer, s.m.instruments, s.m.store),
 		},
 		repeatGate(d.cfg.repeat),
+		signalAttempts(s.f.signals),
 		every,
 		d.cfg.interceptors,
 	)
 	return newTransition(d.name, d.body, d.cfg)
+}
+
+// signalAttempts is the chain's place for putting a run's received signals back on offer at the
+// start of every attempt, so a retry receives what a failed attempt read: none for an FSM that
+// accepts no signals.
+func signalAttempts(accepted map[string]AnySignal) []TransitionInterceptorFunc {
+	if len(accepted) == 0 {
+		return nil
+	}
+	return []TransitionInterceptorFunc{func(next TransitionFunc) TransitionFunc {
+		return func(ctx context.Context, req AnyRequest) (AnyResponse, error) {
+			req.mailbox().beginAttempt()
+			return next(ctx, req)
+		}
+	}}
 }
 
 // repeatGate is a repeated transition's gate as its place in the chain: none for a transition
@@ -315,6 +334,14 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 	for _, opt := range opts {
 		opt.applyEnd(&cfg)
 	}
+
+	accepted, err := acceptedSignals(cfg.signals)
+	if err != nil {
+		s.m.logger.Error("invalid signal declaration", "fsm", s.f.typeName, "error", err)
+		s.buildError = errors.Join(s.buildError, err)
+		return &fsmEnd[R, W]{s.transitionStep}
+	}
+	s.f.signals = accepted
 
 	for _, d := range s.pending {
 		s.f.registeredTransitions[s.f.transitionKey(d.name)] = s.build(d, cfg.every)

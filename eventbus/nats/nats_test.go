@@ -128,7 +128,7 @@ func TestPublishSubscribeRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSubscribeSignalCoalescing mirrors the core's subscribeSignal wrapper — a size-1 buffer fed
+// TestSubscribeSignalCoalescing mirrors the core's subscribeBroadcast wrapper — a size-1 buffer fed
 // by a non-blocking send — end to end against a real NATS: a publish burst must not block the bus
 // and must coalesce to an available wakeup, and a later publish must re-arm it (delivery is
 // ongoing, not a one-shot). This is the pattern WaitRun, claim wakeup, and the cancel sweep all

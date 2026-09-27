@@ -100,6 +100,7 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 			default:
 				logger.DebugContext(ctx, "transition completed successfully")
 				event.IterationsCompleted = run.iterationsCompleted()
+				event.ConsumedSignals = req.mailbox().received()
 				if resp != nil && resp.Any() != nil {
 					b, err := codec.Marshal(resp.Any())
 					if err != nil {
@@ -121,6 +122,8 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				return resp, appendErr
 			case appendErr != nil:
 				logger.ErrorContext(ctx, "failed to append complete event", "error", appendErr)
+			default:
+				req.mailbox().consume(event.GetConsumedSignals())
 			}
 
 			return resp, err

@@ -185,6 +185,10 @@ func (s *objectStore) reapRun(ctx context.Context, version ulid.ULID, manifest *
 	if err := s.deleteObject(ctx, s.cancelKey(version)); err != nil {
 		return err
 	}
+	// Markers of signals the run never read, now inert.
+	if err := s.deletePrefix(ctx, s.signalPrefix(version)); err != nil {
+		return err
+	}
 
 	// The manifest is what the scan finds the run by, so delete it last: a crash before this point
 	// leaves a terminal manifest the next pass re-reaps, never orphaned events.
