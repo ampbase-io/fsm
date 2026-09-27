@@ -168,7 +168,20 @@ case <-ctx.Done():
   out of ID order, so dedupe on the set of applied IDs, never on the highest one.
 - **Refused at the door.** A finished or unknown run refuses with `ErrFsmNotFound`. A name the
   FSM did not accept, or a payload that does not decode, refuses with an error (`InvalidArgument`
-  over the `Signal` RPC). A signal never ends a run; that is what `Cancel` is for.
+  over the `Signal` RPC). The sending `Manager` must have the run's FSM registered to check them.
+  A signal never ends a run; that is what `Cancel` is for.
+
+`Send` takes a `SignalSender`, which the `Manager` is through its `SendSignal`, so a handler that
+sends can be tested with a fake. A transition body that receives can be tested with `MockSignals`:
+
+```go
+req := fsm.MockRequest(fsm.NewRequest(&Req{}, &Resp{}), logger, fsm.Run{})
+sigs := fsm.MockSignals(req, Advance)
+defer sigs.Close()
+sigs.Deliver(Advance, &Command{Reason: "looks good"})
+resp, err := observe(ctx, req)
+consumed := sigs.Received() // what the transition's COMPLETE would consume
+```
 
 On the object storage backend a signal sent on one node reaches the run's owner within one
 heartbeat, sooner with an event bus. [docs/rfc-addendum-signals.md](docs/rfc-addendum-signals.md)

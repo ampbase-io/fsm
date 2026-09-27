@@ -165,7 +165,7 @@ func (s *adminServer) Signal(ctx context.Context, req *connect.Request[fsmv1.Sig
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 
-	id, err := s.m.signal(ctx, version, req.Msg.GetName(), req.Msg.GetPayload())
+	id, err := s.m.SendSignal(ctx, version, req.Msg.GetName(), req.Msg.GetPayload())
 	switch {
 	case errors.Is(err, ErrFsmNotFound), errors.Is(err, errFSMNotRegistered):
 		return nil, connect.NewError(connect.CodeNotFound, err)

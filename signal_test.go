@@ -556,3 +556,102 @@ func testSignalReadByPredicate(t *testing.T, b *backend) {
 		t.Fatalf("expected %v, got %v", want, notes)
 	}
 }
+
+// TestSignalBeforeFirstExecution verifies a signal sent to a run that is pending, not yet
+// executing anywhere, reaches it once it starts.
+func TestSignalBeforeFirstExecution(t *testing.T) { runBackends(t, testSignalBeforeFirstExecution) }
+
+func testSignalBeforeFirstExecution(t *testing.T, b *backend) {
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	got := make(chan ulid.ULID, 1)
+	start, _, err := m.Register[orderReq, orderResp]("signal-early").
+		Start("wait", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			select {
+			case adv := <-testAdvance.Receive(req):
+				got <- adv.ID
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done", acceptTestSignals()).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version, err := start(ctx, "signal-10", NewRequest(&orderReq{}, &orderResp{}), WithDelayedStart(time.Now().Add(300*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("failed to start FSM: %v", err)
+	}
+	id, err := testAdvance.Send(ctx, m, version, &command{})
+	if err != nil {
+		t.Fatalf("send to the pending run failed: %v", err)
+	}
+	if delivered := within(t, got, 10*time.Second, "the signal once the run starts"); delivered != id {
+		t.Fatalf("expected %s, got %s", id, delivered)
+	}
+	waitRun(t, m, version)
+}
+
+// recordingSender is a SignalSender that records what a typed Send hands it.
+type recordingSender struct {
+	name    string
+	payload []byte
+}
+
+func (s *recordingSender) SendSignal(_ context.Context, _ ulid.ULID, name string, payload []byte) (ulid.ULID, error) {
+	s.name, s.payload = name, payload
+	return ulid.Make(), nil
+}
+
+// TestSignalSendThroughSender verifies a typed Send encodes the message with the signal's codec
+// and hands the name and bytes to any SignalSender, so a caller can put the Manager behind an
+// interface.
+func TestSignalSendThroughSender(t *testing.T) {
+	var sender recordingSender
+	if _, err := testAdvance.Send(context.Background(), &sender, ulid.Make(), &command{Stage: 4, Note: "x"}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if sender.name != "advance" {
+		t.Fatalf("expected the signal's name, got %q", sender.name)
+	}
+	if err := testAdvance.check(sender.payload); err != nil {
+		t.Fatalf("expected a payload the declared type decodes: %v", err)
+	}
+}
+
+// TestMockSignals verifies a body under test receives signals through MockSignals as it would in a
+// run: typed, per name, and counted received only once read.
+func TestMockSignals(t *testing.T) {
+	req := MockRequest(NewRequest(&orderReq{}, &orderResp{}), slog.Default(), Run{})
+	sigs := MockSignals(req, testPause, testAdvance)
+	defer sigs.Close()
+
+	id := sigs.Deliver(testAdvance, &command{Stage: 3})
+	sigs.Deliver(testPause, &command{})
+
+	body := func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+		select {
+		case adv := <-testAdvance.Receive(req):
+			return NewResponse(&orderResp{Status: adv.Msg.Note}), checkStage(adv.Msg.Stage)
+		case <-time.After(time.Second):
+			return nil, errors.New("no advance")
+		}
+	}
+	if _, err := body(context.Background(), req); err != nil {
+		t.Fatalf("body failed: %v", err)
+	}
+	if got := sigs.Received(); !slices.Equal(got, []ulid.ULID{id}) {
+		t.Fatalf("expected only the advance received, got %v", got)
+	}
+}
+
+func checkStage(stage int) error {
+	if stage != 3 {
+		return errors.New("unexpected stage")
+	}
+	return nil
+}

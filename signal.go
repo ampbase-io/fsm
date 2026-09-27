@@ -55,11 +55,14 @@ type Received[T any] struct {
 	Msg *T
 }
 
-// Send records the signal for the run and returns its ID. The run must be executing or pending:
-// a finished or unknown run refuses with ErrFsmNotFound. The run's FSM must accept the signal
-// (WithSignals). A transition reading the signal receives it; one sent to a run on another node
-// reaches it through that node's sweep.
-func (s Signal[T]) Send(ctx context.Context, m *Manager, version ulid.ULID, msg *T) (ulid.ULID, error) {
+// SignalSender sends a signal's encoded payload to a run. The Manager is one; a test fakes it.
+type SignalSender interface {
+	SendSignal(ctx context.Context, version ulid.ULID, name string, payload []byte) (ulid.ULID, error)
+}
+
+// Send encodes msg with the signal's codec and sends it to the run through to, usually the
+// Manager, returning the signal's ID. See Manager.SendSignal for what is refused.
+func (s Signal[T]) Send(ctx context.Context, to SignalSender, version ulid.ULID, msg *T) (ulid.ULID, error) {
 	if s.err != nil {
 		return ulid.ULID{}, s.err
 	}
@@ -67,7 +70,7 @@ func (s Signal[T]) Send(ctx context.Context, m *Manager, version ulid.ULID, msg 
 	if err != nil {
 		return ulid.ULID{}, fmt.Errorf("signal %s: %w", s.name, err)
 	}
-	return m.signal(ctx, version, s.name, payload)
+	return to.SendSignal(ctx, version, s.name, payload)
 }
 
 // Receive returns the channel on which the transition running req receives this signal. Signals
@@ -142,9 +145,14 @@ func acceptedSignals(signals []AnySignal) (map[string]AnySignal, error) {
 	return accepted, nil
 }
 
-// signal validates a signal against the run's FSM, records it durably and offers it to the run if
-// it executes here. It is Send's and the RPC's one path.
-func (m *Manager) signal(ctx context.Context, version ulid.ULID, name string, payload []byte) (ulid.ULID, error) {
+// SendSignal records a signal for the run, from its name and its payload encoded with the declared
+// signal's codec, and returns its ID; a transition reading the name receives it, on this node or,
+// through that node's sweep, on the one executing the run. It is the one send path, under
+// Signal.Send and the Signal RPC. The run must be executing or pending: a finished or unknown run
+// refuses with ErrFsmNotFound. This Manager must have the run's FSM registered, since it checks
+// the name is accepted (WithSignals) and the payload decodes as the declared type, refusing
+// either otherwise.
+func (m *Manager) SendSignal(ctx context.Context, version ulid.ULID, name string, payload []byte) (ulid.ULID, error) {
 	run, err := m.store.liveRun(ctx, version)
 	if err != nil {
 		return ulid.ULID{}, err

@@ -50,7 +50,11 @@ id, err := Advance.Send(ctx, m, runVersion, &Command{Reason: "looks good"})
 
 `Send` returns the signal's ID, the same ID the receiving transition sees.
 
+`Send` encodes the message with the signal's codec and hands the name and bytes to a `SignalSender`: the `Manager`'s exported `SendSignal(ctx, version, name, payload)`, or a fake in a caller's tests, so a caller can put the manager behind an interface. `SendSignal` is the one send path. It validates against the run's FSM, so the sending `Manager` must have that FSM registered.
+
 A client without a `Manager` uses the `Signal` RPC, which carries the name and the payload as bytes. The worker decodes the bytes with the declared signal's codec before accepting, as `Start` does for requests.
+
+**Testing a body.** `MockSignals(req, signals...)` gives a request built by `MockRequest` the mailbox a run would give it. `Deliver` offers a typed signal, and `Received` returns what the transition's COMPLETE would consume.
 
 **Receiving.** A transition receives on a channel, so it can `select` over signals beside its own timers and its context:
 
@@ -77,7 +81,7 @@ case <-ctx.Done():
 
 ## Interactions
 
-- **Retries.** Each attempt of a transition starts with every unconsumed signal on offer again, including those a failed attempt received.
+- **Retries.** Each attempt of a transition starts with every unconsumed signal on offer again, including those a failed attempt received. A signal a failed attempt received and the successful attempt does not read again stays unconsumed and reaches the next transition that reads its name, so a consumer's set of applied IDs has to live as long as the run.
 - **`RepeatWhile`.** Every iteration records its own COMPLETE, so each consumes what it received. The predicate may receive signals too; they belong to the attempt it decides, so a signal it receives before `RepeatAgain` is not offered again to that iteration's body, and one it receives before `RepeatDone` is consumed by the COMPLETE that finishes the transition.
 - **A name no longer accepted.** A stored signal whose name the running definition does not accept, left by an earlier definition, is logged and never offered.
 - **Cancel.** Cancel ends the run; signals never do. Unread signals are discarded with the run.
@@ -125,7 +129,7 @@ The admin service gains:
 
 ## History visibility
 
-The SIGNAL event is part of the run's durable event log. The current `History` API returns a run's start record and its last event only, so signals — like every intermediate transition event — are not readable through it. Exposing a run's event log is a separate, general addition and is not part of this addendum. A consumer that shows "who signaled what, when" records that in its own audit trail when it sends.
+The SIGNAL event is part of the run's durable event log. The current `History` API returns a run's start record and its last event only, so signals — like every intermediate transition event — are not readable through it. Exposing a run's event log is a separate, general addition and is not part of this addendum. Until then a consumer's own record, written when it sends, is the only readable trail of who signaled what, and when.
 
 ## Rejected alternatives
 
