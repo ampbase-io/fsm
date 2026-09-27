@@ -11,11 +11,14 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// mailbox delivers one executing run's signals to its transitions. It exists only for a run whose
-// FSM accepts signals. One goroutine owns its state and offers, on every accepted name's
-// unbuffered channel at once, the oldest signal of that name not yet received in this attempt,
-// so a signal counts as received only when a handler's receive completes. Every other method
-// hands that goroutine a function to run, so the state needs no lock.
+// mailbox delivers one executing run's signals to its transitions. One goroutine owns its state and
+// offers, on every accepted name's unbuffered channel at once, the oldest signal of that name not
+// yet received in this attempt, so a signal counts as received only when a handler's receive
+// completes. Every other method hands that goroutine a function to run: the state needs no lock,
+// and what COMPLETE reads as received is never behind a receive that already happened.
+//
+// A run whose FSM accepts no signals has a nil mailbox; close, outlet, received and consume, the
+// methods every run reaches, accept one.
 type mailbox struct {
 	outlets map[string]delivery
 	ctrl    chan func(*mailboxState)
@@ -34,6 +37,13 @@ type mailboxState struct {
 
 	// received holds the IDs handlers received during the current attempt, in order.
 	received []string
+}
+
+// seen reports whether the mailbox already holds the signal, or has consumed it.
+func (st *mailboxState) seen(id string) bool {
+	_, pending := st.pending[id]
+	_, consumed := st.consumed[id]
+	return pending || consumed
 }
 
 // pendingSignal is a pending signal and its receiver's value, decoded once when offered.
@@ -91,6 +101,14 @@ func newMailbox(accepted map[string]AnySignal, consumed []string, logger *slog.L
 	return mb
 }
 
+// The delivery goroutine's select: the control channel, the run's end, then one send per name
+// with a signal on offer.
+const (
+	selectCtrl = iota
+	selectDone
+	selectFirstSend
+)
+
 // close stops the delivery goroutine when the run ends.
 func (mb *mailbox) close() {
 	if mb == nil {
@@ -106,22 +124,22 @@ func (mb *mailbox) deliver(st *mailboxState) {
 		cases, heads := mb.cases(st)
 		chosen, recv, _ := reflect.Select(cases)
 		switch chosen {
-		case 0:
+		case selectCtrl:
 			recv.Interface().(func(*mailboxState))(st)
-		case 1:
+		case selectDone:
 			return
 		default:
-			st.received = append(st.received, heads[chosen-2])
+			st.received = append(st.received, heads[chosen-selectFirstSend])
 		}
 	}
 }
 
-// cases is one select over the control channel, the run's end, and a send of every accepted
-// name's head signal; heads holds the IDs of those sends, in case order.
+// cases is the delivery goroutine's select, laid out as the select constants say; heads holds the
+// IDs of its sends, in case order.
 func (mb *mailbox) cases(st *mailboxState) (cases []reflect.SelectCase, heads []string) {
 	cases = []reflect.SelectCase{
-		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.ctrl)},
-		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.done)},
+		selectCtrl: {Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.ctrl)},
+		selectDone: {Dir: reflect.SelectRecv, Chan: reflect.ValueOf(mb.done)},
 	}
 	for name, o := range mb.outlets {
 		p, ok := st.head(name)
@@ -162,8 +180,7 @@ func (mb *mailbox) do(f func(*mailboxState)) {
 	<-ran
 }
 
-// outlet returns the delivery of an accepted signal name. A nil mailbox — a run whose FSM
-// accepts no signals — has none.
+// outlet returns the delivery of an accepted signal name.
 func (mb *mailbox) outlet(name string) (delivery, bool) {
 	if mb == nil {
 		return nil, false
@@ -178,9 +195,7 @@ func (mb *mailbox) outlet(name string) (delivery, bool) {
 func (mb *mailbox) offer(sigs ...*fsmv1.Signal) {
 	mb.do(func(st *mailboxState) {
 		for _, sig := range sigs {
-			_, pending := st.pending[sig.GetId()]
-			_, consumed := st.consumed[sig.GetId()]
-			if pending || consumed {
+			if st.seen(sig.GetId()) {
 				continue
 			}
 			o, ok := mb.outlets[sig.GetName()]
@@ -204,12 +219,9 @@ func (mb *mailbox) refresh(ctx context.Context, store signalStore, version ulid.
 	var unseen []string
 	mb.do(func(st *mailboxState) {
 		for _, id := range ids {
-			_, pending := st.pending[id]
-			_, consumed := st.consumed[id]
-			if pending || consumed {
-				continue
+			if !st.seen(id) {
+				unseen = append(unseen, id)
 			}
-			unseen = append(unseen, id)
 		}
 	})
 
@@ -232,7 +244,7 @@ func (mb *mailbox) beginAttempt() {
 }
 
 // received returns the IDs handlers received in the current attempt, which the transition's
-// COMPLETE records as consumed. A nil mailbox has received none.
+// COMPLETE records as consumed.
 func (mb *mailbox) received() []string {
 	if mb == nil {
 		return nil
@@ -252,6 +264,5 @@ func (mb *mailbox) consume(ids []string) {
 			delete(st.pending, id)
 			st.consumed[id] = struct{}{}
 		}
-		st.received = nil
 	})
 }
