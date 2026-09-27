@@ -72,8 +72,9 @@ type RunManifest struct {
 	// iterations_completed removes its entry, so an entry means the transition may still have
 	// iterations to run.
 	Iterations map[string]uint32 `protobuf:"bytes,29,rep,name=iterations,proto3" json:"iterations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	// consumed_signals are the IDs of the signals the run's transitions have consumed. A pending
-	// marker whose ID is here is never offered again, even if deleting it failed.
+	// consumed_signals are the IDs of consumed signals whose markers may still exist: the latest
+	// COMPLETE's, and any whose marker delete failed. A pending marker whose ID is here is never
+	// offered again. Once a marker is deleted, the next COMPLETE drops its ID.
 	ConsumedSignals []string `protobuf:"bytes,30,rep,name=consumed_signals,json=consumedSignals,proto3" json:"consumed_signals,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache

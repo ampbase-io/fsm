@@ -190,3 +190,40 @@ func TestObjectCancelBeforeExecutionDiscardsSignals(t *testing.T) {
 		t.Fatalf("expected the FINISH to list %s discarded, got %v", sig.GetId(), got)
 	}
 }
+
+// TestObjectCompletePrunesDeletedSignals verifies the manifest stops keeping a consumed ID once its
+// marker is deleted: the next COMPLETE drops it, so consumed_signals does not grow for the life of
+// the run.
+func TestObjectCompletePrunesDeletedSignals(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	run := startRun(t, s, "sig-prune")
+	first := recordTestSignal(t, s, run, "advance")
+	second := recordTestSignal(t, s, run, "advance")
+
+	completeConsuming(t, s, run, first.GetId())
+	completeConsuming(t, s, run, second.GetId())
+
+	if consumed := mustManifest(t, s, run.StartVersion).GetConsumedSignals(); !slices.Equal(consumed, []string{second.GetId()}) {
+		t.Fatalf("expected only the latest COMPLETE's ID kept, got %v", consumed)
+	}
+}
+
+// TestObjectPruneKeepsFailedDeletes verifies a consumed ID whose marker delete failed stays on the
+// manifest through later COMPLETEs, since its marker is still listed.
+func TestObjectPruneKeepsFailedDeletes(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	run := startRun(t, s, "sig-prune-stuck")
+	stuck := recordTestSignal(t, s, run, "advance")
+	later := recordTestSignal(t, s, run, "advance")
+	h.s3.SetFailDelete(s.signalKey(run.StartVersion, stuck.GetId()))
+
+	completeConsuming(t, s, run, stuck.GetId())
+	completeConsuming(t, s, run, later.GetId())
+
+	consumed := mustManifest(t, s, run.StartVersion).GetConsumedSignals()
+	if !slices.Equal(consumed, []string{stuck.GetId(), later.GetId()}) {
+		t.Fatalf("expected the stuck ID kept beside the latest, got %v", consumed)
+	}
+}

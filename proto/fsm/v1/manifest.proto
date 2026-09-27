@@ -84,7 +84,8 @@ message RunManifest {
   // iterations to run.
   map<string, uint32> iterations = 29;
 
-  // consumed_signals are the IDs of the signals the run's transitions have consumed. A pending
-  // marker whose ID is here is never offered again, even if deleting it failed.
+  // consumed_signals are the IDs of consumed signals whose markers may still exist: the latest
+  // COMPLETE's, and any whose marker delete failed. A pending marker whose ID is here is never
+  // offered again. Once a marker is deleted, the next COMPLETE drops its ID.
   repeated string consumed_signals = 30;
 }
