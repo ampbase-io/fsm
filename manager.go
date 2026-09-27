@@ -18,6 +18,7 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 	"github.com/ampbase-io/fsm/gen/fsm/v1/fsmv1connect"
 
+	"connectrpc.com/connect"
 	"github.com/oklog/ulid/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -299,9 +300,21 @@ func openStore(cfg Config, tracer trace.Tracer, instruments *instruments, logger
 
 // serveAdmin starts the admin RPC service on the given unix socket and tears it down when the
 // manager shuts down.
+// ServiceHandler returns the manager's Connect-RPC service — Start, Wait, Cancel, Signal, Runs,
+// History and the admin listings — as the path and handler to mount on a server, for a process
+// that does not embed a Manager to reach this one over a listener of the caller's choosing. It is
+// the handler the admin unix socket serves.
+//
+// fsm does no authentication: whoever can reach the handler can start, cancel and signal runs, so a
+// network listener must guard it. Wait holds its request open until the run finishes, so the
+// server's write and idle timeouts must allow for that.
+func (m *Manager) ServiceHandler(opts ...connect.HandlerOption) (string, http.Handler) {
+	return fsmv1connect.NewFSMServiceHandler(&adminServer{m: m}, opts...)
+}
+
 func (m *Manager) serveAdmin(socket string) error {
 	mux := http.NewServeMux()
-	mux.Handle(fsmv1connect.NewFSMServiceHandler(&adminServer{m: m}))
+	mux.Handle(m.ServiceHandler())
 	server := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
 
 	os.Remove(socket)

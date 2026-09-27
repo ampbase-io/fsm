@@ -39,12 +39,14 @@ fsm already exposes a Connect-RPC admin service (`ListRegistered`, `ListActive`,
 |`Cancel(version, cause)`|Writes the durable cancel sentinel, then publishes the cancel subject on the bus; the owning worker reacts immediately or on its next lease heartbeat (see Part 2).|
 |`Runs(id)`|Lists the versions of runs recorded for a resource (see base RFC `index/` prefix).|
 |`History(version)`|Returns the archived record for a completed run.|
+|`Signal(version, name, payload)`|Records a signal for the run; see the [signals addendum](rfc-addendum-signals.md).|
 
 Key properties:
 
 - **Persist-then-ack durability.** `Start` returns only after the pending run is durably in object storage. A failed `Start` means *not submitted*; the client retries. Retries are idempotent on the run id — a second `Start` for an already-active id returns `AlreadyRunning` with the existing version, which the base RFC's resource lock already enforces. Once acked, object storage is authoritative and all downstream operations (execution, `Wait`, events, the claim loop) proceed as designed.
 - **Opaque payloads.** The client sends the request as serialized bytes. The worker, which has the FSM's `R`/`W` types registered for that action, decodes with the existing codec system. The client needs only the generated protobuf definitions — not the Go request/response types, and not the fsm library itself.
 - **No new dependency.** The transport is `connectrpc.com/connect`, already a dependency. The ingress is a service the worker optionally hosts; it introduces nothing new to the library's dependency set.
+- **Served where the worker chooses.** `Manager.ServiceHandler(opts...)` returns the service as the path and `http.Handler` to mount, so a worker serves it on a listener of its own, behind whatever authentication its deployment uses; fsm does none. The admin unix socket serves the same handler. `Wait` holds its request open until the run finishes, so the worker's server timeouts must allow for it.
 - **Execution placement.** A worker that accepts a `Start` persists the pending run but need not execute it itself. The claim loop (base RFC Phase 4) distributes pending runs across the worker pool; the accepting worker is simply the one that recorded the submission. This keeps ingress capacity and execution capacity independent.
 
 ## Part 2: Event Publishing and the Event Bus
