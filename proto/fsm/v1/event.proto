@@ -70,6 +70,11 @@ message StateEvent {
   // consumed_signals is, on a COMPLETE, the IDs of the signals the transition received, now
   // consumed.
   repeated string consumed_signals = 14;
+
+  // discarded_signals is, on a FINISH, the IDs of signals the run accepted that no transition
+  // consumed, discarded with the run. Best effort: a signal accepted in the moment the run
+  // finishes may be discarded without being listed.
+  repeated string discarded_signals = 15;
 }
 
 // Signal is a named message sent to a run: its ID (a ULID minted when it was accepted), its

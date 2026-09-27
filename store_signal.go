@@ -109,6 +109,12 @@ func (s *boltStore) pendingSignalIDs(_ context.Context, version ulid.ULID) ([]st
 	return ids, err
 }
 
+// unreadSignalIDs returns the run's pending entries: a consuming COMPLETE deletes its entries in
+// its own transaction, so every one left is unread.
+func (s *boltStore) unreadSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error) {
+	return s.pendingSignalIDs(ctx, version)
+}
+
 // signal reads one pending signal.
 func (s *boltStore) signal(_ context.Context, version ulid.ULID, id string) (*fsmv1.Signal, error) {
 	var sig fsmv1.Signal

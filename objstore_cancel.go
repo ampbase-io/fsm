@@ -104,6 +104,12 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 
 	run := runFromManifest(version, manifest)
 	run.fsmErr = RunErr{Err: halt(cause), State: cancelBeforeExecState}
-	_, err = s.Append(ctx, run, finishEvent(run, cancelBeforeExecState))
+	event := finishEvent(run, cancelBeforeExecState)
+	// A run canceled before it ran read nothing, so every signal sent to it is discarded.
+	event.DiscardedSignals, err = s.unreadSignalIDs(ctx, version)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to list unread signals at cancel", "error", err, versionAttr(version))
+	}
+	_, err = s.Append(ctx, run, event)
 	return err
 }

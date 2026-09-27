@@ -127,18 +127,10 @@ func TestMailboxSkipsUndecodable(t *testing.T) {
 	}
 }
 
-// countingStore is a signalStore serving pending signals from memory and counting their reads.
+// countingStore is a signalReader serving pending signals from memory and counting their reads.
 type countingStore struct {
 	signals map[string]*fsmv1.Signal
 	reads   map[string]int
-}
-
-func (s *countingStore) liveRun(context.Context, ulid.ULID) (Run, error) { return Run{}, nil }
-
-func (s *countingStore) recordSignal(context.Context, Run, *fsmv1.Signal) error { return nil }
-
-func (s *countingStore) pendingSignalIDs(context.Context, ulid.ULID) ([]string, error) {
-	return nil, nil
 }
 
 func (s *countingStore) signal(_ context.Context, _ ulid.ULID, id string) (*fsmv1.Signal, error) {

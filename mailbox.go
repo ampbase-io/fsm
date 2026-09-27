@@ -86,8 +86,13 @@ func (mb *mailbox) offer(sigs ...*fsmv1.Signal) {
 	}
 }
 
+// signalReader reads one pending signal: all refresh needs of a store.
+type signalReader interface {
+	signal(ctx context.Context, version ulid.ULID, id string) (*fsmv1.Signal, error)
+}
+
 // refresh reads, and offers, the run's pending signals among ids that no outlet has seen.
-func (mb *mailbox) refresh(ctx context.Context, store signalStore, version ulid.ULID, ids []string) {
+func (mb *mailbox) refresh(ctx context.Context, store signalReader, version ulid.ULID, ids []string) {
 	for _, o := range mb.outlets {
 		ids = o.unseen(ids)
 	}

@@ -211,6 +211,9 @@ type signalStore interface {
 	recordSignal(ctx context.Context, run Run, sig *fsmv1.Signal) error
 	// pendingSignalIDs returns the IDs of the run's pending signals.
 	pendingSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error)
+	// unreadSignalIDs returns the IDs of the run's signals no transition has consumed: those its
+	// FINISH discards.
+	unreadSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error)
 	// signal reads one pending signal.
 	signal(ctx context.Context, version ulid.ULID, id string) (*fsmv1.Signal, error)
 }
@@ -229,6 +232,20 @@ func signalEvent(run Run, sig *fsmv1.Signal) (*fsmv1.StateEvent, error) {
 		RunVersion:   runVersion,
 		Signal:       sig,
 	}, nil
+}
+
+// discardedSignals is what a run finishing here leaves unread, for its FINISH to record so a
+// consumer's audit trail can state the drop: nothing for a run whose FSM accepts no signals.
+func (m *Manager) discardedSignals(ctx context.Context, run Run, mb *mailbox) []string {
+	if mb == nil {
+		return nil
+	}
+	ids, err := m.store.unreadSignalIDs(ctx, run.StartVersion)
+	if err != nil {
+		m.logger.WarnContext(ctx, "failed to list unread signals at finish", "error", err, versionAttr(run.StartVersion))
+		return nil
+	}
+	return ids
 }
 
 // mailboxes returns the mailbox of every executing run whose FSM accepts signals.

@@ -75,7 +75,7 @@ case <-ctx.Done():
 - **Consumption is a set of IDs.** COMPLETE records the IDs of the signals the transition received. A per-name cursor would not do: see ordering.
 - **Ordering is best effort.** Signals of one name are offered in ID order among those visible when the owner looks. The ID is a ULID minted by the accepting node, so two signals accepted close together on different nodes can become visible out of ID order. A consumer must never skip a signal because its ID is older than one it has applied; dedupe on the set of applied IDs.
 - **Only a receive consumes.** Delivery uses an unbuffered channel per name, so a signal counts as received only when the handler's receive completes. A transition that never reads a name consumes none of its signals by completing. Each accepted name has its own goroutine for the executing run, which owns that name's pending, consumed and received IDs, so the receive and its record happen on one goroutine and a COMPLETE never misses a receive that already happened.
-- **Unread signals wait.** A signal nobody reads waits for a later transition that reads its name. Signals still unread when the run finishes are discarded.
+- **Unread signals wait.** A signal nobody reads waits for a later transition that reads its name. Signals still unread when the run finishes are discarded, and the run's FINISH lists their IDs (`StateEvent.discarded_signals`) so a consumer can record the drop. The list is best effort: a signal accepted in the moment the run finishes may be discarded without being listed. A run canceled before it executes lists every signal sent to it.
 - **Refused at the door.** A run that is finished or unknown refuses with `ErrFsmNotFound`. A name the run's FSM did not declare, or a payload that does not decode as the declared type, refuses with an error, `InvalidArgument` over the RPC. A typed `Send` can only hit these through a programming error, since its handle carries both. A refused signal is never recorded.
 - **Addressed to the run.** A signal sent while one transition runs but read after the next one starts reaches the next one. A consumer that cares which step a signal was meant for carries that in the payload.
 
@@ -129,7 +129,7 @@ The admin service gains:
 
 ## History visibility
 
-The SIGNAL event is part of the run's durable event log. The current `History` API returns a run's start record and its last event only, so signals — like every intermediate transition event — are not readable through it. Exposing a run's event log is a separate, general addition and is not part of this addendum. Until then a consumer's own record, written when it sends, is the only readable trail of who signaled what, and when.
+The SIGNAL event is part of the run's durable event log. The current `History` API returns a run's start record and its last event only, so signals — like every intermediate transition event — are not readable through it. Exposing a run's event log is a separate, general addition and is not part of this addendum. Until then a consumer's own record, written when it sends, is the only readable trail of who signaled what, and when. The one signal fact `History` does carry is the FINISH event's list of signals discarded unread.
 
 ## Rejected alternatives
 

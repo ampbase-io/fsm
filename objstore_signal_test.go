@@ -149,3 +149,44 @@ func TestArchiveReapsSignalMarkers(t *testing.T) {
 		t.Fatal("expected the unread signal's marker reaped")
 	}
 }
+
+// TestObjectUnreadSignalIDsSkipsConsumed verifies a consumed signal whose marker delete failed is
+// not reported unread, while one never consumed is.
+func TestObjectUnreadSignalIDsSkipsConsumed(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	run := startRun(t, s, "sig-unread")
+	read := recordTestSignal(t, s, run, "advance")
+	unread := recordTestSignal(t, s, run, "pause")
+	h.s3.SetFailDelete(s.signalKey(run.StartVersion, read.GetId()))
+	completeConsuming(t, s, run, read.GetId())
+
+	ids, err := s.unreadSignalIDs(context.Background(), run.StartVersion)
+	if err != nil {
+		t.Fatalf("unread signals: %v", err)
+	}
+	if !slices.Equal(ids, []string{unread.GetId()}) {
+		t.Fatalf("expected only the unconsumed signal, got %v", ids)
+	}
+}
+
+// TestObjectCancelBeforeExecutionDiscardsSignals verifies a run canceled before it executes lists
+// every signal sent to it as discarded on its FINISH.
+func TestObjectCancelBeforeExecutionDiscardsSignals(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	ctx := context.Background()
+	run := startRun(t, s, "sig-canceled")
+	sig := recordTestSignal(t, s, run, "advance")
+
+	if err := s.cancelOwnedRun(ctx, run.StartVersion, &CancelError{Reason: "stop"}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	he, err := s.History(ctx, run.StartVersion)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if got := he.GetLastEvent().GetDiscardedSignals(); !slices.Equal(got, []string{sig.GetId()}) {
+		t.Fatalf("expected the FINISH to list %s discarded, got %v", sig.GetId(), got)
+	}
+}
