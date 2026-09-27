@@ -422,6 +422,8 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		return err
 	}
 
+	// A COMPLETE also prunes the consumed IDs whose markers this node has since deleted.
+	pruned := s.deletedSignals(run.StartVersion)
 	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
 		if err := s.checkFence(m, epoch); err != nil {
 			return err
@@ -439,7 +441,7 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 				m.LatestResponse = event.GetResponse()
 			}
 			m.Iterations = recordIteration(m.Iterations, event)
-			m.ConsumedSignals = append(m.ConsumedSignals, event.GetConsumedSignals()...)
+			m.ConsumedSignals = append(withoutIDs(m.ConsumedSignals, pruned), event.GetConsumedSignals()...)
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
 			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
 			recordOutcome(m, event)
@@ -454,8 +456,16 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 	if err != nil {
 		return err
 	}
+	if event.GetType() == fsmv1.EventType_EVENT_TYPE_COMPLETE {
+		s.forgetDeletedSignals(run.StartVersion, pruned)
+	}
 	s.deleteConsumedSignals(ctx, run.StartVersion, event.GetConsumedSignals())
 	return nil
+}
+
+// withoutIDs is ids with every one in drop removed.
+func withoutIDs(ids, drop []string) []string {
+	return slices.DeleteFunc(ids, func(id string) bool { return slices.Contains(drop, id) })
 }
 
 func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.StateEvent, eventKey string, eventBytes []byte) error {

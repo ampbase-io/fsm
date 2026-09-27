@@ -37,6 +37,11 @@ type lease struct {
 	// queue's cluster-wide capacity. It lets the heartbeat refresh (heartbeatQueues) and the
 	// release paths find the run's queue roster after the fact.
 	queue string
+
+	// deletedSignals are consumed signals whose markers this node has deleted, so the manifest
+	// need not keep their IDs: the next COMPLETE drops them from consumed_signals. They go with
+	// the lease, since only the lease holder writes the manifest.
+	deletedSignals []string
 }
 
 // checkFence returns ErrLeaseLost unless the manifest still records this node as owner at the
@@ -76,6 +81,39 @@ func (s *objectStore) ownedByQueue() map[string][]ulid.ULID {
 		byQueue[l.queue] = append(byQueue[l.queue], version)
 	}
 	return byQueue
+}
+
+// noteDeletedSignals records consumed signals whose markers this node deleted, for the next
+// COMPLETE to prune from the manifest. A run whose lease is gone has nothing to prune.
+func (s *objectStore) noteDeletedSignals(version ulid.ULID, ids []string) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	l, ok := s.leases[version]
+	if !ok {
+		return
+	}
+	l.deletedSignals = append(l.deletedSignals, ids...)
+	s.leases[version] = l
+}
+
+// deletedSignals returns the consumed signals whose markers this node has deleted.
+func (s *objectStore) deletedSignals(version ulid.ULID) []string {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	return slices.Clone(s.leases[version].deletedSignals)
+}
+
+// forgetDeletedSignals drops ids from the run's deleted signals once the manifest no longer keeps
+// them.
+func (s *objectStore) forgetDeletedSignals(version ulid.ULID, ids []string) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	l, ok := s.leases[version]
+	if !ok {
+		return
+	}
+	l.deletedSignals = withoutIDs(l.deletedSignals, ids)
+	s.leases[version] = l
 }
 
 func (s *objectStore) ownedEpoch(version ulid.ULID) (int64, bool) {

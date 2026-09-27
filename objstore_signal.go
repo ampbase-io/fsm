@@ -123,11 +123,16 @@ func (s *objectStore) signal(ctx context.Context, version ulid.ULID, id string) 
 
 // deleteConsumedSignals removes the markers of signals a COMPLETE consumed. It runs after the
 // manifest records them consumed, so a failed delete only leaves a marker the run never offers
-// again, which retention removes with the run.
+// again, which retention removes with the run. A marker that is gone needs no consumed record,
+// so the IDs it deleted are noted for the next COMPLETE to prune from the manifest.
 func (s *objectStore) deleteConsumedSignals(ctx context.Context, version ulid.ULID, ids []string) {
+	deleted := make([]string, 0, len(ids))
 	for _, id := range ids {
 		if err := s.deleteObject(ctx, s.signalKey(version, id)); err != nil {
 			s.logger.ErrorContext(ctx, "failed to delete consumed signal marker", "error", err, versionAttr(version), "signal", id)
+			continue
 		}
+		deleted = append(deleted, id)
 	}
+	s.noteDeletedSignals(version, deleted)
 }
