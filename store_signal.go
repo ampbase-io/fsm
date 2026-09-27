@@ -39,7 +39,9 @@ func (s *boltStore) liveRun(_ context.Context, version ulid.ULID) (Run, error) {
 	return rs.Run, nil
 }
 
-// recordSignal writes the SIGNAL event and the pending entry in one transaction.
+// recordSignal writes the SIGNAL event and the pending entry in one transaction, refusing with
+// ErrFsmNotFound a run that finished after liveRun answered: bolt serializes writers, so the check
+// and the write cannot straddle the run's FINISH.
 func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) error {
 	event, err := signalEvent(run, sig)
 	if err != nil {
@@ -59,11 +61,40 @@ func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) 
 	eventVersion := []byte(ulid.Make().String())
 	eventKey := bytes.Join([][]byte{[]byte(run.ID), []byte(run.Action), event.GetRunVersion(), eventVersion}, keySeparator)
 	return s.db.Update(func(tx *bbolt.Tx) error {
+		live, err := activeIn(tx, run)
+		if err != nil {
+			return err
+		}
+		if !live {
+			return ErrFsmNotFound
+		}
 		if err := tx.Bucket(eventsBucket).Put(eventKey, eventBytes); err != nil {
 			return err
 		}
 		return tx.Bucket(signalsBucket).Put(signalEntryKey(run.StartVersion, sig.GetId()), entry)
 	})
+}
+
+// activeIn reports, within tx, whether run is still active: its ACTIVE entry is this run's and has
+// not ended. FINISH deletes the entry, and a later run of the same resource replaces it.
+func activeIn(tx *bbolt.Tx, run Run) (bool, error) {
+	key, err := activeKey(run)
+	if err != nil {
+		return false, err
+	}
+	v := tx.Bucket(activeBucket).Get(key)
+	if v == nil {
+		return false, nil
+	}
+	var ae fsmv1.ActiveEvent
+	if err := proto.Unmarshal(v, &ae); err != nil {
+		return false, err
+	}
+	var started ulid.ULID
+	if err := started.UnmarshalText(ae.GetStartVersion()); err != nil {
+		return false, err
+	}
+	return ae.GetEndEvent() == nil && started == run.StartVersion, nil
 }
 
 // pendingSignalIDs returns the IDs of the run's pending signals.

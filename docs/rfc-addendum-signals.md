@@ -78,7 +78,8 @@ case <-ctx.Done():
 ## Interactions
 
 - **Retries.** Each attempt of a transition starts with every unconsumed signal on offer again, including those a failed attempt received.
-- **`RepeatWhile`.** Every iteration records its own COMPLETE, so each consumes what it received. A `RepeatDone` receives nothing.
+- **`RepeatWhile`.** Every iteration records its own COMPLETE, so each consumes what it received. The predicate may receive signals too; they belong to the attempt it decides, so a signal it receives before `RepeatAgain` is not offered again to that iteration's body, and one it receives before `RepeatDone` is consumed by the COMPLETE that finishes the transition.
+- **A name no longer accepted.** A stored signal whose name the running definition does not accept, left by an earlier definition, is logged and never offered.
 - **Cancel.** Cancel ends the run; signals never do. Unread signals are discarded with the run.
 - **Interceptors.** Signal delivery is not a caller-visible interceptor, and a caller's interceptor sees nothing of it. Internally, one step inside the retry puts received signals back on offer at the start of each attempt.
 - **The finisher and finalizers** receive no signals.
@@ -93,7 +94,8 @@ Sending a signal:
 2. Resolve the run's FSM from the manifest's type and action, and validate the name and payload against its declaration.
 3. Write the SIGNAL event — an immutable, write-once event object under the run's `events/` prefix — carrying the signal's ID, name and payload.
 4. Write the pending marker `signals/<run_version>/<signal_id>`, carrying the same signal.
-5. Publish `fsm.run.signal` on the bus, if one is configured.
+5. Read the manifest again. With no transaction to hold the run live across the writes, a run that finished meanwhile would never deliver the signal, so its event and marker are deleted and the send refuses with `ErrFsmNotFound`.
+6. Publish `fsm.run.signal` on the bus, if one is configured.
 
 The sender never writes the manifest: the lease owner remains its only writer, and every manifest write stays fenced by lease epoch.
 
@@ -107,7 +109,7 @@ Delivering:
 
 ### BoltDB
 
-BoltDB is single-process. Sending writes the SIGNAL event and a pending entry in a `SIGNALS` bucket in one transaction, then wakes the run's mailbox in-process. The COMPLETE that consumes signals deletes their entries in its own transaction. A restart offers every remaining entry.
+BoltDB is single-process. Sending writes the SIGNAL event and a pending entry in a `SIGNALS` bucket in one transaction, which first checks the run is still active, so a send cannot land after the run's FINISH; it then wakes the run's mailbox in-process. The COMPLETE that consumes signals deletes their entries in its own transaction. A restart offers every remaining entry.
 
 ## Event bus
 

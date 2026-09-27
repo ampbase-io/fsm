@@ -94,7 +94,9 @@ func canceller(store appender, codec Codec) TransitionInterceptorFunc {
 				RunErr{Err: haltErr, State: run.CurrentState}.stamp(event)
 			case errors.Is(err, errRepeatDone):
 				// The predicate ended the repetition. The COMPLETE, with no iterations completed,
-				// records the transition finished, so resume and ListActive move past it.
+				// records the transition finished, so resume and ListActive move past it, and
+				// consumes any signal the predicate received.
+				event.ConsumedSignals = req.mailbox().received()
 			case err != nil:
 				return resp, err
 			default:

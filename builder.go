@@ -264,17 +264,18 @@ func (s *fsmTransition[R, W]) To(name string, transition Transition[R, W], opts 
 }
 
 // build makes a declared transition, its interceptors outermost first: record the outcome,
-// retry, a repeated transition's gate, the interceptors every transition runs inside, and its
-// own. The gate sits inside retry and outside the caller's interceptors, so they run only for
-// an iteration that runs.
+// retry, the signal attempt reset, a repeated transition's gate, the interceptors every
+// transition runs inside, and its own. The gate sits inside retry and outside the caller's
+// interceptors, so they run only for an iteration that runs; the reset sits outside the gate, so
+// a signal the predicate receives belongs to the attempt, not to the one after.
 func (s *fsmTransition[R, W]) build(d declaration[R, W], every []TransitionInterceptorFunc) *transition {
 	d.cfg.interceptors = slices.Concat(
 		[]TransitionInterceptorFunc{
 			canceller(s.m.store, s.f.wCodec),
 			retry(s.m.tracer, s.m.instruments, s.m.store),
 		},
-		repeatGate(d.cfg.repeat),
 		signalAttempts(s.f.signals),
+		repeatGate(d.cfg.repeat),
 		every,
 		d.cfg.interceptors,
 	)

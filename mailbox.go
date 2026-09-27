@@ -183,7 +183,13 @@ func (mb *mailbox) offer(sigs ...*fsmv1.Signal) {
 			if pending || consumed {
 				continue
 			}
-			v, err := mb.outlets[sig.GetName()].value(sig)
+			o, ok := mb.outlets[sig.GetName()]
+			if !ok {
+				// Accepted under a definition that declared the name, since changed.
+				mb.logger.Error("signal name not accepted by this run's FSM, not offering it", "signal", sig.GetId(), "name", sig.GetName())
+				continue
+			}
+			v, err := o.value(sig)
 			if err != nil {
 				mb.logger.Error("failed to decode signal, not offering it", "error", err, "signal", sig.GetId(), "name", sig.GetName())
 				continue

@@ -32,7 +32,10 @@ func (s *objectStore) liveRun(ctx context.Context, version ulid.ULID) (Run, erro
 }
 
 // recordSignal writes the signal's SIGNAL event, then its pending marker, then broadcasts it. The
-// sender never writes the manifest, so the lease owner stays its only, fenced, writer.
+// sender never writes the manifest, so the lease owner stays its only, fenced, writer. With no
+// transaction to hold the run live across the writes, it reads the manifest again afterwards: a
+// run that finished meanwhile would never deliver the signal, nor remove what was written if its
+// reap had already run, so both are deleted and the send is refused with ErrFsmNotFound.
 func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Signal) error {
 	event, err := signalEvent(run, sig)
 	if err != nil {
@@ -43,10 +46,17 @@ func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Sign
 		return err
 	}
 
-	if err := s.appendEvent(ctx, run.ID, run.Action, run.StartVersion, ulid.Make(), event); err != nil {
+	eventVersion := ulid.Make()
+	eventKey := s.eventKey(run.ID, run.Action, run.StartVersion, eventVersion)
+	markerKey := s.signalKey(run.StartVersion, sig.GetId())
+	if err := s.appendEvent(ctx, run.ID, run.Action, run.StartVersion, eventVersion, event); err != nil {
 		return err
 	}
-	if err := s.putIdempotent(ctx, s.signalKey(run.StartVersion, sig.GetId()), marker); err != nil {
+	if err := s.putIdempotent(ctx, markerKey, marker); err != nil {
+		return err
+	}
+	if _, err := s.liveRun(ctx, run.StartVersion); err != nil {
+		s.withdrawSignal(ctx, eventKey, markerKey)
 		return err
 	}
 
@@ -54,6 +64,16 @@ func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Sign
 		s.publishControl(subjectSignal, fsmv1.RunEventKind_RUN_EVENT_KIND_SIGNAL, run.StartVersion, "")
 	}
 	return nil
+}
+
+// withdrawSignal deletes a signal's event and marker written for a run that finished before the
+// send completed.
+func (s *objectStore) withdrawSignal(ctx context.Context, eventKey, markerKey string) {
+	for _, key := range []string{markerKey, eventKey} {
+		if err := s.deleteObject(ctx, key); err != nil {
+			s.logger.ErrorContext(ctx, "failed to withdraw signal", "error", err, "key", key)
+		}
+	}
 }
 
 // pendingSignalIDs returns the IDs of the run's pending signal markers, from a keys-only listing

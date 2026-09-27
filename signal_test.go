@@ -385,3 +385,174 @@ func TestObjectSignalAcrossNodes(t *testing.T) {
 	}
 	waitRun(t, owner, version)
 }
+
+// TestSignalUnacceptedNameSkipped verifies a stored signal whose name the running definition no
+// longer accepts, left by an earlier definition, is skipped, not offered: the run's other
+// signals are still delivered.
+func TestSignalUnacceptedNameSkipped(t *testing.T) { runBackends(t, testSignalUnacceptedNameSkipped) }
+
+func testSignalUnacceptedNameSkipped(t *testing.T, b *backend) {
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	got := make(chan ulid.ULID, 1)
+	start, _, err := m.Register[orderReq, orderResp]("signal-retired").
+		Start("wait", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			entered <- struct{}{}
+			select {
+			case adv := <-testAdvance.Receive(req):
+				got <- adv.ID
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}).
+		End("done", acceptTestSignals()).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+	version := startOrder(t, start, "signal-7")
+	within(t, entered, 10*time.Second, "the transition")
+
+	run, err := m.store.liveRun(ctx, version)
+	if err != nil {
+		t.Fatalf("live run: %v", err)
+	}
+	retired := &fsmv1.Signal{Id: ulid.Make().String(), Name: "retired", Payload: []byte("{}")}
+	if err := m.store.recordSignal(ctx, run, retired); err != nil {
+		t.Fatalf("record a signal of a retired name: %v", err)
+	}
+	m.sweepSignals(ctx)
+
+	id, err := testAdvance.Send(ctx, m, version, &command{})
+	if err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if delivered := within(t, got, 10*time.Second, "the accepted signal"); delivered != id {
+		t.Fatalf("expected %s, got %s", id, delivered)
+	}
+	waitRun(t, m, version)
+}
+
+// TestSignalRefusedOnceFinished verifies a send that found the run live but records after it
+// finished is refused, and leaves no pending signal behind.
+func TestSignalRefusedOnceFinished(t *testing.T) { runBackends(t, testSignalRefusedOnceFinished) }
+
+func testSignalRefusedOnceFinished(t *testing.T, b *backend) {
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	start := blockingFSM(t, m, "signal-finished", entered, release, WithSignals[orderReq, orderResp](testAdvance))
+	version := startOrder(t, start, "signal-8")
+	within(t, entered, 10*time.Second, "the transition")
+
+	// The run as a send reads it before recording, then the run finishes first.
+	run, err := m.store.liveRun(ctx, version)
+	if err != nil {
+		t.Fatalf("live run: %v", err)
+	}
+	close(release)
+	waitRun(t, m, version)
+
+	late := &fsmv1.Signal{Id: ulid.Make().String(), Name: "advance", Payload: []byte("{}")}
+	if err := m.store.recordSignal(ctx, run, late); !errors.Is(err, ErrFsmNotFound) {
+		t.Fatalf("expected ErrFsmNotFound for a run that finished, got %v", err)
+	}
+	ids, err := m.store.pendingSignalIDs(ctx, version)
+	if err != nil {
+		t.Fatalf("pending signals: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected no pending signal left behind, got %v", ids)
+	}
+}
+
+// TestSignalReadByPredicate verifies a RepeatWhile predicate's signals belong to its attempt: one
+// it receives before RepeatAgain is not offered again to the iteration's body, and one it
+// receives before RepeatDone is consumed with the transition, not offered to the next one.
+func TestSignalReadByPredicate(t *testing.T) { runBackends(t, testSignalReadByPredicate) }
+
+func testSignalReadByPredicate(t *testing.T, b *backend) {
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var (
+		mu    sync.Mutex
+		notes []string
+	)
+	note := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		notes = append(notes, s)
+	}
+
+	predicate := func(ctx context.Context, req *Request[orderReq, orderResp]) (Repeat, error) {
+		switch req.Run().Iteration {
+		case 0:
+			return RepeatAgain(), nil
+		case 1:
+			select {
+			case <-testAdvance.Receive(req):
+				note("predicate:advance")
+				return RepeatAgain(), nil
+			case <-ctx.Done():
+				return Repeat{}, ctx.Err()
+			}
+		}
+		select {
+		case <-testPause.Receive(req):
+			note("predicate:pause")
+			return RepeatDone(), nil
+		case <-ctx.Done():
+			return Repeat{}, ctx.Err()
+		}
+	}
+	start, _, err := m.Register[orderReq, orderResp]("signal-predicate").
+		Start("first", okTransition).
+		To("stage", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			if req.Run().Iteration == 0 {
+				entered <- struct{}{}
+				<-release
+				return nil, nil
+			}
+			if !noSignal(testAdvance.Receive(req)) {
+				note("body:advance")
+			}
+			return nil, nil
+		}, RepeatWhile(predicate)).
+		To("after", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			if !noSignal(testPause.Receive(req)) {
+				note("after:pause")
+			}
+			return nil, nil
+		}).
+		End("done", acceptTestSignals()).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version := startOrder(t, start, "signal-9")
+	within(t, entered, 10*time.Second, "the first iteration")
+	// Both wait while the first iteration's body holds; only the predicate reads them.
+	if _, err := testAdvance.Send(ctx, m, version, &command{}); err != nil {
+		t.Fatalf("send advance: %v", err)
+	}
+	if _, err := testPause.Send(ctx, m, version, &command{}); err != nil {
+		t.Fatalf("send pause: %v", err)
+	}
+	close(release)
+	waitRun(t, m, version)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"predicate:advance", "predicate:pause"}; !slices.Equal(notes, want) {
+		t.Fatalf("expected %v, got %v", want, notes)
+	}
+}
