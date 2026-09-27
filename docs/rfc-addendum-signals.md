@@ -80,7 +80,7 @@ case <-ctx.Done():
 - **Retries.** Each attempt of a transition starts with every unconsumed signal on offer again, including those a failed attempt received.
 - **`RepeatWhile`.** Every iteration records its own COMPLETE, so each consumes what it received. A `RepeatDone` receives nothing.
 - **Cancel.** Cancel ends the run; signals never do. Unread signals are discarded with the run.
-- **Interceptors.** Signal delivery is not an interceptor, and an interceptor sees nothing of it.
+- **Interceptors.** Signal delivery is not a caller-visible interceptor, and a caller's interceptor sees nothing of it. Internally, one step inside the retry puts received signals back on offer at the start of each attempt.
 - **The finisher and finalizers** receive no signals.
 
 ## Storage
@@ -99,7 +99,7 @@ The sender never writes the manifest: the lease owner remains its only writer, a
 
 Delivering:
 
-- The owner's coordinate loop lists `signals/` once per heartbeat — one keys-only listing intersected with the runs this node is executing with signals declared, the shape the cancel sweep uses — and on the bus broadcast.
+- A run lists its own `signals/<run_version>/` prefix, keys only, when it starts executing on a node. The owner's coordinate loop lists it again once per heartbeat, and on the bus broadcast, for each run it is executing whose FSM accepts signals. A node executing no such run lists nothing.
 - A run's mailbox fetches the bodies of markers it has not seen and offers them to the run's transitions.
 - COMPLETE carries the received IDs (`StateEvent.consumed_signals`). The manifest CAS appends them to `RunManifest.consumed_signals`, and the owner then deletes their markers. A marker whose delete fails stays harmless: its ID is on the manifest, so it is never offered again.
 - A takeover or restart reads the manifest's consumed IDs with the rest of the run's state, and offers every marker not in that set.

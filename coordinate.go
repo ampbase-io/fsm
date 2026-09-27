@@ -111,18 +111,18 @@ func (m *Manager) coordinate(lc leaseCoordinator) {
 	defer wake.Stop()
 	wakeArmed := false
 
-	pending, unsubscribePending := subscribeBroadcast(m.bus, subjectPending, m.logger)
+	pending, unsubscribePending := subscribeWakeup(m.bus, subjectPending, m.logger)
 	defer unsubscribePending()
 
 	// A cancel is a broadcast: every worker hears it and sweeps, and its owned-intersection —
 	// not the subject — decides which node reacts. The heartbeat sweep is the correctness floor;
 	// this event just pulls it forward. No jitter: the sweep touches only runs this node owns,
 	// so there is no CAS herd to stagger.
-	canceled, unsubscribeCancel := subscribeBroadcast(m.bus, subjectCancel, m.logger)
+	canceled, unsubscribeCancel := subscribeWakeup(m.bus, subjectCancel, m.logger)
 	defer unsubscribeCancel()
 
 	// A signal is a broadcast like a cancel; the executing node's sweep delivers it.
-	signaled, unsubscribeSignal := subscribeBroadcast(m.bus, subjectSignal, m.logger)
+	signaled, unsubscribeSignal := subscribeWakeup(m.bus, subjectSignal, m.logger)
 	defer unsubscribeSignal()
 
 	// runClaim scans for claimable runs unless the manager is shutting down, in which case it

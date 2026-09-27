@@ -41,21 +41,10 @@ func noSignal[T any](ch <-chan Received[T]) bool {
 	}
 }
 
-// startSignaled starts a run and returns its version.
-func startSignaled(t *testing.T, start Start[orderReq, orderResp], id string) ulid.ULID {
-	t.Helper()
-	version, err := start(context.Background(), id, NewRequest(&orderReq{}, &orderResp{}))
-	if err != nil {
-		t.Fatalf("failed to start FSM: %v", err)
-	}
-	return version
-}
-
+// waitRun waits for the run and fails the test unless it succeeded.
 func waitRun(t *testing.T, m *Manager, version ulid.ULID) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := m.Wait(ctx, version); err != nil {
+	if err := waitFor(m, version); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 }
@@ -87,7 +76,7 @@ func testSignalRoundTrip(t *testing.T, b *backend) {
 		t.Fatalf("failed to build FSM: %v", err)
 	}
 
-	version := startSignaled(t, start, "signal-1")
+	version := startOrder(t, start, "signal-1")
 	within(t, entered, 10*time.Second, "the transition")
 	id, err := testAdvance.Send(ctx, m, version, &command{Stage: 2, Note: "go"})
 	if err != nil {
@@ -149,7 +138,7 @@ func testSignalWaitsForItsReader(t *testing.T, b *backend) {
 		t.Fatalf("failed to build FSM: %v", err)
 	}
 
-	version := startSignaled(t, start, "signal-2")
+	version := startOrder(t, start, "signal-2")
 	within(t, entered, 10*time.Second, "the holding transition")
 	if _, err := testPause.Send(ctx, m, version, &command{Note: "pause"}); err != nil {
 		t.Fatalf("send pause: %v", err)
@@ -196,7 +185,7 @@ func testSignalRedeliveredOnRetry(t *testing.T, b *backend) {
 		t.Fatalf("failed to build FSM: %v", err)
 	}
 
-	version := startSignaled(t, start, "signal-3")
+	version := startOrder(t, start, "signal-3")
 	within(t, entered, 10*time.Second, "the transition")
 	id, err := testAdvance.Send(ctx, m, version, &command{})
 	if err != nil {
@@ -253,7 +242,7 @@ func testSignalAcrossRestart(t *testing.T, b *backend) {
 
 	m1, stop1 := b.newManager(nil)
 	start, _ := register(m1)
-	version := startSignaled(t, start, "signal-4")
+	version := startOrder(t, start, "signal-4")
 	if _, err := testPause.Send(ctx, m1, version, &command{}); err != nil {
 		t.Fatalf("send pause: %v", err)
 	}
@@ -293,18 +282,8 @@ func testSignalRefused(t *testing.T, b *backend) {
 
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	start, _, err := m.Register[orderReq, orderResp]("signal-refused").
-		Start("hold", func(ctx context.Context, _ *Request[orderReq, orderResp]) (*Response[orderResp], error) {
-			entered <- struct{}{}
-			<-release
-			return nil, nil
-		}).
-		End("done", WithSignals[orderReq, orderResp](testAdvance)).
-		Build(ctx)
-	if err != nil {
-		t.Fatalf("failed to build FSM: %v", err)
-	}
-	version := startSignaled(t, start, "signal-5")
+	start := blockingFSM(t, m, "signal-refused", entered, release, WithSignals[orderReq, orderResp](testAdvance))
+	version := startOrder(t, start, "signal-5")
 	within(t, entered, 10*time.Second, "the transition")
 
 	if _, err := testAdvance.Send(ctx, m, ulid.Make(), &command{}); !errors.Is(err, ErrFsmNotFound) {
@@ -315,7 +294,7 @@ func testSignalRefused(t *testing.T, b *backend) {
 	}
 
 	admin := &adminServer{m: m}
-	_, err = admin.Signal(ctx, connect.NewRequest(&fsmv1.SignalRequest{Version: version.String(), Name: "advance", Payload: []byte("not json")}))
+	_, err := admin.Signal(ctx, connect.NewRequest(&fsmv1.SignalRequest{Version: version.String(), Name: "advance", Payload: []byte("not json")}))
 	if connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Fatalf("bad payload: expected InvalidArgument, got %v", err)
 	}
@@ -392,7 +371,7 @@ func TestObjectSignalAcrossNodes(t *testing.T) {
 	}
 
 	owner, _ := b.newManager(nil)
-	version := startSignaled(t, register(owner), "signal-6")
+	version := startOrder(t, register(owner), "signal-6")
 	within(t, entered, 10*time.Second, "the transition")
 
 	peer, _ := b.newManager(nil)

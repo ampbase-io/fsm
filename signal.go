@@ -129,9 +129,6 @@ func WithSignals[R, W any](signals ...AnySignal) EndOption[R, W] {
 // acceptedSignals indexes an FSM's declared signals by name, refusing an invalid declaration or
 // a name declared twice.
 func acceptedSignals(signals []AnySignal) (map[string]AnySignal, error) {
-	if len(signals) == 0 {
-		return nil, nil
-	}
 	accepted := make(map[string]AnySignal, len(signals))
 	for _, s := range signals {
 		if err := s.declErr(); err != nil {
@@ -148,7 +145,7 @@ func acceptedSignals(signals []AnySignal) (map[string]AnySignal, error) {
 // signal validates a signal against the run's FSM, records it durably and offers it to the run if
 // it executes here. It is Send's and the RPC's one path.
 func (m *Manager) signal(ctx context.Context, version ulid.ULID, name string, payload []byte) (ulid.ULID, error) {
-	run, err := m.store.signalTarget(ctx, version)
+	run, err := m.store.liveRun(ctx, version)
 	if err != nil {
 		return ulid.ULID{}, err
 	}
@@ -175,36 +172,55 @@ func (m *Manager) signal(ctx context.Context, version ulid.ULID, name string, pa
 	return id, nil
 }
 
-// sweepSignals offers every executing run with a mailbox its pending signals, from one listing.
-// It runs on the heartbeat and on a signal broadcast; a node executing no run that accepts
-// signals lists nothing.
+// sweepSignals offers every run executing here whose FSM accepts signals its pending signals. It
+// runs on the heartbeat and on a signal broadcast; a node executing no such run reads nothing.
 func (m *Manager) sweepSignals(ctx context.Context) {
-	mailboxes := m.mailboxes()
-	if len(mailboxes) == 0 {
-		return
-	}
-	ids, err := m.store.signalIDs(ctx)
-	if err != nil {
-		m.logger.ErrorContext(ctx, "signal sweep failed", "error", err)
-		return
-	}
-	for version, mb := range mailboxes {
-		mb.refresh(ctx, m.store, version, ids[version])
+	for version, mb := range m.mailboxes() {
+		m.loadSignals(ctx, version, mb)
 	}
 }
 
-// loadSignals offers a run that starts executing here the signals already pending for it: those
-// sent before it started, and on a resume those its previous owner had not consumed.
+// loadSignals offers a run the signals pending for it that its mailbox has not seen: at run start,
+// those sent before it started and, on a resume, those its previous owner had not consumed.
 func (m *Manager) loadSignals(ctx context.Context, version ulid.ULID, mb *mailbox) {
 	if mb == nil {
 		return
 	}
-	ids, err := m.store.signalIDs(ctx)
+	ids, err := m.store.pendingSignalIDs(ctx, version)
 	if err != nil {
 		m.logger.ErrorContext(ctx, "failed to list pending signals", "error", err, versionAttr(version))
 		return
 	}
-	mb.refresh(ctx, m.store, version, ids[version])
+	mb.refresh(ctx, m.store, version, ids)
+}
+
+// signalStore is what signals need of a backend. Both backends implement it, so Store embeds it.
+type signalStore interface {
+	// liveRun returns the run a command is addressed to, refusing a terminal or unknown run with
+	// ErrFsmNotFound.
+	liveRun(ctx context.Context, version ulid.ULID) (Run, error)
+	// recordSignal durably records a validated signal: its SIGNAL event and its pending entry.
+	recordSignal(ctx context.Context, run Run, sig *fsmv1.Signal) error
+	// pendingSignalIDs returns the IDs of the run's pending signals.
+	pendingSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error)
+	// signal reads one pending signal.
+	signal(ctx context.Context, version ulid.ULID, id string) (*fsmv1.Signal, error)
+}
+
+// signalEvent is the SIGNAL event a backend records for an accepted signal.
+func signalEvent(run Run, sig *fsmv1.Signal) (*fsmv1.StateEvent, error) {
+	runVersion, err := run.StartVersion.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+	return &fsmv1.StateEvent{
+		Type:         fsmv1.EventType_EVENT_TYPE_SIGNAL,
+		Id:           run.ID,
+		ResourceType: run.TypeName,
+		Action:       run.Action,
+		RunVersion:   runVersion,
+		Signal:       sig,
+	}, nil
 }
 
 // mailboxes returns the mailbox of every executing run whose FSM accepts signals.

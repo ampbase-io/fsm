@@ -3,7 +3,6 @@ package fsm
 import (
 	"bytes"
 	"context"
-	"fmt"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
@@ -24,9 +23,9 @@ func signalEntryPrefix(version ulid.ULID) []byte {
 	return append([]byte(version.String()), keySeparator...)
 }
 
-// signalTarget returns the run a signal is addressed to from the in-memory index, refusing a
-// terminal or unknown run with ErrFsmNotFound.
-func (s *boltStore) signalTarget(_ context.Context, version ulid.ULID) (Run, error) {
+// liveRun returns the run a command is addressed to from the in-memory index, refusing a terminal
+// or unknown run with ErrFsmNotFound.
+func (s *boltStore) liveRun(_ context.Context, version ulid.ULID) (Run, error) {
 	txn := s.memDB.Txn(false)
 	defer txn.Abort()
 	item, err := txn.First(fsmTable, idIndex, version.String())
@@ -42,18 +41,11 @@ func (s *boltStore) signalTarget(_ context.Context, version ulid.ULID) (Run, err
 
 // recordSignal writes the SIGNAL event and the pending entry in one transaction.
 func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) error {
-	runVersion, err := run.StartVersion.MarshalText()
+	event, err := signalEvent(run, sig)
 	if err != nil {
 		return err
 	}
-	event, err := proto.Marshal(&fsmv1.StateEvent{
-		Type:         fsmv1.EventType_EVENT_TYPE_SIGNAL,
-		Id:           run.ID,
-		ResourceType: run.TypeName,
-		Action:       run.Action,
-		RunVersion:   runVersion,
-		Signal:       sig,
-	})
+	eventBytes, err := proto.Marshal(event)
 	if err != nil {
 		return err
 	}
@@ -62,33 +54,26 @@ func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) 
 		return err
 	}
 
-	// EVENT Bucket, keyed by the signal's ID as the event version:
-	// <resource_id>#<action>#<run_version>#<signal_id>
-	eventKey := bytes.Join([][]byte{[]byte(run.ID), []byte(run.Action), runVersion, []byte(sig.GetId())}, keySeparator)
+	// EVENT Bucket
+	// <resource_id>#<action>#<run_version>#<event_version>
+	eventVersion := []byte(ulid.Make().String())
+	eventKey := bytes.Join([][]byte{[]byte(run.ID), []byte(run.Action), event.GetRunVersion(), eventVersion}, keySeparator)
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		if err := tx.Bucket(eventsBucket).Put(eventKey, event); err != nil {
+		if err := tx.Bucket(eventsBucket).Put(eventKey, eventBytes); err != nil {
 			return err
 		}
 		return tx.Bucket(signalsBucket).Put(signalEntryKey(run.StartVersion, sig.GetId()), entry)
 	})
 }
 
-// signalIDs returns the IDs of every pending signal, by run, oldest first.
-func (s *boltStore) signalIDs(context.Context) (map[ulid.ULID][]string, error) {
-	ids := map[ulid.ULID][]string{}
+// pendingSignalIDs returns the IDs of the run's pending signals.
+func (s *boltStore) pendingSignalIDs(_ context.Context, version ulid.ULID) ([]string, error) {
+	var ids []string
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		return tx.Bucket(signalsBucket).ForEach(func(k, _ []byte) error {
-			runPart, id, ok := bytes.Cut(k, keySeparator)
-			if !ok {
-				return fmt.Errorf("malformed signal entry key %q", k)
-			}
-			version, err := ulid.Parse(string(runPart))
-			if err != nil {
-				return err
-			}
-			ids[version] = append(ids[version], string(id))
-			return nil
-		})
+		for _, k := range signalEntryKeys(tx.Bucket(signalsBucket), version) {
+			ids = append(ids, string(bytes.TrimPrefix(k, signalEntryPrefix(version))))
+		}
+		return nil
 	})
 	return ids, err
 }
@@ -109,6 +94,17 @@ func (s *boltStore) signal(_ context.Context, version ulid.ULID, id string) (*fs
 	return &sig, nil
 }
 
+// signalEntryKeys returns the keys of the run's pending entries, copied so they outlive a cursor.
+func signalEntryKeys(b *bbolt.Bucket, version ulid.ULID) [][]byte {
+	prefix := signalEntryPrefix(version)
+	var keys [][]byte
+	c := b.Cursor()
+	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+		keys = append(keys, bytes.Clone(k))
+	}
+	return keys
+}
+
 // consumeSignals deletes, within tx, the pending entries of the signals a COMPLETE consumed.
 func consumeSignals(tx *bbolt.Tx, version ulid.ULID, ids []string) error {
 	b := tx.Bucket(signalsBucket)
@@ -123,13 +119,7 @@ func consumeSignals(tx *bbolt.Tx, version ulid.ULID, ids []string) error {
 // discardSignals deletes, within tx, every pending entry of a finished run.
 func discardSignals(tx *bbolt.Tx, version ulid.ULID) error {
 	b := tx.Bucket(signalsBucket)
-	prefix := signalEntryPrefix(version)
-	var keys [][]byte
-	c := b.Cursor()
-	for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
-		keys = append(keys, bytes.Clone(k))
-	}
-	for _, k := range keys {
+	for _, k := range signalEntryKeys(b, version) {
 		if err := b.Delete(k); err != nil {
 			return err
 		}

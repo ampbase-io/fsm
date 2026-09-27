@@ -18,13 +18,9 @@ func (s *objectStore) signalPrefix(version ulid.ULID) string {
 	return s.key("signals", version.String()) + "/"
 }
 
-func (s *objectStore) signalsPrefix() string {
-	return s.key("signals") + "/"
-}
-
-// signalTarget returns the run a signal is addressed to, refusing a terminal or unknown run with
+// liveRun returns the run a command is addressed to, refusing a terminal or unknown run with
 // ErrFsmNotFound.
-func (s *objectStore) signalTarget(ctx context.Context, version ulid.ULID) (Run, error) {
+func (s *objectStore) liveRun(ctx context.Context, version ulid.ULID) (Run, error) {
 	manifest, _, err := s.getManifest(ctx, version)
 	if err != nil {
 		return Run{}, err
@@ -36,25 +32,9 @@ func (s *objectStore) signalTarget(ctx context.Context, version ulid.ULID) (Run,
 }
 
 // recordSignal writes the signal's SIGNAL event, then its pending marker, then broadcasts it. The
-// sender never writes the manifest, so the lease owner stays its only, fenced, writer. Both
-// objects are keyed by the signal's ID, so a retried send rewrites them rather than adding more.
+// sender never writes the manifest, so the lease owner stays its only, fenced, writer.
 func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Signal) error {
-	id, err := ulid.Parse(sig.GetId())
-	if err != nil {
-		return err
-	}
-	runVersion, err := run.StartVersion.MarshalText()
-	if err != nil {
-		return err
-	}
-	event, err := proto.Marshal(&fsmv1.StateEvent{
-		Type:         fsmv1.EventType_EVENT_TYPE_SIGNAL,
-		Id:           run.ID,
-		ResourceType: run.TypeName,
-		Action:       run.Action,
-		RunVersion:   runVersion,
-		Signal:       sig,
-	})
+	event, err := signalEvent(run, sig)
 	if err != nil {
 		return err
 	}
@@ -63,7 +43,7 @@ func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Sign
 		return err
 	}
 
-	if err := s.putIdempotent(ctx, s.eventKey(run.ID, run.Action, run.StartVersion, id), event); err != nil {
+	if err := s.appendEvent(ctx, run.ID, run.Action, run.StartVersion, ulid.Make(), event); err != nil {
 		return err
 	}
 	if err := s.putIdempotent(ctx, s.signalKey(run.StartVersion, sig.GetId()), marker); err != nil {
@@ -71,34 +51,22 @@ func (s *objectStore) recordSignal(ctx context.Context, run Run, sig *fsmv1.Sign
 	}
 
 	if busIsLive(s.bus) {
-		s.publishBroadcast(subjectSignal, fsmv1.RunEventKind_RUN_EVENT_KIND_SIGNAL, run.StartVersion, "")
+		s.publishControl(subjectSignal, fsmv1.RunEventKind_RUN_EVENT_KIND_SIGNAL, run.StartVersion, "")
 	}
 	return nil
 }
 
-// signalIDs returns the IDs of every pending signal marker, by run, oldest first, from one
-// keys-only listing of the signals/ prefix. A marker whose signal was consumed but whose delete
-// failed is listed too; the run's consumed IDs filter it.
-func (s *objectStore) signalIDs(ctx context.Context) (map[ulid.ULID][]string, error) {
-	keys, err := s.listKeys(ctx, s.signalsPrefix())
+// pendingSignalIDs returns the IDs of the run's pending signal markers, from a keys-only listing
+// of its signals/<version>/ prefix. A marker whose signal was consumed but whose delete failed is
+// listed too; the run's consumed IDs filter it.
+func (s *objectStore) pendingSignalIDs(ctx context.Context, version ulid.ULID) ([]string, error) {
+	keys, err := s.listKeys(ctx, s.signalPrefix(version))
 	if err != nil {
 		return nil, err
 	}
-
-	ids := map[ulid.ULID][]string{}
+	ids := make([]string, 0, len(keys))
 	for _, key := range keys {
-		rest := strings.TrimPrefix(key, s.signalsPrefix())
-		runPart, id, ok := strings.Cut(rest, "/")
-		if !ok {
-			s.logger.WarnContext(ctx, "malformed signal marker key", "key", key)
-			continue
-		}
-		version, err := ulid.Parse(runPart)
-		if err != nil {
-			s.logger.WarnContext(ctx, "malformed signal marker key", "error", err, "key", key)
-			continue
-		}
-		ids[version] = append(ids[version], id)
+		ids = append(ids, strings.TrimPrefix(key, s.signalPrefix(version)))
 	}
 	return ids, nil
 }

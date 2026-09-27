@@ -802,8 +802,8 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		runCtx, stop := context.WithCancelCause(ctx)
 		ctx, cancel := context.WithCancelCause(runCtx)
 
-		mb, closeMailbox := newMailbox(ri.signals, ri.consumedSignals, logger)
-		defer closeMailbox()
+		mb := newMailbox(ri.signals, ri.consumedSignals, logger)
+		defer mb.close()
 		request.withMailbox(mb)
 
 		m.mu.Lock()

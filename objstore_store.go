@@ -181,7 +181,7 @@ func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEve
 	if busIsLive(s.bus) {
 		switch event.GetType() {
 		case fsmv1.EventType_EVENT_TYPE_START:
-			s.publishBroadcast(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
+			s.publishControl(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
 		case fsmv1.EventType_EVENT_TYPE_COMPLETE,
 			fsmv1.EventType_EVENT_TYPE_ERROR,
 			fsmv1.EventType_EVENT_TYPE_CANCEL:
@@ -192,11 +192,11 @@ func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEve
 	return eventVersion, nil
 }
 
-// publishBroadcast emits a control broadcast — pending, done, cancel, or signal — carrying only
+// publishControl emits a control event — pending, done, cancel, or signal — carrying only
 // the run identity (and, for a cancel, its cause). Its meaning is the kind and the subject it
 // rides on. Best-effort per the EventBus contract; the durable log and sentinels are the source
 // of truth.
-func (s *objectStore) publishBroadcast(subject string, kind fsmv1.RunEventKind, version ulid.ULID, cause string) {
+func (s *objectStore) publishControl(subject string, kind fsmv1.RunEventKind, version ulid.ULID, cause string) {
 	runVersion, _ := version.MarshalText() // a valid ULID never fails to marshal
 	s.bus.Publish(subject, &fsmv1.RunEvent{
 		Kind:       kind,
@@ -538,14 +538,14 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 			s.logger.ErrorContext(ctx, "failed to release queue slot", "error", err, versionAttr(run.StartVersion), "queue", releaseQueue)
 		}
 		if busIsLive(s.bus) {
-			s.publishBroadcast(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
+			s.publishControl(subjectPending, fsmv1.RunEventKind_RUN_EVENT_KIND_PENDING, run.StartVersion, "")
 		}
 	}
 
 	// The finish cleanup is complete — lock deleted, history written, outcome recorded — so a
 	// waiter released now observes everything fsm.run.done implies.
 	if busIsLive(s.bus) {
-		s.publishBroadcast(doneSubject(run.StartVersion), fsmv1.RunEventKind_RUN_EVENT_KIND_DONE, run.StartVersion, "")
+		s.publishControl(doneSubject(run.StartVersion), fsmv1.RunEventKind_RUN_EVENT_KIND_DONE, run.StartVersion, "")
 	}
 
 	return nil
@@ -829,7 +829,7 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	// Subscribe before the first manifest read: a completion landing between the read and the
 	// wait still wakes us, and one that landed before Subscribe returned is caught by that
 	// first read.
-	signal, unsubscribe := subscribeBroadcast(s.bus, doneSubject(runVersion), s.logger)
+	done, unsubscribe := subscribeWakeup(s.bus, doneSubject(runVersion), s.logger)
 	defer unsubscribe()
 
 	var outcome error
@@ -885,7 +885,7 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-		case <-signal:
+		case <-done:
 			if !timer.Stop() {
 				<-timer.C
 			}

@@ -80,12 +80,12 @@ func busIsLive(b EventBus) bool {
 	return !noop
 }
 
-// subscribeBroadcast turns a subscription into a coalescing wakeup channel: the callback does a
+// subscribeWakeup turns a subscription into a coalescing wakeup channel: the callback does a
 // non-blocking send into a size-1 buffer, so a burst of events collapses to a single pending
 // wakeup and never blocks the bus. A failed subscription logs and returns a no-op unsubscribe,
 // leaving the caller on its polling floor. The internal fast paths — WaitRun's done wait, the
 // claim wakeup, the cancel sweep — consume it and ignore the payload, routing on the subject.
-func subscribeBroadcast(bus EventSubscriber, subject string, logger *slog.Logger) (<-chan struct{}, func()) {
+func subscribeWakeup(bus EventSubscriber, subject string, logger *slog.Logger) (<-chan struct{}, func()) {
 	wake := make(chan struct{}, 1)
 	unsubscribe, err := bus.Subscribe(subject, func(*fsmv1.RunEvent) {
 		select {

@@ -81,14 +81,25 @@ func repeatingFSM(t *testing.T, m *Manager, action string, it *iterations, predi
 
 func startAndWait(t *testing.T, m *Manager, start Start[orderReq, orderResp], id string) (ulid.ULID, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	version := startOrder(t, start, id)
+	return version, waitFor(m, version)
+}
 
-	version, err := start(ctx, id, NewRequest(&orderReq{}, &orderResp{}))
+// startOrder starts a run of an orderReq FSM and returns its version.
+func startOrder(t *testing.T, start Start[orderReq, orderResp], id string) ulid.ULID {
+	t.Helper()
+	version, err := start(context.Background(), id, NewRequest(&orderReq{}, &orderResp{}))
 	if err != nil {
 		t.Fatalf("failed to start FSM: %v", err)
 	}
-	return version, m.Wait(ctx, version)
+	return version
+}
+
+// waitFor waits up to ten seconds for the run and returns its outcome.
+func waitFor(m *Manager, version ulid.ULID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return m.Wait(ctx, version)
 }
 
 // TestRepeatWhileRunsEachIteration verifies a repeated transition runs once per index the
