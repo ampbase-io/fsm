@@ -260,7 +260,32 @@ bus := natsbus.New(nc, logger, natsbus.WithSubjectPrefix("org.acme"))
 - **"Start this child unless I already did" needs more than that error.** Transitions and
   finalizers run at least once, so a parent re-enters the code that starts its children.
   `AlreadyRunningError` covers only a child still running: a finished child's id can be started
-  again, and queued starts stack. Check `Runs(id)` before starting.
+  again, and a plain queued start stacks. Check `Runs(id)` before starting.
+
+## Queues and exclusivity
+
+`Config.Queues` gives a queue a cluster-wide capacity, and `fsm.WithQueue(name)` starts a run
+under it: the run is persisted immediately and the claim loop admits it when the queue has room.
+
+A run started with no queue holds its resource — its type, id and action — so a second start
+while it is live gets an `*AlreadyRunningError` naming it. Queued runs stack behind one another
+instead, so several runs of one id can be live at once.
+
+`fsm.WithExclusiveQueue(name)` is both: the run waits for the queue's capacity and holds its
+resource for its whole life.
+
+```go
+version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
+```
+
+- **Held from Start, not from admission.** A run still waiting for capacity already refuses a
+  second start of its id.
+- **Refused the same way as an unqueued run.** A second start, queued or not, gets an
+  `*AlreadyRunningError` naming the live run, and over the RPC an `AlreadyExists` carrying its
+  version.
+- **Released when the run finishes,** so the id is free again.
+- **Other ids are unaffected.** Exclusivity is per resource; the queue's capacity still governs
+  how many run at once across the fleet.
 
 ## Observability
 

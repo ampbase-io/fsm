@@ -564,11 +564,11 @@ func (s *boltStore) currentState(ctx context.Context, tx *bbolt.Tx, run Run) str
 }
 
 // activeKey is a run's ACTIVE bucket key, <resource_type>#<resource_id>#<action>#<run_version>,
-// with the zero version for a run that is not queue-gated: only one such run per resource is
-// active at a time, while queued runs stack.
+// with the zero version for a run that holds its resource: only one such run per resource is
+// active at a time, while queued runs stack behind it (Run.stacks).
 func activeKey(run Run) ([]byte, error) {
 	version := ulid.ULID{}
-	if run.Queue != "" {
+	if run.stacks() {
 		version = run.StartVersion
 	}
 	versionBytes, err := version.MarshalText()
@@ -808,6 +808,7 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 				DelayUntil: delayMillis(start.DelayUntil),
 				RunAfter:   optionalVersionBytes(start.RunAfter),
 				Queue:      run.Queue,
+				Exclusive:  run.Exclusive,
 				Parent:     parentBytes,
 			},
 			TraceContext: map[string]string{},
@@ -832,8 +833,8 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 
 		switch event.GetType() {
 		case fsmv1.EventType_EVENT_TYPE_START:
-			// NOTE: we only allow one active event per resource unless it's getting queued
-			if run.Queue == "" && activeB.Get(aeEventKey) != nil {
+			// One active event per resource, unless the run stacks behind the one holding it.
+			if !run.stacks() && activeB.Get(aeEventKey) != nil {
 				var ae fsmv1.ActiveEvent
 				if err := proto.Unmarshal(activeB.Get(aeEventKey), &ae); err != nil {
 					return err

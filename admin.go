@@ -249,7 +249,10 @@ func startOptionsFromProto(o *fsmv1.StartOptions) ([]StartOptionsFn, error) {
 		}
 		opts = append(opts, WithRunAfter(version))
 	}
-	if q := o.GetQueue(); q != "" {
+	switch q := o.GetQueue(); {
+	case q != "" && o.GetExclusive():
+		opts = append(opts, WithExclusiveQueue(q))
+	case q != "":
 		opts = append(opts, WithQueue(q))
 	}
 	if p := o.GetParent(); p != "" {

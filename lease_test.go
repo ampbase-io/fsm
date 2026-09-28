@@ -144,7 +144,7 @@ func putLock(t *testing.T, s *objectStore, key string, version ulid.ULID) {
 }
 
 func runLockKey(s *objectStore, run Run) string {
-	return s.lockKey(run.TypeName, run.ID, run.Action, "", run.StartVersion)
+	return s.lockKey(run)
 }
 
 func TestLeaseStampedAtStart(t *testing.T) {
@@ -668,11 +668,11 @@ func TestStaleOrphanLockReaped(t *testing.T) {
 	a := h.store("node-a", 50*time.Millisecond)
 
 	staleVersion := testULID(t, uint64(time.Now().Add(-time.Minute).UnixMilli()))
-	staleKey := a.lockKey("orderReq", "stale-1", "deploy", "", staleVersion)
+	staleKey := a.lockKey(Run{TypeName: "orderReq", ID: "stale-1", Action: "deploy", StartVersion: staleVersion})
 	putLock(t, a, staleKey, staleVersion)
 
 	freshVersion := ulid.Make()
-	freshKey := a.lockKey("orderReq", "fresh-1", "deploy", "", freshVersion)
+	freshKey := a.lockKey(Run{TypeName: "orderReq", ID: "fresh-1", Action: "deploy", StartVersion: freshVersion})
 	putLock(t, a, freshKey, freshVersion)
 
 	entries, err := a.scanLocks(ctx, a.lockPrefix("orderReq"))

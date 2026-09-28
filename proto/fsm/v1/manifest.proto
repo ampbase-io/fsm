@@ -88,4 +88,9 @@ message RunManifest {
   // COMPLETE's, and any whose marker delete failed. A pending marker whose ID is here is never
   // offered again. Once a marker is deleted, the next COMPLETE drops its ID.
   repeated string consumed_signals = 30;
+
+  // exclusive is a queued run that holds its resource's lock rather than stacking behind one.
+  // The finish builds the lock key to delete from here; without it the finish would delete a key
+  // nothing holds and leave the run's own lock for the next start to reap as a terminal one.
+  bool exclusive = 31;
 }

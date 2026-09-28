@@ -16,8 +16,16 @@ import (
 // completes immediately, returning the resume function used to adopt runs started elsewhere.
 func completingFSM(t *testing.T, m *Manager, action string) Resume {
 	t.Helper()
+	_, resume := completingStart(t, m, action)
+	return resume
+}
 
-	_, resume, err := m.Register[orderReq, orderResp](action).
+// completingStart is completingFSM with the start it registers, for a test that also starts runs
+// of the same action.
+func completingStart(t *testing.T, m *Manager, action string) (Start[orderReq, orderResp], Resume) {
+	t.Helper()
+
+	start, resume, err := m.Register[orderReq, orderResp](action).
 		Start("created", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
 			return NewResponse(&orderResp{Status: "resumed"}), nil
 		}).
@@ -26,7 +34,7 @@ func completingFSM(t *testing.T, m *Manager, action string) Resume {
 	if err != nil {
 		t.Fatalf("failed to build %s FSM: %v", action, err)
 	}
-	return resume
+	return start, resume
 }
 
 // crossManagerTimings expires leases quickly while suppressing heartbeats and the periodic
