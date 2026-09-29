@@ -326,8 +326,8 @@ type fsm struct {
 	// signals are the signals the FSM's runs accept, by name. Set at End().
 	signals map[string]AnySignal
 
-	// exclusiveQueue is the queue every run of the FSM is started on, exclusively; empty for an
-	// FSM whose starts choose their own queueing. Set at End() (RunsExclusively).
+	// exclusiveQueue names the queue every run of the FSM waits on while holding its resource;
+	// empty for an FSM whose starts choose their own queueing. Set at End() (RunsExclusively).
 	exclusiveQueue string
 }
 
@@ -601,8 +601,8 @@ type startOptions struct {
 	parent ulid.ULID
 }
 
-// asksExclusively reports whether the start asked for exactly the queueing an FSM declaring queue
-// runs under, which is the one shape resolveStart accepts beside saying nothing at all.
+// asksExclusively reports whether the start asked for exactly what a declaration of the named
+// queue means: that queue, held exclusively. It is the only explicit form resolveStart accepts.
 func (o startOptions) asksExclusively(queue string) bool {
 	return o.queue == queue && o.exclusive
 }
@@ -655,9 +655,10 @@ func WithParent(parent ulid.ULID) StartOptionsFn {
 	}
 }
 
-// declareExclusive records the queue every run of f is started on exclusively, refusing one the
-// Manager has no capacity configured for: under the object backend no node would admit such a run,
-// and its resource lock — taken at Start — would block the id until the queue was configured.
+// declareExclusive records the queue every run of f waits on while holding its resource. It
+// refuses a queue the Manager has no capacity for: under the object backend no node would admit
+// such a run, and its resource lock — taken at Start — would block the id until that queue was
+// configured.
 func (m *Manager) declareExclusive(f *fsm, queue string) error {
 	if queue == "" {
 		return nil

@@ -131,8 +131,8 @@ type TransitionConfig[R, W any] struct {
 	// signals are the signals the FSM's runs accept, configured when calling End.
 	signals []AnySignal
 
-	// exclusiveQueue is the queue every run of the FSM is started on, exclusively, configured
-	// when calling End.
+	// exclusiveQueue names the queue every run of the FSM waits on while holding its resource,
+	// set by RunsExclusively when calling End.
 	exclusiveQueue string
 }
 
@@ -228,10 +228,11 @@ func (o exclusiveOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *Transition
 	return cfg
 }
 
-// RunsExclusively declares that every run of the FSM is queued on queue and holds its resource, as
-// WithExclusiveQueue does per start, so no start path can launch a second run of one id. A start
-// that passes the matching option is accepted; one naming another queue, or queueing without
-// exclusivity, is refused. Build fails unless the queue is configured on the Manager.
+// RunsExclusively declares that every run of the FSM waits for the named queue's capacity and
+// holds its resource, as WithExclusiveQueue does for one start, so no start path can launch a
+// second run of an id. A start that passes the matching option is accepted; one naming a different
+// queue, or queueing without exclusivity, is refused. Build fails unless the Manager has capacity
+// configured for that queue.
 func RunsExclusively[R, W any](queue string) EndOption[R, W] {
 	return exclusiveOption[R, W](queue)
 }

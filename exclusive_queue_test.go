@@ -363,14 +363,14 @@ func TestPlainQueueStacksBesideExclusive(t *testing.T) {
 	within(t, entered, 10*time.Second, "the stacked run")
 }
 
-// heldExclusively reports whether the run was recorded as queued on queue and holding its
+// heldExclusively reports whether the run was recorded on the named queue and holding its
 // resource, which is what a declared start records.
 func heldExclusively(run Run, queue string) bool {
 	return run.Queue == queue && run.Exclusive
 }
 
 // declaredFSM registers an FSM that blocks in its first transition and declares itself exclusive
-// on queue.
+// on the named queue.
 func declaredFSM(t *testing.T, m *Manager, action, queue string, entered chan<- struct{}, release <-chan struct{}) Start[orderReq, orderResp] {
 	t.Helper()
 	return blockingFSM(t, m, action, entered, release, RunsExclusively[orderReq, orderResp](queue))
