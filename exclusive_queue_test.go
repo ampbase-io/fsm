@@ -333,3 +333,32 @@ func TestBoltActiveReportsExclusive(t *testing.T) {
 		t.Fatalf("expected one active run, got %d", len(active))
 	}
 }
+
+// TestPlainQueueStacksBesideExclusive pins the boundary of the guarantee: exclusivity is a
+// property of the starts, not of the resource, so a plain WithQueue start of the same id takes a
+// version-keyed lock and runs beside an exclusive one. Every start of a resource that must run
+// alone has to pass WithExclusiveQueue.
+func TestPlainQueueStacksBesideExclusive(t *testing.T) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		cfg.ClaimInterval = 50 * time.Millisecond
+	})
+	ctx := context.Background()
+	m, _ := b.newManager(map[string]int{"mixed": 2})
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer close(release)
+	start := blockingFSM(t, m, "excl-mixed", entered, release)
+
+	if _, err := startExclusive(start, "mixed-1", "mixed"); err != nil {
+		t.Fatalf("the exclusive start: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the exclusive run")
+
+	// Documented gap, not a guarantee: the plain start's lock carries its version, so it does not
+	// collide with the resource lock the exclusive run holds.
+	if _, err := start(ctx, "mixed-1", NewRequest(&orderReq{}, &orderResp{}), WithQueue("mixed")); err != nil {
+		t.Fatalf("a plain queued start beside an exclusive run: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the stacked run")
+}

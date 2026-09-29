@@ -280,9 +280,16 @@ version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
 
 - **Held from Start, not from admission.** A run still waiting for capacity already refuses a
   second start of its id.
-- **Refused the same way as an unqueued run.** A second start, queued or not, gets an
-  `*AlreadyRunningError` naming the live run, and over the RPC an `AlreadyExists` carrying its
-  version.
+- **Refused the same way as an unqueued run.** A second start that also takes the resource's lock
+  — an unqueued start, or another exclusive one — gets an `*AlreadyRunningError` naming the live
+  run, and over the RPC an `AlreadyExists` carrying its version.
+- **Every start of the resource must use it.** A plain `WithQueue` start of the same id still
+  stacks beside an exclusive run, because its lock is keyed by run version. Exclusivity is a
+  property of the starts, not of the resource, so a call site left on `WithQueue` silently runs
+  a second time.
+- **A run that is never admitted holds the resource** until the queue has capacity, and
+  `Cancel` cannot release it: a cancel is applied by the node executing the run, and none has
+  claimed it.
 - **Released when the run finishes,** so the id is free again.
 - **Other ids are unaffected.** Exclusivity is per resource; the queue's capacity still governs
   how many run at once across the fleet.
