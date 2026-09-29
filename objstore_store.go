@@ -33,13 +33,27 @@ func (s *objectStore) runsPrefix() string {
 	return s.key("runs") + "/"
 }
 
-// lockKey returns the resource lock key enforcing one-active-run-per-resource. Queued runs are
-// allowed to stack, so their locks are further keyed by run version.
-func (s *objectStore) lockKey(resourceType, resourceID, action, queue string, runVersion ulid.ULID) string {
-	if queue == "" {
-		return s.key("locks", escapeSegment(resourceType), escapeSegment(resourceID), escapeSegment(action))
+// lockedRun is the run a manifest's lock key is built from: the identity and the two fields the
+// key depends on, without the state and outcome runFromManifest reconstructs.
+func lockedRun(version ulid.ULID, m *fsmv1.RunManifest) Run {
+	return Run{
+		ID:           m.GetResourceId(),
+		StartVersion: version,
+		Action:       m.GetAction(),
+		TypeName:     m.GetResourceType(),
+		Queue:        m.GetQueue(),
+		Exclusive:    m.GetExclusive(),
 	}
-	return s.key("locks", escapeSegment(resourceType), escapeSegment(resourceID), escapeSegment(action), runVersion.String())
+}
+
+// lockKey is the run's resource lock: locks/<type>/<id>/<action>, which only one run holds at a
+// time, plus the run version for a run that stacks behind it (Run.stacks).
+func (s *objectStore) lockKey(run Run) string {
+	resource := s.key("locks", escapeSegment(run.TypeName), escapeSegment(run.ID), escapeSegment(run.Action))
+	if !run.stacks() {
+		return resource
+	}
+	return resource + "/" + run.StartVersion.String()
 }
 
 func (s *objectStore) lockPrefix(resourceType string) string {
@@ -283,7 +297,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 	}
 
 	// 1. Acquire the resource lock. A 412 means another run holds it.
-	lockKey := s.lockKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.Queue, run.StartVersion)
+	lockKey := s.lockKey(run)
 	if err := s.acquireRunLock(ctx, lockKey, runVersionBytes); err != nil {
 		return err
 	}
@@ -343,6 +357,7 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 		Transitions:    start.Transitions,
 		Resource:       start.Resource,
 		Queue:          run.Queue,
+		Exclusive:      run.Exclusive,
 		Parent:         optionalVersionBytes(run.Parent),
 		DelayUntil:     delayMillis(start.DelayUntil),
 		RunAfter:       optionalVersionBytes(start.RunAfter),
@@ -517,7 +532,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 
 	// The lock is deleted after the manifest records completion; a crash in between leaves an
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
-	lockKey := s.lockKey(manifest.GetResourceType(), manifest.GetResourceId(), manifest.GetAction(), manifest.GetQueue(), run.StartVersion)
+	lockKey := s.lockKey(lockedRun(run.StartVersion, manifest))
 	if err := s.deleteObject(ctx, lockKey); err != nil {
 		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
 	}
@@ -585,6 +600,7 @@ func activeEventFromManifest(m *fsmv1.RunManifest) *fsmv1.ActiveEvent {
 			DelayUntil: m.GetDelayUntil(),
 			RunAfter:   m.GetRunAfter(),
 			Queue:      m.GetQueue(),
+			Exclusive:  m.GetExclusive(),
 			Parent:     m.GetParent(),
 		},
 		TraceContext: m.GetTraceContext(),
@@ -641,6 +657,7 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 		CurrentState: nextState(m.GetTransitions(), m.GetCompletedStates(), m.GetIterations()),
 		TypeName:     m.GetResourceType(),
 		Queue:        m.GetQueue(),
+		Exclusive:    m.GetExclusive(),
 		Parent:       parent,
 		fsmErr:       recordedRunErr(m),
 	}

@@ -250,7 +250,11 @@ func startOptionsFromProto(o *fsmv1.StartOptions) ([]StartOptionsFn, error) {
 		opts = append(opts, WithRunAfter(version))
 	}
 	if q := o.GetQueue(); q != "" {
-		opts = append(opts, WithQueue(q))
+		queue := WithQueue
+		if o.GetExclusive() {
+			queue = WithExclusiveQueue
+		}
+		opts = append(opts, queue(q))
 	}
 	if p := o.GetParent(); p != "" {
 		version, err := ulid.Parse(p)

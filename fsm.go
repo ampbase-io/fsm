@@ -263,6 +263,10 @@ type Run struct {
 
 	Queue string
 
+	// Exclusive is a queued run that holds its resource's lock rather than stacking behind one,
+	// so only one run of its type, id and action is live at a time (WithExclusiveQueue).
+	Exclusive bool
+
 	Parent ulid.ULID
 
 	// fsmErr is the error and originating state that caused the FSM to stop executing transitions.
@@ -272,6 +276,12 @@ type Run struct {
 	// iteration.
 	iterated bool
 }
+
+// stacks reports whether the run's key carries its version, so it shares its resource with the
+// runs stacked behind it: a queued run does, unless it holds the resource's lock exclusively. An
+// unqueued run never does — its key is the resource's, which is what makes it exclusive — so
+// Exclusive says nothing without a queue.
+func (r Run) stacks() bool { return r.Queue != "" && !r.Exclusive }
 
 // iterationsCompleted is the count the COMPLETE of the run's current iteration records: its index
 // plus one in a RepeatWhile transition, zero in any other.
@@ -485,6 +495,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 		}
 
 		startOpt.queue = resource.active.GetOptions().GetQueue()
+		startOpt.exclusive = resource.active.GetOptions().GetExclusive()
 
 		if parentBytes := resource.active.GetOptions().GetParent(); parentBytes != nil {
 			if err := startOpt.parent.UnmarshalText(parentBytes); err != nil {
@@ -499,6 +510,7 @@ func (m *Manager) resumeOne[R, W any](f *fsm) func(ctx context.Context, resource
 			ResourceName: f.alias,
 			TypeName:     f.typeName,
 			Queue:        startOpt.queue,
+			Exclusive:    startOpt.exclusive,
 			Parent:       startOpt.parent,
 			fsmErr:       resource.fsmError,
 		}
@@ -576,6 +588,8 @@ type startOptions struct {
 
 	queue string
 
+	exclusive bool
+
 	parent ulid.ULID
 }
 
@@ -598,6 +612,18 @@ func WithRunAfter(version ulid.ULID) StartOptionsFn {
 func WithQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
+		opts.exclusive = false
+	}
+}
+
+// WithExclusiveQueue queues the FSM as WithQueue does, and holds the resource's lock from Start
+// until the run finishes, so an unqueued or exclusive start of the same resource is refused with
+// an *AlreadyRunningError. A plain WithQueue start still stacks beside it, so every start of a
+// resource that must run alone has to use this option.
+func WithExclusiveQueue(queue string) StartOptionsFn {
+	return func(opts *startOptions) {
+		opts.queue = queue
+		opts.exclusive = true
 	}
 }
 
@@ -682,6 +708,7 @@ func (m *Manager) persistStart(ctx context.Context, f *fsm, id string, runVersio
 		ResourceName: f.alias,
 		TypeName:     f.typeName,
 		Queue:        startOpt.queue,
+		Exclusive:    startOpt.exclusive,
 		Parent:       startOpt.parent,
 	}
 	start := &startRecord{

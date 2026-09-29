@@ -30,6 +30,10 @@ message EventOptions {
   string queue = 3;
 
   bytes parent = 4;
+
+  // exclusive is a queued run that holds its resource's lock, so only one run of its type, id
+  // and action is live at a time. Restored on resume, since the run's key depends on it.
+  bool exclusive = 5;
 }
 
 message StateEvent {

@@ -260,7 +260,42 @@ bus := natsbus.New(nc, logger, natsbus.WithSubjectPrefix("org.acme"))
 - **"Start this child unless I already did" needs more than that error.** Transitions and
   finalizers run at least once, so a parent re-enters the code that starts its children.
   `AlreadyRunningError` covers only a child still running: a finished child's id can be started
-  again, and queued starts stack. Check `Runs(id)` before starting.
+  again, and a plain queued start stacks. Check `Runs(id)` before starting.
+
+## Queues and exclusivity
+
+`Config.Queues` gives a queue a cluster-wide capacity, and `fsm.WithQueue(name)` starts a run
+under it: the run is persisted immediately and the claim loop admits it when the queue has room.
+
+A run started with no queue holds its resource — its type, id and action — so a second start
+while it is live gets an `*AlreadyRunningError` naming it. Queued runs stack behind one another
+instead, so several runs of one id can be live at once.
+
+`fsm.WithExclusiveQueue(name)` is both: the run waits for the queue's capacity and holds its
+resource for its whole life.
+
+```go
+version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
+```
+
+- **Held from Start, not from admission.** A run still waiting for capacity already refuses a
+  second start of its id.
+- **Refused the same way as an unqueued run.** A second start that also takes the resource's lock
+  — an unqueued start, or another exclusive one — gets an `*AlreadyRunningError` naming the live
+  run, and over the RPC an `AlreadyExists` carrying its version.
+- **Every start of the resource must use it.** A plain `WithQueue` start of the same id still
+  stacks beside an exclusive run, because its lock is keyed by run version. Exclusivity is a
+  property of the starts, not of the resource, so a call site left on `WithQueue` silently runs
+  a second time.
+- **A run that is never admitted holds the resource** until the queue has capacity, and
+  `Cancel` cannot release it: a cancel is applied by the node executing the run, and none has
+  claimed it.
+- **Released when the run finishes,** so the id is free again.
+- **Other ids are unaffected.** Exclusivity is per resource; the queue's capacity still governs
+  how many run at once across the fleet.
+- **The last option wins.** `WithQueue` after `WithExclusiveQueue` leaves the run queued and not
+  exclusive, as passing the plain option alone would. An empty queue name starts the run on the
+  default runner, where it holds its resource as any unqueued run does.
 
 ## Observability
 

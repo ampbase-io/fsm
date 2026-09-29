@@ -46,6 +46,7 @@ message StartOptions {
   string run_after = 2;   // run version to wait for; empty = none
   string queue = 3;       // queue name; empty = default runner
   string parent = 4;      // parent run version; empty = none
+  bool exclusive = 5;     // with queue: hold the resource's lock, so one run per id is live
 }
 
 message StartRequest {

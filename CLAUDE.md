@@ -21,7 +21,9 @@ backend's distributed-execution design is the active work.
   credentials; the request tier is a thin Connect client. Submission durability lives in the
   ingress — the RPC `Start` persists then acks, synchronously.
 - **Manifests are keyed by run version alone** (`runs/<run_version>`). Id/tuple lookups go
-  through `locks/` (active) and `index/` (history). Don't re-key.
+  through `locks/` (active) and `index/` (history). Don't re-key. Whether a run's key carries its
+  version is `Run.stacks()` (fsm.go) — queued and not exclusive — and both backends' key builders
+  ask it: `objectStore.lockKey` and bolt's `activeKey`. Don't re-derive that rule at a call site.
 - **The object-storage event log is the source of truth.** The bus is an accelerator: publish
   only after the durable write, never block a transition, tolerate dropped events. `owner_node`
   is a node identity, never a routable address — there is no worker-to-worker RPC in the design.
