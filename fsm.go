@@ -601,6 +601,12 @@ type startOptions struct {
 	parent ulid.ULID
 }
 
+// asksExclusively reports whether the start asked for exactly the queueing an FSM declaring queue
+// runs under, which is the one shape resolveStart accepts beside saying nothing at all.
+func (o startOptions) asksExclusively(queue string) bool {
+	return o.queue == queue && o.exclusive
+}
+
 // WithDelayedStart will delay the start of the FSM until the provided time.
 func WithDelayedStart(until time.Time) StartOptionsFn {
 	return func(opts *startOptions) {
@@ -679,7 +685,7 @@ func (f *fsm) resolveStart(opts []StartOptionsFn) (startOptions, error) {
 		startOpt.queue, startOpt.exclusive = f.exclusiveQueue, true
 		return startOpt, nil
 	}
-	if startOpt.queue != f.exclusiveQueue || !startOpt.exclusive {
+	if !startOpt.asksExclusively(f.exclusiveQueue) {
 		return startOptions{}, fmt.Errorf("%w: %s/%s runs exclusively on %s", errQueueConflict, f.typeName, f.action, f.exclusiveQueue)
 	}
 	return startOpt, nil

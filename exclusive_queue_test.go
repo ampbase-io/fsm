@@ -363,6 +363,12 @@ func TestPlainQueueStacksBesideExclusive(t *testing.T) {
 	within(t, entered, 10*time.Second, "the stacked run")
 }
 
+// heldExclusively reports whether the run was recorded as queued on queue and holding its
+// resource, which is what a declared start records.
+func heldExclusively(run Run, queue string) bool {
+	return run.Queue == queue && run.Exclusive
+}
+
 // declaredFSM registers an FSM that blocks in its first transition and declares itself exclusive
 // on queue.
 func declaredFSM(t *testing.T, m *Manager, action, queue string, entered chan<- struct{}, release <-chan struct{}) Start[orderReq, orderResp] {
@@ -392,7 +398,7 @@ func TestRunsExclusivelyHonoredByEveryStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live run: %v", err)
 	}
-	if run.Queue != "declared" || !run.Exclusive {
+	if !heldExclusively(run, "declared") {
 		t.Fatalf("expected the run recorded queued and exclusive, got %+v", run)
 	}
 
@@ -487,7 +493,7 @@ func TestRunsExclusivelyPassesOtherOptions(t *testing.T) {
 	if run.Parent != parent {
 		t.Fatalf("expected the parent kept, got %s", run.Parent)
 	}
-	if run.Queue != "declared" || !run.Exclusive {
+	if !heldExclusively(run, "declared") {
 		t.Fatalf("expected the declaration adopted beside it, got %+v", run)
 	}
 }
