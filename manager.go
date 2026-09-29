@@ -110,7 +110,14 @@ type Manager struct {
 
 	fsms map[fsmKey]*fsm
 
-	queues map[string]*queuedRunner
+	// queues is Config.Queues as given: the only record of which queue names exist that both
+	// backends have, so it is what a RunsExclusively declaration is validated against.
+	queues map[string]int
+
+	// runners are the in-process queue runners, built from queues and BoltDB-only: the object
+	// backend enforces capacity cluster-wide in the claim loop and starts none, so this is empty
+	// there and cannot stand in for queues.
+	runners map[string]*queuedRunner
 
 	done chan struct{}
 
@@ -230,7 +237,8 @@ func New(cfg Config) (*Manager, error) {
 		store:       store,
 		bus:         busOrNoop(cfg.EventBus),
 		fsms:        map[fsmKey]*fsm{},
-		queues:      make(map[string]*queuedRunner, len(cfg.Queues)),
+		runners:     make(map[string]*queuedRunner, len(cfg.Queues)),
+		queues:      cfg.Queues,
 		done:        done,
 		claimNudge:  make(chan struct{}, 1),
 		running:     map[ulid.ULID]runHandle{},
@@ -253,7 +261,7 @@ func New(cfg Config) (*Manager, error) {
 				queue:  make(chan queueItem),
 				queued: make([]func(), 0, size),
 			}
-			man.queues[name] = q
+			man.runners[name] = q
 			go q.run(done, cfg.Logger.With("queue", name, "size", size))
 		}
 	}
@@ -644,9 +652,9 @@ func (m *Manager) startOpaque(ctx context.Context, typeName, action, id string, 
 		return ulid.ULID{}, err
 	}
 
-	var startOpt startOptions
-	for _, opt := range opts {
-		opt(&startOpt)
+	startOpt, err := f.resolveStart(opts)
+	if err != nil {
+		return ulid.ULID{}, err
 	}
 
 	runVersion := ulid.Make()

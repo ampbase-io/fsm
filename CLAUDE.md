@@ -24,6 +24,9 @@ backend's distributed-execution design is the active work.
   through `locks/` (active) and `index/` (history). Don't re-key. Whether a run's key carries its
   version is `Run.stacks()` (fsm.go) — queued and not exclusive — and both backends' key builders
   ask it: `objectStore.lockKey` and bolt's `activeKey`. Don't re-derive that rule at a call site.
+  A start's queueing is resolved once, in `fsm.resolveStart`, against the FSM's `RunsExclusively`
+  declaration; both start paths (`Manager.start`, `startOpaque`) call it, so no ingress can
+  bypass it. Resume never consults the declaration — a run keeps the options it was started with.
 - **The object-storage event log is the source of truth.** The bus is an accelerator: publish
   only after the durable write, never block a transition, tolerate dropped events. `owner_node`
   is a node identity, never a routable address — there is no worker-to-worker RPC in the design.

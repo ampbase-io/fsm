@@ -224,7 +224,7 @@ func startError(err error) error {
 	switch {
 	case errors.Is(err, errFSMNotRegistered):
 		return connect.NewError(connect.CodeNotFound, err)
-	case errors.Is(err, errAmbiguousAction), errors.Is(err, errInvalidResource):
+	case errors.Is(err, errAmbiguousAction), errors.Is(err, errInvalidResource), errors.Is(err, errQueueConflict):
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	default:
 		return connect.NewError(connect.CodeInternal, err)

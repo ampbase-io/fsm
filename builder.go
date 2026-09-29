@@ -130,6 +130,10 @@ type TransitionConfig[R, W any] struct {
 
 	// signals are the signals the FSM's runs accept, configured when calling End.
 	signals []AnySignal
+
+	// exclusiveQueue names the queue every run of the FSM waits on while holding its resource,
+	// set by RunsExclusively when calling End.
+	exclusiveQueue string
 }
 
 type Option[R, W any] interface {
@@ -216,6 +220,22 @@ func (o finalizerOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *Transition
 // on a lost lease, with cause ErrLeaseLost. A finalizer runs again if the run is resumed before
 // its FINISH is recorded.
 type Finalizer[R, W any] func(context.Context, *Request[R, W], RunErr)
+
+type exclusiveOption[R, W any] string
+
+func (o exclusiveOption[R, W]) applyEnd(cfg *TransitionConfig[R, W]) *TransitionConfig[R, W] {
+	cfg.exclusiveQueue = string(o)
+	return cfg
+}
+
+// RunsExclusively declares that every run of the FSM waits for the named queue's capacity and
+// holds its resource, as WithExclusiveQueue does for one start, so no start path can launch a
+// second run of an id. A start that passes the matching option is accepted; one naming a different
+// queue, or queueing without exclusivity, is refused. Build fails unless the Manager has capacity
+// configured for that queue.
+func RunsExclusively[R, W any](queue string) EndOption[R, W] {
+	return exclusiveOption[R, W](queue)
+}
 
 // WithFinalizers adds the provided Finalizers to the list of finalizers to be executed when the FSM
 // has completed.
@@ -343,6 +363,12 @@ func (s *fsmTransition[R, W]) End(name string, opts ...EndOption[R, W]) *fsmEnd[
 		return &fsmEnd[R, W]{s.transitionStep}
 	}
 	s.f.signals = accepted
+
+	if err := s.m.declareExclusive(s.f, cfg.exclusiveQueue); err != nil {
+		s.m.logger.Error("invalid exclusive queue", "fsm", s.f.typeName, "error", err)
+		s.buildError = errors.Join(s.buildError, err)
+		return &fsmEnd[R, W]{s.transitionStep}
+	}
 
 	for _, d := range s.pending {
 		s.f.registeredTransitions[s.f.transitionKey(d.name)] = s.build(d, cfg.every)
