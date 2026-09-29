@@ -32,7 +32,7 @@ func acceptTestSignals() EndOption[orderReq, orderResp] {
 }
 
 // noSignal reports whether nothing arrives on ch within a short wait.
-func noSignal[T any](ch <-chan Received[T]) bool {
+func noSignal[T any](ch <-chan T) bool {
 	select {
 	case <-ch:
 		return false

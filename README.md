@@ -286,6 +286,9 @@ version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
 - **Released when the run finishes,** so the id is free again.
 - **Other ids are unaffected.** Exclusivity is per resource; the queue's capacity still governs
   how many run at once across the fleet.
+- **The last option wins.** `WithQueue` after `WithExclusiveQueue` leaves the run queued and not
+  exclusive, as passing the plain option alone would. An empty queue name starts the run on the
+  default runner, where it holds its resource as any unqueued run does.
 
 ## Observability
 

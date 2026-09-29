@@ -37,6 +37,19 @@ func (s *objectStore) runsPrefix() string {
 // allowed to stack, so their locks are further keyed by run version.
 // lockKey is the run's resource lock: locks/<type>/<id>/<action>, which only one run holds at a
 // time, plus the run version for a run that stacks behind it (Run.stacks).
+// lockedRun is the run a manifest's lock key is built from: the identity and the two fields the
+// key depends on, without the state and outcome runFromManifest reconstructs.
+func lockedRun(version ulid.ULID, m *fsmv1.RunManifest) Run {
+	return Run{
+		ID:           m.GetResourceId(),
+		StartVersion: version,
+		Action:       m.GetAction(),
+		TypeName:     m.GetResourceType(),
+		Queue:        m.GetQueue(),
+		Exclusive:    m.GetExclusive(),
+	}
+}
+
 func (s *objectStore) lockKey(run Run) string {
 	resource := s.key("locks", escapeSegment(run.TypeName), escapeSegment(run.ID), escapeSegment(run.Action))
 	if !run.stacks() {
@@ -521,7 +534,7 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 
 	// The lock is deleted after the manifest records completion; a crash in between leaves an
 	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
-	lockKey := s.lockKey(runFromManifest(run.StartVersion, manifest))
+	lockKey := s.lockKey(lockedRun(run.StartVersion, manifest))
 	if err := s.deleteObject(ctx, lockKey); err != nil {
 		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
 	}

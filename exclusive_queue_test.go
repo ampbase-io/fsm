@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,13 +14,6 @@ import (
 	"github.com/oklog/ulid/v2"
 	"go.etcd.io/bbolt"
 )
-
-// exclusiveFSM registers a run that blocks in its first transition until release closes, and
-// returns the start and the channel each entry reports on.
-func exclusiveFSM(t *testing.T, m *Manager, action string, entered chan<- struct{}, release <-chan struct{}) Start[orderReq, orderResp] {
-	t.Helper()
-	return blockingFSM(t, m, action, entered, release)
-}
 
 // startExclusive starts an exclusive queued run and returns its version and error.
 func startExclusive(start Start[orderReq, orderResp], id, queue string) (ulid.ULID, error) {
@@ -51,7 +45,7 @@ func TestExclusiveQueueRefusesSecondStart(t *testing.T) {
 	release := make(chan struct{})
 	// Capacity 0 holds every start pending: the lock must already refuse a second start.
 	holder, _ := b.newManager(map[string]int{"pending": 0})
-	pendingStart := exclusiveFSM(t, holder, "excl-pending", entered, release)
+	pendingStart := blockingFSM(t, holder, "excl-pending", entered, release)
 
 	first, err := startExclusive(pendingStart, "excl-1", "pending")
 	if err != nil {
@@ -67,7 +61,7 @@ func TestExclusiveQueueRefusesSecondStart(t *testing.T) {
 
 	// With capacity, the run is admitted and executes; the id stays held.
 	m, _ := b.newManager(map[string]int{"deploys": 2})
-	start := exclusiveFSM(t, m, "excl-running", entered, release)
+	start := blockingFSM(t, m, "excl-running", entered, release)
 	running, err := startExclusive(start, "excl-3", "deploys")
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -92,7 +86,7 @@ func TestExclusiveQueueRefusesSecondStart(t *testing.T) {
 
 	// A peer, which reads the lock from storage rather than from this manager's memory, can start.
 	peer, _ := b.newManager(map[string]int{"deploys": 2})
-	peerStart := exclusiveFSM(t, peer, "excl-running", entered, release)
+	peerStart := blockingFSM(t, peer, "excl-running", entered, release)
 	if _, err := startExclusive(peerStart, "excl-3", "deploys"); err != nil {
 		t.Fatalf("a start after the run finished: %v", err)
 	}
@@ -109,7 +103,7 @@ func TestExclusiveQueueAdmitsOneIDAtATime(t *testing.T) {
 
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
-	start := exclusiveFSM(t, m, "excl-cap", entered, release)
+	start := blockingFSM(t, m, "excl-cap", entered, release)
 
 	a, err := startExclusive(start, "cap-a", "one")
 	if err != nil {
@@ -121,7 +115,7 @@ func TestExclusiveQueueAdmitsOneIDAtATime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start b: %v", err)
 	}
-	if !noEntry(entered) {
+	if !noSignal(entered) {
 		t.Fatal("expected the second id to wait for capacity")
 	}
 
@@ -129,16 +123,6 @@ func TestExclusiveQueueAdmitsOneIDAtATime(t *testing.T) {
 	waitRun(t, m, a)
 	within(t, entered, 10*time.Second, "the second run once capacity freed")
 	waitRun(t, m, bVersion)
-}
-
-// noEntry reports whether nothing arrives on ch within a short wait.
-func noEntry(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return false
-	case <-time.After(300 * time.Millisecond):
-		return true
-	}
 }
 
 // TestExclusiveQueueHeldAcrossTakeover verifies the lock outlives its owner: when a peer takes the
@@ -152,7 +136,7 @@ func TestExclusiveQueueHeldAcrossTakeover(t *testing.T) {
 	defer close(block)
 
 	m1, stop1 := b.newManager(map[string]int{"takeover": 1})
-	start := exclusiveFSM(t, m1, "excl-takeover", entered, block)
+	start := blockingFSM(t, m1, "excl-takeover", entered, block)
 	version, err := startExclusive(start, "takeover-1", "takeover")
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -191,7 +175,7 @@ func TestExclusiveQueueOverRPC(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	defer close(release)
-	exclusiveFSM(t, m, "excl-rpc", entered, release)
+	blockingFSM(t, m, "excl-rpc", entered, release)
 
 	admin := &adminServer{m: m}
 	startRPC := func() (*connect.Response[fsmv1.StartResponse], error) {
@@ -233,7 +217,7 @@ func TestBoltExclusiveQueue(t *testing.T) {
 	block := make(chan struct{})
 
 	m1, stop1 := b.newManager(nil)
-	start := exclusiveFSM(t, m1, "excl-bolt", entered, block)
+	start := blockingFSM(t, m1, "excl-bolt", entered, block)
 	version, err := startExclusive(start, "bolt-1", "deploys")
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -268,10 +252,7 @@ func activeKeysFor(t *testing.T, m *Manager, typeName, id, action string) int {
 	if !ok {
 		t.Fatalf("expected boltStore, got %T", m.store)
 	}
-	prefix := append([]byte(typeName), keySeparator...)
-	prefix = append(prefix, []byte(id)...)
-	prefix = append(prefix, keySeparator...)
-	prefix = append(prefix, []byte(action)...)
+	prefix := bytes.Join([][]byte{[]byte(typeName), []byte(id), []byte(action)}, keySeparator)
 
 	var n int
 	if err := s.db.View(func(tx *bbolt.Tx) error {
@@ -284,4 +265,71 @@ func activeKeysFor(t *testing.T, m *Manager, typeName, id, action string) int {
 		t.Fatalf("count active keys: %v", err)
 	}
 	return n
+}
+
+// TestQueueOptionsLastWins verifies the queue options compose as any other start option: the last
+// one given decides both the queue and whether the run holds its resource.
+func TestQueueOptionsLastWins(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		opts  []StartOptionsFn
+		queue string
+		want  bool
+	}{
+		{name: "exclusive", opts: []StartOptionsFn{WithExclusiveQueue("a")}, queue: "a", want: true},
+		{name: "plain", opts: []StartOptionsFn{WithQueue("a")}, queue: "a"},
+		{name: "plain after exclusive", opts: []StartOptionsFn{WithExclusiveQueue("a"), WithQueue("b")}, queue: "b"},
+		{name: "exclusive after plain", opts: []StartOptionsFn{WithQueue("a"), WithExclusiveQueue("b")}, queue: "b", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts startOptions
+			for _, o := range tc.opts {
+				o(&opts)
+			}
+			if opts.queue != tc.queue || opts.exclusive != tc.want {
+				t.Fatalf("expected queue %q exclusive %v, got %q and %v", tc.queue, tc.want, opts.queue, opts.exclusive)
+			}
+		})
+	}
+}
+
+// TestBoltActiveReportsExclusive verifies BoltDB's in-memory snapshot of a resumed run carries its
+// exclusivity, so ActiveChildren and ListActive describe it as it was started.
+func TestBoltActiveReportsExclusive(t *testing.T) {
+	b := newBoltBackend(t)
+	ctx := context.Background()
+
+	entered := make(chan struct{}, 2)
+	block := make(chan struct{})
+	m1, stop1 := b.newManager(nil)
+	start := blockingFSM(t, m1, "excl-active", entered, block)
+	version, err := startExclusive(start, "active-1", "deploys")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the run")
+	stop1()
+	close(block)
+
+	// A second manager reads the run back from the store, as a restarted process does.
+	m2, _ := b.newManager(nil)
+	completingStart(t, m2, "excl-active")
+	active, err := m2.store.Active(ctx, fsmKey{typeName: "orderReq", action: "excl-active"})
+	if err != nil {
+		t.Fatalf("active: %v", err)
+	}
+	states, err := m2.store.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("list active: %v", err)
+	}
+	i := slices.IndexFunc(states, func(rs runSnapshot) bool { return rs.StartVersion == version })
+	if i < 0 {
+		t.Fatalf("expected the run listed, got %+v", states)
+	}
+	if !states[i].Exclusive {
+		t.Fatal("expected the listed run to report its exclusivity")
+	}
+	if len(active) != 1 {
+		t.Fatalf("expected one active run, got %d", len(active))
+	}
 }

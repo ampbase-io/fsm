@@ -612,13 +612,15 @@ func WithRunAfter(version ulid.ULID) StartOptionsFn {
 func WithQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
+		opts.exclusive = false
 	}
 }
 
 // WithExclusiveQueue queues the FSM as WithQueue does, and holds the resource's lock for the run's
 // whole life, so only one run of its type, id and action is live at a time: a second start, queued
 // or not, gets an *AlreadyRunningError naming it. The lock is taken at Start, so a run waiting for
-// the queue's capacity already refuses one, and released when the run finishes.
+// the queue's capacity already refuses one, and released when the run finishes. An empty queue
+// name starts the run on the default runner, where it holds the resource as any unqueued run does.
 func WithExclusiveQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
