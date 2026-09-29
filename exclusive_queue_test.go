@@ -362,3 +362,183 @@ func TestPlainQueueStacksBesideExclusive(t *testing.T) {
 	}
 	within(t, entered, 10*time.Second, "the stacked run")
 }
+
+// declaredFSM registers an FSM that blocks in its first transition and declares itself exclusive
+// on queue.
+func declaredFSM(t *testing.T, m *Manager, action, queue string, entered chan<- struct{}, release <-chan struct{}) Start[orderReq, orderResp] {
+	t.Helper()
+	return blockingFSM(t, m, action, entered, release, RunsExclusively[orderReq, orderResp](queue))
+}
+
+// TestRunsExclusivelyHonoredByEveryStart verifies a declared FSM's runs hold their resource
+// however they are started: a start passing nothing adopts the declaration, over the typed start
+// and the admin RPC alike, and a second start of the id is refused by either path.
+func TestRunsExclusivelyHonoredByEveryStart(t *testing.T) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		cfg.ClaimInterval = 50 * time.Millisecond
+	})
+	ctx := context.Background()
+	m, _ := b.newManager(map[string]int{"declared": 2})
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer close(release)
+	start := declaredFSM(t, m, "excl-declared", "declared", entered, release)
+
+	// Silence adopts the declaration: the run is queued and holds its resource.
+	version := startOrder(t, start, "declared-1")
+	within(t, entered, 10*time.Second, "the declared run")
+	run, err := m.store.liveRun(ctx, version)
+	if err != nil {
+		t.Fatalf("live run: %v", err)
+	}
+	if run.Queue != "declared" || !run.Exclusive {
+		t.Fatalf("expected the run recorded queued and exclusive, got %+v", run)
+	}
+
+	// A matching option is accepted as an option; a second start is refused by the lock.
+	_, err = startExclusive(start, "declared-1", "declared")
+	mustAlreadyRunning(t, err, version, "a matching second start")
+
+	admin := &adminServer{m: m}
+	_, err = admin.Start(ctx, connect.NewRequest(&fsmv1.StartRequest{
+		TypeName: "orderReq", Action: "excl-declared", Id: "declared-1", Resource: []byte(`{"Name":"x"}`),
+	}))
+	if connect.CodeOf(err) != connect.CodeAlreadyExists {
+		t.Fatalf("expected an RPC start with no options refused by the lock, got %v", err)
+	}
+}
+
+// TestRunsExclusivelyRefusesConflictingOptions verifies a start whose queue options contradict the
+// declaration is refused rather than silently overridden, on both start paths.
+func TestRunsExclusivelyRefusesConflictingOptions(t *testing.T) {
+	b := newObjectBackendWith(t, nil)
+	ctx := context.Background()
+	m, _ := b.newManager(map[string]int{"declared": 1, "other": 1})
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	start := declaredFSM(t, m, "excl-conflict", "declared", entered, release)
+
+	for name, opt := range map[string]StartOptionsFn{
+		"plain queue":     WithQueue("declared"),
+		"another queue":   WithExclusiveQueue("other"),
+		"no queue at all": WithQueue(""),
+		"plain elsewhere": WithQueue("other"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := start(ctx, "conflict-"+name, NewRequest(&orderReq{}, &orderResp{}), opt)
+			if !errors.Is(err, errQueueConflict) {
+				t.Fatalf("expected errQueueConflict, got %v", err)
+			}
+		})
+	}
+
+	admin := &adminServer{m: m}
+	_, err := admin.Start(ctx, connect.NewRequest(&fsmv1.StartRequest{
+		TypeName: "orderReq", Action: "excl-conflict", Id: "conflict-rpc", Resource: []byte(`{"Name":"x"}`),
+		Options: &fsmv1.StartOptions{Queue: "declared"},
+	}))
+	if connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("expected InvalidArgument for a plain queued RPC start, got %v", err)
+	}
+}
+
+// TestRunsExclusivelyRequiresAConfiguredQueue verifies Build refuses a declaration naming a queue
+// the Manager has no capacity for: under the object backend no node would admit such a run, and
+// its resource lock would block the id until the queue was configured.
+func TestRunsExclusivelyRequiresAConfiguredQueue(t *testing.T) {
+	m := newTestManager(t)
+	_, _, err := m.Register[orderReq, orderResp]("excl-unconfigured").
+		Start("only", okTransition).
+		End("done", RunsExclusively[orderReq, orderResp]("nowhere")).
+		Build(context.Background())
+	if !errors.Is(err, errQueueConflict) {
+		t.Fatalf("expected the build refused for an unconfigured queue, got %v", err)
+	}
+}
+
+// TestRunsExclusivelyPassesOtherOptions verifies the resolver touches only the queue: a start that
+// says nothing about queueing keeps its other options and adopts the declaration.
+func TestRunsExclusivelyPassesOtherOptions(t *testing.T) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		cfg.ClaimInterval = 50 * time.Millisecond
+	})
+	ctx := context.Background()
+	m, _ := b.newManager(map[string]int{"declared": 2})
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer close(release)
+	start := declaredFSM(t, m, "excl-parent", "declared", entered, release)
+
+	parent := ulid.Make()
+	version, err := start(ctx, "parent-child", NewRequest(&orderReq{}, &orderResp{}), WithParent(parent))
+	if err != nil {
+		t.Fatalf("start with a parent: %v", err)
+	}
+	within(t, entered, 10*time.Second, "the child run")
+
+	run, err := m.store.liveRun(ctx, version)
+	if err != nil {
+		t.Fatalf("live run: %v", err)
+	}
+	if run.Parent != parent {
+		t.Fatalf("expected the parent kept, got %s", run.Parent)
+	}
+	if run.Queue != "declared" || !run.Exclusive {
+		t.Fatalf("expected the declaration adopted beside it, got %+v", run)
+	}
+}
+
+// TestRunsExclusivelyLeavesPendingRunsAlone verifies a plain queued run still waiting for
+// admission when its definition becomes exclusive is admitted under its stored options: it stacks,
+// takes no resource lock, and runs to completion.
+func TestRunsExclusivelyLeavesPendingRunsAlone(t *testing.T) {
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		cfg.ClaimInterval = 50 * time.Millisecond
+		cfg.HeartbeatPeriod = 100 * time.Millisecond
+	})
+	ctx := context.Background()
+
+	// Started before the declaration, and parked: the node configures no capacity for the queue.
+	starter, _ := b.newManager(map[string]int{"drain": 0})
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer close(release)
+	old := blockingFSM(t, starter, "excl-drain", entered, release)
+	pending, err := old(ctx, "drain-1", NewRequest(&orderReq{}, &orderResp{}), WithQueue("drain"))
+	if err != nil {
+		t.Fatalf("the pre-existing start: %v", err)
+	}
+
+	// The upgraded node declares the FSM exclusive and has capacity, so its claim loop admits the
+	// pending run under the options it was started with.
+	upgraded, _ := b.newManager(map[string]int{"drain": 1})
+	completing, _, err := upgraded.Register[orderReq, orderResp]("excl-drain").
+		Start("created", okTransition).
+		End("done", RunsExclusively[orderReq, orderResp]("drain")).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build the declared FSM: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := upgraded.Wait(waitCtx, pending); err != nil {
+		t.Fatalf("the drained run failed: %v", err)
+	}
+
+	store, ok := upgraded.store.(*objectStore)
+	if !ok {
+		t.Fatalf("expected objectStore, got %T", upgraded.store)
+	}
+	resource := store.lockKey(Run{TypeName: "orderReq", ID: "drain-1", Action: "excl-drain"})
+	if !objectGone(t, store, resource) {
+		t.Fatal("expected the stacking run never to have taken the resource lock")
+	}
+	// The id is free for a declared start once the drained run is done.
+	if _, err := completing(ctx, "drain-1", NewRequest(&orderReq{}, &orderResp{})); err != nil {
+		t.Fatalf("a declared start after the drain: %v", err)
+	}
+}

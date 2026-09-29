@@ -283,10 +283,9 @@ version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
 - **Refused the same way as an unqueued run.** A second start that also takes the resource's lock
   — an unqueued start, or another exclusive one — gets an `*AlreadyRunningError` naming the live
   run, and over the RPC an `AlreadyExists` carrying its version.
-- **Every start of the resource must use it.** A plain `WithQueue` start of the same id still
-  stacks beside an exclusive run, because its lock is keyed by run version. Exclusivity is a
-  property of the starts, not of the resource, so a call site left on `WithQueue` silently runs
-  a second time.
+- **Every start of the resource must use it,** or declare it on the FSM instead (below). A plain
+  `WithQueue` start of the same id stacks beside an exclusive run, because its lock is keyed by
+  run version, so a call site left on `WithQueue` silently runs a second time.
 - **A run that is never admitted holds the resource** until the queue has capacity, and
   `Cancel` cannot release it: a cancel is applied by the node executing the run, and none has
   claimed it.
@@ -296,6 +295,24 @@ version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
 - **The last option wins.** `WithQueue` after `WithExclusiveQueue` leaves the run queued and not
   exclusive, as passing the plain option alone would. An empty queue name starts the run on the
   default runner, where it holds its resource as any unqueued run does.
+
+To hold the resource however a run is started, declare it on the FSM instead of at each call site:
+
+```go
+End("done", fsm.RunsExclusively[Req, Resp]("tofu"))
+```
+
+- **Every start path honours it,** including the `Start` RPC, whatever options the caller sends.
+- **A start that says nothing about queueing adopts it.** One passing the matching
+  `WithExclusiveQueue` is accepted too, so existing call sites keep working.
+- **A contradicting start is refused,** not silently overridden: a plain `WithQueue`, a different
+  queue, or `WithQueue("")`. Over the RPC that is `InvalidArgument`.
+- **`Build` fails unless the queue is configured** in `Config.Queues`. On the object backend no
+  node would admit a run on an unknown queue, and its lock, taken at Start, would hold the id
+  until the queue was configured.
+- **Runs started earlier keep the options they were started with.** A plain queued run still
+  waiting for admission when its definition becomes exclusive is admitted as it was started:
+  stacking, with no resource lock.
 
 ## Observability
 

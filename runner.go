@@ -47,7 +47,7 @@ func runnerFromOpts(opts *startOptions, m *Manager) runner {
 			// re-limit per node (the N×size bug) — it is bolt-only.
 			return defaultRunner()
 		}
-		q, ok := m.queues[opts.queue]
+		q, ok := m.runners[opts.queue]
 		if !ok {
 			m.logger.Warn("queue not found, using default runner", "queue", opts.queue)
 			return defaultRunner()

@@ -325,6 +325,10 @@ type fsm struct {
 
 	// signals are the signals the FSM's runs accept, by name. Set at End().
 	signals map[string]AnySignal
+
+	// exclusiveQueue is the queue every run of the FSM is started on, exclusively; empty for an
+	// FSM whose starts choose their own queueing. Set at End() (RunsExclusively).
+	exclusiveQueue string
 }
 
 // startEvent builds the START event for a run of f with the given id.
@@ -590,6 +594,10 @@ type startOptions struct {
 
 	exclusive bool
 
+	// queueSet records that a queue option was applied, so a start that said nothing about
+	// queueing can be told from one that asked for none. Not persisted.
+	queueSet bool
+
 	parent ulid.ULID
 }
 
@@ -613,6 +621,7 @@ func WithQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
 		opts.exclusive = false
+		opts.queueSet = true
 	}
 }
 
@@ -624,6 +633,7 @@ func WithExclusiveQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
 		opts.exclusive = true
+		opts.queueSet = true
 	}
 }
 
@@ -639,13 +649,49 @@ func WithParent(parent ulid.ULID) StartOptionsFn {
 	}
 }
 
+// declareExclusive records the queue every run of f is started on exclusively, refusing one the
+// Manager has no capacity configured for: under the object backend no node would admit such a run,
+// and its resource lock — taken at Start — would block the id until the queue was configured.
+func (m *Manager) declareExclusive(f *fsm, queue string) error {
+	if queue == "" {
+		return nil
+	}
+	if _, ok := m.queues[queue]; !ok {
+		return fmt.Errorf("%w: queue %s is not configured on this manager", errQueueConflict, queue)
+	}
+	f.exclusiveQueue = queue
+	return nil
+}
+
+// resolveStart applies a start's options and reconciles them with the FSM's declaration: a start
+// that says nothing about queueing adopts it, one that asks for exactly it is accepted, and
+// anything else is refused rather than silently overridden. Options other than the queue's pass
+// through untouched.
+func (f *fsm) resolveStart(opts []StartOptionsFn) (startOptions, error) {
+	var startOpt startOptions
+	for _, opt := range opts {
+		opt(&startOpt)
+	}
+	if f.exclusiveQueue == "" {
+		return startOpt, nil
+	}
+	if !startOpt.queueSet {
+		startOpt.queue, startOpt.exclusive = f.exclusiveQueue, true
+		return startOpt, nil
+	}
+	if startOpt.queue != f.exclusiveQueue || !startOpt.exclusive {
+		return startOptions{}, fmt.Errorf("%w: %s/%s runs exclusively on %s", errQueueConflict, f.typeName, f.action, f.exclusiveQueue)
+	}
+	return startOpt, nil
+}
+
 // start attempts to start the FSM using the provided id and request. The id is used to uniquely
 // identify the FSM associated with the req type along with the action used to register it.
 func (m *Manager) start[R, W any](f *fsm) func(ctx context.Context, id string, request *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error) {
 	return func(ctx context.Context, id string, request *Request[R, W], opts ...StartOptionsFn) (ulid.ULID, error) {
-		var startOpt startOptions
-		for _, opt := range opts {
-			opt(&startOpt)
+		startOpt, err := f.resolveStart(opts)
+		if err != nil {
+			return ulid.ULID{}, err
 		}
 
 		logger := m.logger.With(slog.Group("fsm", "action", f.action, "type", f.typeName, "alias", f.alias, "id", id))

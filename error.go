@@ -23,6 +23,10 @@ var (
 	// errFSMNotRegistered reports that no FSM matches the (type, action) an opaque Start named.
 	errFSMNotRegistered = errors.New("no FSM registered")
 
+	// errQueueConflict reports that a Start's queue options contradict the FSM's declaration
+	// (RunsExclusively).
+	errQueueConflict = errors.New("start options conflict with the FSM's declared queue")
+
 	// errAmbiguousAction reports that an opaque Start named an action without a type and more
 	// than one registered FSM shares that action.
 	errAmbiguousAction = errors.New("ambiguous action: specify a type")
