@@ -616,19 +616,10 @@ func WithQueue(queue string) StartOptionsFn {
 	}
 }
 
-// WithExclusiveQueue queues the FSM as WithQueue does, and holds the resource's lock for the run's
-// whole life: a second start that also takes that lock — an unqueued start, or another exclusive
-// one — gets an *AlreadyRunningError naming it. The lock is taken at Start, so a run still waiting
-// for the queue's capacity already refuses one, and released when the run finishes. An empty queue
-// name starts the run on the default runner, where it holds the resource as any unqueued run does.
-//
-// A plain WithQueue start of the same resource still stacks beside it, since its lock is keyed by
-// run version: exclusivity is a property of the starts, not of the resource, so every start of a
+// WithExclusiveQueue queues the FSM as WithQueue does, and holds the resource's lock from Start
+// until the run finishes, so an unqueued or exclusive start of the same resource is refused with
+// an *AlreadyRunningError. A plain WithQueue start still stacks beside it, so every start of a
 // resource that must run alone has to use this option.
-//
-// A run that is never admitted — a queue with no capacity — holds the resource until capacity
-// frees, and Manager.Cancel cannot release it: a cancel is applied by the node executing the run,
-// and no node has claimed it.
 func WithExclusiveQueue(queue string) StartOptionsFn {
 	return func(opts *startOptions) {
 		opts.queue = queue
