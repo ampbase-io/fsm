@@ -110,10 +110,13 @@ type Manager struct {
 
 	fsms map[fsmKey]*fsm
 
-	// queues is the configured capacity of each queue, whichever backend enforces it: the object
-	// backend's claim loop cluster-wide, or a runners entry in this process under BoltDB.
+	// queues is Config.Queues as given: the only record of which queue names exist that both
+	// backends have, so it is what a RunsExclusively declaration is validated against.
 	queues map[string]int
 
+	// runners are the in-process queue runners, built from queues and BoltDB-only: the object
+	// backend enforces capacity cluster-wide in the claim loop and starts none, so this is empty
+	// there and cannot stand in for queues.
 	runners map[string]*queuedRunner
 
 	done chan struct{}
