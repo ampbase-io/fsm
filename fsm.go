@@ -914,6 +914,13 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 		logger.InfoContext(ctx, "starting fsm")
 
+		// Recording the run as started is also where a backend refuses one it has already
+		// settled — canceled while it waited for a runner — so it runs before any side effects
+		// and its refusal stops the run.
+		if err := m.store.SetRunning(ctx, request.Run()); err != nil {
+			stop(err)
+		}
+
 		// The run's duration counts from its submission, so a queued or delayed wait is included.
 		runStart := ulid.Time(runVersion.Time())
 

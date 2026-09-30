@@ -478,6 +478,18 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
 	for _, ae := range activeEvents {
+		// A run whose row already records an outcome was settled while the scan above was reading
+		// its still-live entry — takePending records the outcome before the FINISH that deletes the
+		// entry — so seeding the row PENDING here would undo the settle and let the resume run a
+		// canceled run. The row stands, and SetRunning refuses the resume that follows.
+		row, err := runRow(txn, ae.version)
+		if err != nil {
+			return nil, err
+		}
+		if row.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+			continue
+		}
+
 		// The queue and parent are restored from the persisted event options rather than from f,
 		// whose fields only reflect the most recent Start call.
 		var parent ulid.ULID
@@ -686,15 +698,89 @@ func (s *boltStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
 	return active, err
 }
 
+// errRunSettled reports that the run reached its outcome before it began executing, so this node
+// must not run it: a cancel that arrived while it waited for a runner settled it.
+var errRunSettled = errors.New("run settled before it started")
+
+// SetRunning claims the run for execution, refusing one already settled. It and takePending are
+// the two sides of the arbiter for a cancel racing a dispatch: memdb serializes writers, so the
+// check and the write cannot straddle the settle, and exactly one of them finds the run still to
+// be started.
 func (s *boltStore) SetRunning(ctx context.Context, run Run) error {
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
+
+	rs, err := runRow(txn, run.StartVersion)
+	if err != nil {
+		return err
+	}
+	if rs.State == fsmv1.RunState_RUN_STATE_COMPLETE {
+		return errRunSettled
+	}
 
 	if err := txn.Insert(fsmTable, runSnapshot{Run: run, State: fsmv1.RunState_RUN_STATE_RUNNING}); err != nil {
 		return err
 	}
 	txn.Commit()
 	return nil
+}
+
+// runRow reads a run's row within txn. A run the index does not hold comes back as the zero
+// snapshot, whose state is neither pending nor complete, so callers need no second check.
+func runRow(txn *memdb.Txn, version ulid.ULID) (runSnapshot, error) {
+	item, err := txn.First(fsmTable, idIndex, version.String())
+	if err != nil {
+		return runSnapshot{}, err
+	}
+	rs, _ := item.(runSnapshot)
+	return rs, nil
+}
+
+// cancelPending settles a run this node has not started executing — queued behind a full queue, or
+// waiting out a delay — so its waiters resolve and its resource frees instead of the cancel waiting
+// for a slot that may never come. takePending takes the run first, which is what makes this and a
+// dispatch mutually exclusive; a run already executing or already finished reports ErrFsmNotFound,
+// an executing run's cancel having already reached its context through Manager.Cancel.
+func (s *boltStore) cancelPending(ctx context.Context, version ulid.ULID, cause error) error {
+	run, err := s.takePending(version, RunErr{Err: halt(cause), State: cancelBeforeExecState})
+	if err != nil {
+		return err
+	}
+
+	event := finishEvent(run, cancelBeforeExecState)
+	// A run canceled before it ran read nothing, so every signal sent to it is discarded.
+	event.DiscardedSignals, err = s.unreadSignalIDs(ctx, version)
+	if err != nil {
+		s.logger.WarnContext(ctx, "failed to list unread signals at cancel", "error", err, versionAttr(version))
+	}
+	_, err = s.Append(ctx, run, event)
+	return err
+}
+
+// takePending records the outcome of a run still waiting to start and returns the run it took,
+// carrying that outcome. Only a pending run is taken, so a dispatch that got there first keeps the
+// run; the row holds the outcome from here on, so a waiter released between this and the FINISH
+// append sees the same one.
+func (s *boltStore) takePending(version ulid.ULID, outcome RunErr) (Run, error) {
+	txn := s.memDB.Txn(true)
+	defer txn.Abort()
+
+	rs, err := runRow(txn, version)
+	if err != nil {
+		return Run{}, err
+	}
+	if rs.State != fsmv1.RunState_RUN_STATE_PENDING {
+		return Run{}, ErrFsmNotFound
+	}
+
+	rs.State = fsmv1.RunState_RUN_STATE_COMPLETE
+	rs.Error = outcome
+	rs.Run.fsmErr = outcome
+	if err := txn.Insert(fsmTable, rs); err != nil {
+		return Run{}, err
+	}
+	txn.Commit()
+	return rs.Run, nil
 }
 
 func (s *boltStore) ForgetRun(run Run) error {

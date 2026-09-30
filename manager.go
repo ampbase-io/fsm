@@ -76,10 +76,18 @@ type Store interface {
 	// Run-state notes from the executor.
 
 	// SetRunning records that the run has begun executing transitions on this node, moving it
-	// out of PENDING before the first transition rather than after it.
+	// out of PENDING before the first transition rather than after it. It is also where the
+	// backend refuses a run this node may no longer execute, so an error stops the run.
 	SetRunning(ctx context.Context, run Run) error
 	// ForgetRun discards local run state after a failed resume so waiters consult the backend.
 	ForgetRun(run Run) error
+	// cancelPending settles a run waiting to start — behind a full queue, or a delay — with the
+	// given cause, so its waiters resolve and its resource frees rather than the cancel waiting
+	// for a run to begin that may never get a slot. Settling and starting are mutually
+	// exclusive: a backend takes the run here through the same claim SetRunning refuses a run
+	// without, so a cancel racing a dispatch has exactly one winner. A run it does not take is
+	// left alone — an executing run's cancel has already reached its context.
+	cancelPending(ctx context.Context, version ulid.ULID, cause error) error
 
 	signalStore
 }
@@ -514,6 +522,11 @@ func (m *Manager) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]Run, 
 // broadcast, and whichever node owns the run reacts — the run need not be executing on this
 // node, or anywhere yet. The local context is canceled too for immediate effect when this node
 // is the owner. A single-process backend cancels the local run directly.
+//
+// A run that has not started anywhere is settled here instead: it records the cause, frees its
+// resource and releases its waiters without running, since nothing else would apply the cancel
+// until it begins — and a run queued behind a full queue may never begin. Its finalizers do not
+// run; nothing has happened that needs finalizing.
 func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) error {
 	cerr := &CancelError{Reason: cause}
 	if rec, ok := m.store.(cancelRecorder); ok {
@@ -522,13 +535,24 @@ func (m *Manager) Cancel(ctx context.Context, version ulid.ULID, cause string) e
 		if err := rec.requestCancel(ctx, version, cerr); err != nil {
 			return err
 		}
-		m.cancelRunning(version, cerr)
+		if !m.cancelRunning(version, cerr) {
+			// The cancel is already durable and the owner's sweep applies it, so settling a run
+			// nobody has started is an accelerator here, not the caller's to retry.
+			m.settlePending(ctx, version, cerr)
+		}
 		return nil
 	}
-	if !m.cancelRunning(version, cerr) {
-		return ErrFsmNotFound
+	if m.cancelRunning(version, cerr) {
+		return nil
 	}
-	return nil
+	return m.store.cancelPending(ctx, version, cerr)
+}
+
+// settlePending settles a run that has not started, logging a failure the caller has no use for.
+func (m *Manager) settlePending(ctx context.Context, version ulid.ULID, cause error) {
+	if err := m.store.cancelPending(ctx, version, cause); err != nil {
+		m.logger.ErrorContext(ctx, "failed to settle a run canceled before it started", "error", err, versionAttr(version))
+	}
 }
 
 // cancelRunning halts the run's transitions with an operator's cause, reporting whether this
