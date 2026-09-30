@@ -48,7 +48,11 @@ backend's distributed-execution design is the active work.
   `runClaimer`, whose claim loop hands out only the runs this node may take. `SetRunning` and
   `cancelPending` are the two sides of one arbiter, also on `Store`: a run waiting for a runner is
   either started or settled by a cancel, never both, so each backend decides between them with the
-  same claim — the memdb row on BoltDB, the manifest lease on the object backend. A backend may also
+  same claim — the memdb row on BoltDB, the manifest lease on the object backend. The run loop asks
+  once, through `beginRun` (fsm.go): the one place a run is refused before its first side effect,
+  and the loop's only store *write*. It must stay between the `m.running` registration (so a cancel
+  arriving in that window reaches the run's context instead of being lost) and the first
+  transition. A backend may also
   satisfy narrow capability views, each declared at its own call site: `appender`
   (interceptor.go), `runClaimer`, `fencer`, `cancelSweeper` (coordinate.go), `cancelRecorder`
   (manager.go), `nodeIdentified` (fsm.go). BoltDB implements none of the lease-shaped ones, so it
