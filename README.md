@@ -138,6 +138,14 @@ apart. It never executes a transition, and its finalizers do not run: nothing ha
 needs finalizing. A cancel that races the run starting resolves to exactly one of the two — the run
 either starts and is canceled through its context, or is settled and never starts.
 
+Only a run that has never started is settled this way. One that has — taken over from a node that
+lost its lease, or resumed after a restart and waiting for a slot again — is canceled through its
+context once it runs, so its finalizers run. On the object backend the cancel is recorded and
+applied when the run resumes; BoltDB keeps no durable cancel, so there `Cancel` reports
+`ErrFsmNotFound` for such a run until it is executing. BoltDB knows a run has started only from
+what it recorded, so a run that crashed partway through its first transition, before recording
+anything, resumes as never started, and a cancel before it runs again settles it.
+
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the
 cancel calls for — start a compensating run and wait on it, say. It carries the values
 initializers put on the transitions' context but none of their cancellation, and no deadline:

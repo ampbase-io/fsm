@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1059,5 +1061,94 @@ func TestClaimResumesFromCompletedStates(t *testing.T) {
 	}
 	if got := ranShipped.Load(); got != 1 {
 		t.Fatalf("expected the interrupted transition to run once on the claimer, ran %d times", got)
+	}
+}
+
+// failManifestPut refuses the nth PUT to each run manifest from now on and lets the others through.
+func failManifestPut(s3 *fake.S3, n int) {
+	var (
+		mu   sync.Mutex
+		puts = map[string]int{}
+	)
+	s3.SetPrePut(func(key string) {
+		if path.Base(path.Dir(key)) != "runs" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		puts[key]++
+		if puts[key] == n {
+			s3.SetFailPut(key)
+			return
+		}
+		s3.SetFailPut("")
+	})
+}
+
+// TestSetRunningReleasesRunOnFailedWrite verifies a start the backend could not record hands the
+// run back: SetRunning reports ErrLeaseLost, this node keeps no lease for the heartbeat to extend,
+// and the manifest is unowned, so a peer may claim the run at once.
+func TestSetRunningReleasesRunOnFailedWrite(t *testing.T) {
+	h := newLeaseHarness(t)
+	a := h.store("node-a", 10*time.Second)
+	b := h.store("node-b", 10*time.Second)
+
+	run := startRun(t, a, "sr-fail")
+	// The START has written the manifest, so SetRunning's is the next write to it.
+	failManifestPut(h.s3, 1)
+	defer h.s3.SetPrePut(nil)
+
+	if err := a.SetRunning(context.Background(), run); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost from a start that could not be recorded, got %v", err)
+	}
+	if owns(a, run.StartVersion) {
+		t.Fatal("the node kept the lease on a run it is not running")
+	}
+	if owner := mustManifest(t, a, run.StartVersion).GetOwnerNode(); owner != "" {
+		t.Fatalf("expected the manifest released, still owned by %q", owner)
+	}
+	if _, err := b.claimManifest(context.Background(), run.StartVersion); err != nil {
+		t.Fatalf("expected a peer to claim the released run, got %v", err)
+	}
+}
+
+// TestRunFinishesAfterFailedStartRecord verifies a run whose start could not be recorded is
+// neither stranded nor executed unrecorded: it is handed back, claimed again, and runs once.
+func TestRunFinishesAfterFailedStartRecord(t *testing.T) {
+	h := newLeaseHarness(t)
+	m, err := New(Config{
+		NodeID: "node-a",
+		ObjectStorage: &ObjectStorageConfig{
+			Bucket:              h.s3.Bucket(),
+			Client:              h.s3.Client(),
+			ClaimInterval:       50 * time.Millisecond,
+			HeartbeatPeriod:     100 * time.Millisecond,
+			WaitPollInterval:    time.Millisecond,
+			WaitPollMaxInterval: 10 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { m.Shutdown(5 * time.Second) })
+
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	close(release)
+	start := blockingFSM(t, m, "unrecorded", entered, release)
+
+	// A run started on this node creates its manifest at START, so its second write is
+	// SetRunning's.
+	failManifestPut(h.s3, 2)
+	defer h.s3.SetPrePut(nil)
+
+	version, err := start(context.Background(), "unrecorded-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitRun(t, m, version)
+	within(t, entered, 10*time.Second, "the run's one execution")
+	if !noSignal(entered) {
+		t.Fatal("the run executed more than once")
 	}
 }

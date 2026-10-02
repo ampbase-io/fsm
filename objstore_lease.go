@@ -246,14 +246,34 @@ func (s *objectStore) claimManifest(ctx context.Context, version ulid.ULID) (*fs
 	return s.claimReserved(ctx, version, "")
 }
 
+// claimPending is claimManifest for a run no node has started, the only run a cancel may settle: a
+// run that has started belongs to whichever node takes it over, which applies the cancel through
+// its context and runs its finalizers, so a manifest past PENDING is refused with errClaimLost.
+func (s *objectStore) claimPending(ctx context.Context, version ulid.ULID) (*fsmv1.RunManifest, error) {
+	if !s.reserveClaim(version) {
+		return nil, errClaimLost
+	}
+	return s.claimIf(ctx, version, "", s.unstarted)
+}
+
+// unstarted reports whether a claimable manifest records a run no node has started.
+func (s *objectStore) unstarted(m *fsmv1.RunManifest, now time.Time) bool {
+	return m.GetStatus() == fsmv1.RunState_RUN_STATE_PENDING && s.claimable(m, now)
+}
+
 // claimReserved takes ownership of an already-reserved run via manifest CAS, tracking the lease
 // (under queue, so the roster heartbeat can find it) on success and dropping the reservation on
 // failure. Claimability is re-checked against the fresh manifest on every CAS attempt, so losing a
 // race to another node surfaces as errClaimLost rather than a steal. The caller must already hold
 // the reservation (reserveClaim); this never reserves, so it composes with the queued path.
 func (s *objectStore) claimReserved(ctx context.Context, version ulid.ULID, queue string) (*fsmv1.RunManifest, error) {
+	return s.claimIf(ctx, version, queue, s.claimable)
+}
+
+// claimIf is claimReserved under the given claim condition, checked against every fresh manifest.
+func (s *objectStore) claimIf(ctx context.Context, version ulid.ULID, queue string, may func(*fsmv1.RunManifest, time.Time) bool) (*fsmv1.RunManifest, error) {
 	manifest, err := s.casManifest(ctx, version, func(m *fsmv1.RunManifest) error {
-		if !s.claimable(m, time.Now()) {
+		if !may(m, time.Now()) {
 			return errClaimLost
 		}
 		m.OwnerNode = s.node

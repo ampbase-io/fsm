@@ -965,7 +965,9 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 // lease-coordinated backend answers from the lease it already holds, which a delayed or queued
 // dispatch can have lost while it waited; either backend refuses a run it has already settled,
 // canceled while it waited for a runner. It runs before any side effects, so a refusal stops the
-// run rather than surfacing as a fenced write part-way through a transition.
+// run rather than surfacing as a fenced write part-way through a transition. Only a refusal stops
+// it: a stopped run records nothing, so stopping on a failure to record the start would leave the
+// run to nobody.
 func (m *Manager) beginRun(ctx context.Context, request AnyRequest) error {
 	run := request.Run()
 
@@ -979,7 +981,13 @@ func (m *Manager) beginRun(ctx context.Context, request AnyRequest) error {
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
 	}
 
-	return m.store.SetRunning(ctx, run)
+	switch err := m.store.SetRunning(ctx, run); {
+	case errors.Is(err, ErrLeaseLost), errors.Is(err, errRunSettled):
+		return err
+	case err != nil:
+		m.logger.ErrorContext(ctx, "failed to record run started", "error", err, runAttr(run))
+	}
+	return nil
 }
 
 // iterate runs a transition's iterations from first until the run moves on, and reports whether

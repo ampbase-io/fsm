@@ -86,7 +86,8 @@ func (s *objectStore) pendingCancellations(ctx context.Context) (map[ulid.ULID]e
 // polling to their deadline. It reuses the finish path: a single FINISH append records the
 // cause, deletes the lock, writes history, drops the lease, and publishes done; no transitions
 // run and no finalizers fire, because nothing has happened that needs finalizing. A run that has
-// since gone terminal, or that this node no longer owns, is left alone.
+// started — a takeover not yet dispatched — or gone terminal, or that this node no longer owns,
+// is left alone.
 func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cause error) error {
 	if _, ok := s.ownedEpoch(version); !ok {
 		return nil
@@ -98,7 +99,9 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 	case err != nil:
 		return err
 	}
-	if manifestTerminal(manifest) {
+	// A run that has started is the run loop's to cancel, through its context, so its finalizers
+	// run; once this node dispatches it, the sweep reaches it there. A terminal run has nothing left.
+	if manifest.GetStatus() != fsmv1.RunState_RUN_STATE_PENDING {
 		return nil
 	}
 
@@ -117,10 +120,11 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 // cancelPending settles a run no node has started — pending, or queued behind a full queue, where
 // nothing applies the cancel sentinel until a slot frees. Ownership is the arbiter: it takes the
 // same lease claim a claim pass takes, minus queue admission, so a cancel and an admission can
-// never both win the run. Losing the claim is not a failure — the run is owned, so its owner's
-// sweep applies the sentinel — and neither is a run that has since gone terminal.
+// never both win the run. Losing the claim is not a failure: the run is owned, or has started and
+// belongs to whichever node takes it over, and either way the sentinel reaches it through its
+// context; or it has gone terminal.
 func (s *objectStore) cancelPending(ctx context.Context, version ulid.ULID, cause error) error {
-	manifest, err := s.claimManifest(ctx, version)
+	manifest, err := s.claimPending(ctx, version)
 	switch {
 	case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
 		return nil
