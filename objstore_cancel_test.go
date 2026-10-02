@@ -239,3 +239,57 @@ func TestCancelOwnedRunTerminalNoop(t *testing.T) {
 		t.Fatal("cancelOwnedRun ran the finish path on an already-terminal run")
 	}
 }
+
+// TestCancelOwnedRunLeavesStartedRun verifies the sweep's settle refuses a run that has started —
+// a takeover this node has claimed but not yet dispatched — so the cancel reaches it through its
+// context once it runs, and its finalizers run.
+func TestCancelOwnedRunLeavesStartedRun(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	ctx := context.Background()
+
+	run := startRun(t, s, "cor-started")
+	if err := s.SetRunning(ctx, run); err != nil {
+		t.Fatalf("SetRunning: %v", err)
+	}
+	if err := s.cancelOwnedRun(ctx, run.StartVersion, &CancelError{Reason: "too late"}); err != nil {
+		t.Fatalf("cancelOwnedRun: %v", err)
+	}
+	if manifestTerminal(mustManifest(t, s, run.StartVersion)) {
+		t.Fatal("settled a run that had started, skipping its finalizers")
+	}
+	if !owns(s, run.StartVersion) {
+		t.Fatal("expected the node to keep the run it is about to execute")
+	}
+}
+
+// TestCancelPendingLeavesStartedRunToTakeover verifies the cancel's own claim refuses a run that
+// has started, even once its owner's lease has expired: the run is the next owner's, and the
+// cancel takes no lease on a run it will not settle.
+func TestCancelPendingLeavesStartedRunToTakeover(t *testing.T) {
+	h := newLeaseHarness(t)
+	owner := h.store("node-a", 50*time.Millisecond)
+	peer := h.store("node-b", 10*time.Second)
+	ctx := context.Background()
+
+	run := startRun(t, owner, "cp-started")
+	if err := owner.SetRunning(ctx, run); err != nil {
+		t.Fatalf("SetRunning: %v", err)
+	}
+	eventually(t, 5*time.Second, func() bool {
+		return peer.claimable(mustManifest(t, peer, run.StartVersion), time.Now())
+	}, "the owner's lease to expire")
+
+	if err := peer.cancelPending(ctx, run.StartVersion, &CancelError{Reason: "too late"}); err != nil {
+		t.Fatalf("cancelPending: %v", err)
+	}
+	if manifestTerminal(mustManifest(t, peer, run.StartVersion)) {
+		t.Fatal("settled a run that had started, skipping its finalizers")
+	}
+	if owns(peer, run.StartVersion) {
+		t.Fatal("the cancel kept a lease on a run it did not settle")
+	}
+	if _, err := peer.claimManifest(ctx, run.StartVersion); err != nil {
+		t.Fatalf("expected the takeover to claim the run, got %v", err)
+	}
+}

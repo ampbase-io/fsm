@@ -943,6 +943,8 @@ var errRunNotPending = errors.New("run is not pending")
 
 // SetRunning flips the manifest to RUNNING under the fence. Appending a transition would set it
 // too, but not until the first one finished — too late to tell an executing run from a waiting one.
+// A write that fails releases the run and reports ErrLeaseLost, so it is claimed and started again
+// rather than executed unrecorded or stranded under a lease nobody is running.
 func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
 	epoch, ok := s.ownedEpoch(run.StartVersion)
 	if !ok {
@@ -959,10 +961,18 @@ func (s *objectStore) SetRunning(ctx context.Context, run Run) error {
 		m.Status = fsmv1.RunState_RUN_STATE_RUNNING
 		return nil
 	})
-	if errors.Is(err, errRunNotPending) {
+	switch {
+	case err == nil, errors.Is(err, errRunNotPending):
 		return nil
+	case errors.Is(err, ErrLeaseLost):
+		return err
 	}
-	return err
+	// A run must not execute while its manifest says it never started — a cancel takes that as
+	// leave to settle it without finalizers — so hand it back to be claimed again instead.
+	releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	s.releaseLease(releaseCtx, run.StartVersion, epoch)
+	return fmt.Errorf("%w: run start not recorded: %w", ErrLeaseLost, err)
 }
 
 // ForgetRun releases this node's claim on the run after a failed resume so another node — or

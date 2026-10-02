@@ -423,6 +423,22 @@ type activeResource struct {
 	retryCount uint64
 
 	fsmError RunErr
+
+	// progressed reports the run recorded progress before this resume — a transition completed or
+	// halted, or an attempt failed — so it has started. Only the BoltDB fold sets it; the object
+	// backend's manifest records the same fact as its status.
+	progressed bool
+}
+
+// resumedState is the state a resumed run's row starts in: running once it has progressed, as the
+// object backend's manifest records it, so a cancel leaves it to its own context and finalizers
+// instead of settling it as never started. BoltDB does not record a start durably, so a run that
+// crashed in its first transition before recording anything resumes pending.
+func resumedState(r *activeResource) fsmv1.RunState {
+	if r.progressed {
+		return fsmv1.RunState_RUN_STATE_RUNNING
+	}
+	return fsmv1.RunState_RUN_STATE_PENDING
 }
 
 func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, error) {
@@ -511,7 +527,7 @@ func (s *boltStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, 
 				Parent:       parent,
 				fsmErr:       ae.fsmError,
 			},
-			State: fsmv1.RunState_RUN_STATE_PENDING,
+			State: resumedState(ae),
 		}
 		if err := txn.Insert(fsmTable, rs); err != nil {
 			return nil, err
@@ -541,15 +557,18 @@ func (s *boltStore) foldEvents(ctx context.Context, eventB *bbolt.Bucket, ae *fs
 
 		switch event.Type {
 		case fsmv1.EventType_EVENT_TYPE_COMPLETE:
+			folded.progressed = true
 			folded.completedTransitions = append(folded.completedTransitions, event.GetState())
 			if event.GetResponse() != nil {
 				folded.response = event.GetResponse()
 			}
 			folded.iterations = recordIteration(folded.iterations, &event)
 		case fsmv1.EventType_EVENT_TYPE_CANCEL:
+			folded.progressed = true
 			folded.completedTransitions = append(folded.completedTransitions, event.GetState())
 			folded.fsmError = recordedRunErr(&event)
 		case fsmv1.EventType_EVENT_TYPE_ERROR:
+			folded.progressed = true
 			folded.retryCount = event.GetRetryCount()
 		}
 	}

@@ -10,6 +10,7 @@ import (
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
+	"connectrpc.com/connect"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -143,6 +144,20 @@ func testCancelPendingRecordsTheSameOutcome(t *testing.T, b *backend) {
 	if last.GetErrorState() != cancelBeforeExecState {
 		t.Fatalf("expected the FINISH to record %q as where the run stopped, got %q", cancelBeforeExecState, last.GetErrorState())
 	}
+
+	// The control API reports the same classification, so a consumer waiting over RPC need not
+	// read the message text to tell a cancel from a failure.
+	admin := &adminServer{m: m}
+	resp, err := admin.Wait(ctx, connect.NewRequest(&fsmv1.WaitRequest{Version: version.String()}))
+	if err != nil {
+		t.Fatalf("admin wait: %v", err)
+	}
+	if resp.Msg.GetHaltKind() != fsmv1.HaltKind_HALT_KIND_CANCELED {
+		t.Fatalf("expected the RPC wait to report a canceled halt, got %v", resp.Msg.GetHaltKind())
+	}
+	if resp.Msg.GetErrorState() != cancelBeforeExecState {
+		t.Fatalf("expected the RPC wait to report %q, got %q", cancelBeforeExecState, resp.Msg.GetErrorState())
+	}
 }
 
 // TestCancelPendingLeavesAdmittedRunToItsContext verifies the settle path does not reach past
@@ -182,6 +197,137 @@ func testCancelPendingLeavesAdmittedRunToItsContext(t *testing.T, b *backend) {
 // TestCancelPendingUnknownRun verifies an unknown or already-finished run is still reported as
 // such: settling a pending run must not turn Cancel into a silent success.
 func TestCancelPendingUnknownRun(t *testing.T) { runBackends(t, testCancelPendingUnknownRun) }
+
+// startedFSM registers a run whose first transition completes and whose second waits for its
+// context to end, reporting each transition's entry and the outcome its finalizer sees.
+func startedFSM(t *testing.T, m *Manager, action string, first, second chan<- struct{}, finalized chan<- RunErr) (Start[orderReq, orderResp], Resume) {
+	t.Helper()
+
+	start, resume, err := m.Register[orderReq, orderResp](action).
+		Start("first", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			first <- struct{}{}
+			return nil, nil
+		}).
+		To("second", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			second <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}).
+		End("done", WithFinalizers(func(ctx context.Context, req *Request[orderReq, orderResp], err RunErr) {
+			finalized <- err
+		})).
+		Build(context.Background())
+	if err != nil {
+		t.Fatalf("failed to build %s FSM: %v", action, err)
+	}
+	return start, resume
+}
+
+// TestCancelLeavesExpiredStartedRunToTakeover verifies a cancel landing after a running run's
+// owner lost its lease, but before a peer took it over, does not settle the run: the peer takes it
+// over, the cancel reaches it through its context, and its finalizers run.
+func TestCancelLeavesExpiredStartedRunToTakeover(t *testing.T) {
+	ctx := context.Background()
+	nodes := 0
+	b := newObjectBackendWith(t, func(cfg *ObjectStorageConfig) {
+		nodes++
+		cfg.LeaseTimeout = 150 * time.Millisecond
+		if nodes == 3 {
+			// The peer, which takes the run over.
+			cfg.HeartbeatPeriod = 75 * time.Millisecond
+			cfg.ClaimInterval = 75 * time.Millisecond
+			return
+		}
+		// The owner, whose lease lapses, and the node the cancel lands on: neither extends nor claims.
+		cfg.HeartbeatPeriod = time.Hour
+		cfg.ClaimInterval = time.Hour
+	})
+
+	owner, _ := b.newManager(nil)
+	ownerFirst := make(chan struct{}, 1)
+	start, _ := startedFSM(t, owner, "taken-over", ownerFirst, make(chan struct{}, 1), make(chan RunErr, 1))
+	version, err := start(ctx, "taken-over-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	within(t, ownerFirst, 10*time.Second, "the first transition on the owner")
+
+	canceller, _ := b.newManager(nil)
+	s, ok := canceller.store.(*objectStore)
+	if !ok {
+		t.Fatalf("expected objectStore, got %T", canceller.store)
+	}
+	eventually(t, 5*time.Second, func() bool {
+		return s.claimable(mustManifest(t, s, version), time.Now())
+	}, "the owner's lease to expire")
+
+	if err := canceller.Cancel(ctx, version, "stop it"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if manifestTerminal(mustManifest(t, s, version)) {
+		t.Fatal("the cancel settled a run that had started, skipping its finalizers")
+	}
+
+	peer, _ := b.newManager(nil)
+	peerFirst := make(chan struct{}, 1)
+	peerFinalized := make(chan RunErr, 1)
+	startedFSM(t, peer, "taken-over", peerFirst, make(chan struct{}, 1), peerFinalized)
+
+	outcome := within(t, peerFinalized, 10*time.Second, "the takeover's finalizers")
+	mustCancelError(t, outcome.Err, "stop it", "the outcome the finalizer saw")
+	mustCancelError(t, waitFor(canceller, version), "stop it", "waiting on the run")
+	if !noSignal(peerFirst) {
+		t.Fatal("the takeover re-ran a transition the owner had completed")
+	}
+}
+
+// TestCancelLeavesResumedStartedRunToItsContext verifies BoltDB's counterpart: a run that had
+// started before a restart, and is resumed behind a queue with no free slot, is not settled by a
+// cancel. It is left to its own context, so once it runs again its finalizers run.
+func TestCancelLeavesResumedStartedRunToItsContext(t *testing.T) {
+	ctx := context.Background()
+	b := newBoltBackend(t)
+
+	before, stopBefore := b.newManager(map[string]int{"q": 1})
+	reached := make(chan struct{}, 1)
+	start, _ := startedFSM(t, before, "resumed", make(chan struct{}, 1), reached, make(chan RunErr, 1))
+	version, err := start(ctx, "resumed-1", NewRequest(&orderReq{}, &orderResp{}), WithQueue("q"))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Reaching the second transition means the first's COMPLETE is recorded: the run has started.
+	within(t, reached, 10*time.Second, "the second transition")
+	stopBefore()
+
+	// Restarted with no capacity, the run is resumed but waits for a slot.
+	held, stopHeld := b.newManager(map[string]int{"q": 0})
+	_, resumeHeld := startedFSM(t, held, "resumed", make(chan struct{}, 1), make(chan struct{}, 1), make(chan RunErr, 1))
+	if err := resumeHeld(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	switch err := held.Cancel(ctx, version, "stop it"); {
+	case err == nil, errors.Is(err, ErrFsmNotFound):
+	default:
+		t.Fatalf("cancel: %v", err)
+	}
+	pendingRun(t, held, version) // still active: not settled
+	stopHeld()
+
+	// With a slot it runs again, so a cancel reaches it through its context.
+	after, _ := b.newManager(map[string]int{"q": 1})
+	second := make(chan struct{}, 1)
+	finalized := make(chan RunErr, 1)
+	_, resumeAfter := startedFSM(t, after, "resumed", make(chan struct{}, 1), second, finalized)
+	if err := resumeAfter(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	within(t, second, 10*time.Second, "the resumed run's second transition")
+	if err := after.Cancel(ctx, version, "stop it"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	outcome := within(t, finalized, 10*time.Second, "the resumed run's finalizers")
+	mustCancelError(t, outcome.Err, "stop it", "the outcome the finalizer saw")
+}
 
 func testCancelPendingUnknownRun(t *testing.T, b *backend) {
 	m, _ := b.newManager(nil)
