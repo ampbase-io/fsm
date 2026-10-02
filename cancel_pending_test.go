@@ -522,3 +522,43 @@ func TestResumeScanLeavesSettledRunSettled(t *testing.T) {
 		t.Fatalf("expected the resume scan to leave the run settled, got %v", err)
 	}
 }
+
+// TestCancelReachesExecutingRunWhateverItsRow verifies a cancel of a run this process is executing
+// goes through its context, even when BoltDB's row says it never started — as it does after a
+// SetRunning failure the run continues past. The settle only ever sees a run that is not executing,
+// so an executing run's finalizers run.
+func TestCancelReachesExecutingRunWhateverItsRow(t *testing.T) {
+	ctx := context.Background()
+	m, _ := newBoltBackend(t).newManager(nil)
+	s, ok := m.store.(*boltStore)
+	if !ok {
+		t.Fatalf("expected boltStore, got %T", m.store)
+	}
+
+	executing := make(chan struct{}, 1)
+	finalized := make(chan RunErr, 1)
+	start, _ := startedFSM(t, m, "unrecorded-row", make(chan struct{}, 1), executing, finalized)
+	version, err := start(ctx, "unrecorded-row-1", NewRequest(&orderReq{}, &orderResp{}))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	within(t, executing, 10*time.Second, "the run's second transition")
+
+	txn := s.memDB.Txn(true)
+	rs, err := runRow(txn, version)
+	if err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	rs.State = fsmv1.RunState_RUN_STATE_PENDING
+	if err := txn.Insert(fsmTable, rs); err != nil {
+		t.Fatalf("rewrite row: %v", err)
+	}
+	txn.Commit()
+
+	if err := m.Cancel(ctx, version, "stop it"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	outcome := within(t, finalized, 10*time.Second, "the executing run's finalizers")
+	mustCancelError(t, outcome.Err, "stop it", "the outcome the finalizer saw")
+	mustCancelError(t, waitFor(m, version), "stop it", "waiting on the run")
+}
