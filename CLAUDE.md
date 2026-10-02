@@ -52,7 +52,7 @@ backend's distributed-execution design is the active work.
   once, through `beginRun` (fsm.go): the one place a run is refused before its first side effect,
   and the loop's only store *write*. It must stay between the `m.running` registration (so a cancel
   arriving in that window reaches the run's context instead of being lost) and the first
-  transition. It stops the run only on a refusal (`refusesRun`): a stopped run records nothing, so
+  transition. It stops the run only on a refusal (`ErrLeaseLost`, `errRunSettled`): a stopped run records nothing, so
   the object `SetRunning` hands back a run whose start it failed to write instead of leaving it to
   a lease nobody runs. **A settle takes only a run that never started** — manifest status PENDING
   (which only ever moves forward), or on BoltDB a row `Active` seeded from a record with no

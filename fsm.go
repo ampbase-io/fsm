@@ -981,20 +981,13 @@ func (m *Manager) beginRun(ctx context.Context, request AnyRequest) error {
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
 	}
 
-	err := m.store.SetRunning(ctx, run)
-	if refusesRun(err) {
+	switch err := m.store.SetRunning(ctx, run); {
+	case errors.Is(err, ErrLeaseLost), errors.Is(err, errRunSettled):
 		return err
-	}
-	if err != nil {
+	case err != nil:
 		m.logger.ErrorContext(ctx, "failed to record run started", "error", err, runAttr(run))
 	}
 	return nil
-}
-
-// refusesRun reports whether SetRunning refused the run, rather than failing to record its start:
-// this node no longer holds it, or a cancel settled it while it waited.
-func refusesRun(err error) bool {
-	return errors.Is(err, ErrLeaseLost) || errors.Is(err, errRunSettled)
 }
 
 // iterate runs a transition's iterations from first until the run moves on, and reports whether
