@@ -891,17 +891,8 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 		m.mu.Unlock()
 		m.loadSignals(ctx, runVersion, mb)
 
-		// A lease-coordinated run may have lost ownership before reaching execution — a
-		// delayed or queued dispatch can trail its claim by arbitrarily long. Stop before
-		// any side effects run rather than waiting to be fenced on the first write. The same
-		// lookup yields the lease epoch handlers read as their fencing token.
-		if f, ok := m.store.(fencer); ok {
-			epoch, owned := f.ownedEpoch(runVersion)
-			if !owned {
-				stop(ErrLeaseLost)
-			}
-			request.withLeaseEpoch(epoch)
-			span.SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
+		if err := m.beginRun(ctx, request); err != nil {
+			stop(err)
 		}
 
 		defer func() {
@@ -968,6 +959,27 @@ func run(ctx context.Context, request AnyRequest, m *Manager, r runner, ri *runI
 
 	<-ack
 	return
+}
+
+// beginRun settles whether the run may execute on this node and records that it has. A
+// lease-coordinated backend answers from the lease it already holds, which a delayed or queued
+// dispatch can have lost while it waited; either backend refuses a run it has already settled,
+// canceled while it waited for a runner. It runs before any side effects, so a refusal stops the
+// run rather than surfacing as a fenced write part-way through a transition.
+func (m *Manager) beginRun(ctx context.Context, request AnyRequest) error {
+	run := request.Run()
+
+	if f, ok := m.store.(fencer); ok {
+		epoch, owned := f.ownedEpoch(run.StartVersion)
+		if !owned {
+			return ErrLeaseLost
+		}
+		// The same lookup yields the lease epoch handlers read as their fencing token.
+		request.withLeaseEpoch(epoch)
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int64("fsm.lease_epoch", epoch))
+	}
+
+	return m.store.SetRunning(ctx, run)
 }
 
 // iterate runs a transition's iterations from first until the run moves on, and reports whether

@@ -131,6 +131,13 @@ the way to ask "was that a cancel?" — never the message text. The FINISH event
 returns carries the same classification as `halt_kind`, with `error_state` naming the
 transition the run halted in.
 
+A run that has not started anywhere — waiting on a queue with no free slot, or on a delay — is
+settled by `Cancel` where it stands: its cause is recorded, its resource is freed, and its waiters
+get the same `*fsm.CancelError` an admitted run's would, so `Wait` and `History` cannot tell the two
+apart. It never executes a transition, and its finalizers do not run: nothing has happened that
+needs finalizing. A cancel that races the run starting resolves to exactly one of the two — the run
+either starts and is canceled through its context, or is settled and never starts.
+
 Finalizers run on a context that an operator's cancel does not end, so they can do the work the
 cancel calls for — start a compensating run and wait on it, say. It carries the values
 initializers put on the transitions' context but none of their cancellation, and no deadline:
@@ -286,9 +293,8 @@ version, err := start(ctx, orgID, req, fsm.WithExclusiveQueue("tofu"))
 - **Every start of the resource must use it,** or declare it on the FSM instead (below). A plain
   `WithQueue` start of the same id stacks beside an exclusive run, because its lock is keyed by
   run version, so a call site left on `WithQueue` silently runs a second time.
-- **A run that is never admitted holds the resource** until the queue has capacity, and
-  `Cancel` cannot release it: a cancel is applied by the node executing the run, and none has
-  claimed it.
+- **A run that is never admitted holds the resource** until the queue has capacity — or until
+  `Cancel` settles it, which frees the id at once without the run ever executing.
 - **Released when the run finishes,** so the id is free again.
 - **Other ids are unaffected.** Exclusivity is per resource; the queue's capacity still governs
   how many run at once across the fleet.

@@ -45,7 +45,14 @@ backend's distributed-execution design is the active work.
   START record; `Append` records every later event); run-state queries (`ActiveRuns`, `WaitRun`,
   `Runs`, …) are backend-typed. `Active` (every incomplete run of one FSM) is on `Store` and
   implemented by both backends; the Manager resumes through it unless the backend is a
-  `runClaimer`, whose claim loop hands out only the runs this node may take. A backend may also
+  `runClaimer`, whose claim loop hands out only the runs this node may take. `SetRunning` and
+  `cancelPending` are the two sides of one arbiter, also on `Store`: a run waiting for a runner is
+  either started or settled by a cancel, never both, so each backend decides between them with the
+  same claim — the memdb row on BoltDB, the manifest lease on the object backend. The run loop asks
+  once, through `beginRun` (fsm.go): the one place a run is refused before its first side effect,
+  and the loop's only store *write*. It must stay between the `m.running` registration (so a cancel
+  arriving in that window reaches the run's context instead of being lost) and the first
+  transition. A backend may also
   satisfy narrow capability views, each declared at its own call site: `appender`
   (interceptor.go), `runClaimer`, `fencer`, `cancelSweeper` (coordinate.go), `cancelRecorder`
   (manager.go), `nodeIdentified` (fsm.go). BoltDB implements none of the lease-shaped ones, so it
@@ -55,7 +62,8 @@ backend's distributed-execution design is the active work.
 - `objstore_store.go` / `objstore_lease.go` / `objstore_cancel.go` / `objstore.go` — the object
   backend: Append + queries + WaitRun; leases and `lease_epoch` fencing (a run that failed to
   resume keeps a `leaseDeferred` slot, which `reserveClaim` refuses until a timer clears it —
-  no second map); cancel sentinels; the S3 client, key helpers, and conditional writes.
+  no second map); cancel sentinels, and `cancelPending`, which claims a never-started run's lease
+  without queue admission so it can settle it; the S3 client, key helpers, and conditional writes.
 - `coordinate.go` — the lease-coordinated background loop (`leaseCoordinator`): heartbeat
   (extend leases, sweep for lost leases and cancels), jittered claim pass, event-driven wakeups.
 - `eventbus.go` — `EventPublisher`/`EventSubscriber`/`EventBus`, the protobuf `fsmv1.RunEvent`

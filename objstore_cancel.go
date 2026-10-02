@@ -113,3 +113,26 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 	_, err = s.Append(ctx, run, event)
 	return err
 }
+
+// cancelPending settles a run no node has started — pending, or queued behind a full queue, where
+// nothing applies the cancel sentinel until a slot frees. Ownership is the arbiter: it takes the
+// same lease claim a claim pass takes, minus queue admission, so a cancel and an admission can
+// never both win the run. Losing the claim is not a failure — the run is owned, so its owner's
+// sweep applies the sentinel — and neither is a run that has since gone terminal.
+func (s *objectStore) cancelPending(ctx context.Context, version ulid.ULID, cause error) error {
+	manifest, err := s.claimManifest(ctx, version)
+	switch {
+	case errors.Is(err, errClaimLost), errors.Is(err, ErrFsmNotFound):
+		return nil
+	case err != nil:
+		return err
+	}
+
+	if err := s.cancelOwnedRun(ctx, version, cause); err != nil {
+		// The lease was taken to settle the run, not to execute it: held, the heartbeat would
+		// extend it for as long as this node lives and no other node could take the run over.
+		s.releaseLease(ctx, version, manifest.GetLeaseEpoch())
+		return err
+	}
+	return nil
+}
