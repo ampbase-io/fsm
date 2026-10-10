@@ -19,7 +19,10 @@ import (
 //
 // Here the clock is read under the same lock as the entropy, and a millisecond
 // behind the last one minted is clamped to it, so the reader only ever sees a
-// non-decreasing sequence and increments within it.
+// non-decreasing sequence and increments within it. The clamp is also what
+// makes a wall-clock step backwards harmless: without it the step would reset
+// the reader the same way a stale caller does, and IDs minted during the step
+// would sort before the ones minted just before it.
 type signalIDs struct {
 	mu   sync.Mutex
 	now  func() uint64
