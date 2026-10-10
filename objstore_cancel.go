@@ -9,6 +9,10 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
+// errRunStarted refuses a settle whose run started between the settle's read of the manifest
+// and its write.
+var errRunStarted = errors.New("run started before it could be settled")
+
 // cancelBeforeExecState labels the terminal state recorded for a run canceled before it began
 // executing: no transition was in flight, so there is no real state to attribute the cancel to,
 // so the record names this label as where it stopped.
@@ -107,14 +111,20 @@ func (s *objectStore) cancelOwnedRun(ctx context.Context, version ulid.ULID, cau
 
 	run := runFromManifest(version, manifest)
 	run.fsmErr = RunErr{Err: halt(cause), State: cancelBeforeExecState}
+	run.unstarted = true
 	event := finishEvent(run, cancelBeforeExecState)
 	// A run canceled before it ran read nothing, so every signal sent to it is discarded.
 	event.DiscardedSignals, err = s.unreadSignalIDs(ctx, version)
 	if err != nil {
 		s.logger.WarnContext(ctx, "failed to list unread signals at cancel", "error", err, versionAttr(version))
 	}
-	_, err = s.Append(ctx, run, event)
-	return err
+	switch _, err := s.Append(ctx, run, event); {
+	case errors.Is(err, errRunStarted):
+		// The sentinel stays, and the next sweep cancels the run through its context.
+		return nil
+	default:
+		return err
+	}
 }
 
 // cancelPending settles a run no node has started — pending, or queued behind a full queue, where

@@ -275,6 +275,10 @@ type Run struct {
 	// iterated is set while the run is in a RepeatWhile transition, so its COMPLETE counts the
 	// iteration.
 	iterated bool
+
+	// unstarted is set on a run a settle finishes without executing it, so its FINISH is refused
+	// once the run has started.
+	unstarted bool
 }
 
 // stacks reports whether the run's key carries its version, so it shares its resource with the

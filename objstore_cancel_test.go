@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -291,5 +292,37 @@ func TestCancelPendingLeavesStartedRunToTakeover(t *testing.T) {
 	}
 	if _, err := peer.claimManifest(ctx, run.StartVersion); err != nil {
 		t.Fatalf("expected the takeover to claim the run, got %v", err)
+	}
+}
+
+// TestCancelOwnedRunRefusedOnceTheRunStarts: a settle that read PENDING, then lost the manifest to
+// SetRunning before it wrote, must not finish a run that is now executing. SetRunning lands inside
+// that window here — after cancelOwnedRun's read, at the put of its FINISH object, before the
+// manifest CAS — and the run must come out RUNNING and still leased, with cancelOwnedRun leaving it
+// to the next sweep. Errors go through t.Errorf: the hook runs on a server goroutine.
+func TestCancelOwnedRunRefusedOnceTheRunStarts(t *testing.T) {
+	h := newLeaseHarness(t)
+	s := h.store("node-a", 10*time.Second)
+	ctx := context.Background()
+
+	run := startRun(t, s, "cor-raced")
+	h.s3.SetPrePut(func(key string) {
+		if !strings.Contains(key, "events/") {
+			return
+		}
+		h.s3.SetPrePut(nil)
+		if err := s.SetRunning(ctx, run); err != nil {
+			t.Errorf("SetRunning: %v", err)
+		}
+	})
+
+	if err := s.cancelOwnedRun(ctx, run.StartVersion, &CancelError{Reason: "raced"}); err != nil {
+		t.Fatalf("cancelOwnedRun: %v", err)
+	}
+	if got := mustManifest(t, s, run.StartVersion).GetStatus(); got != fsmv1.RunState_RUN_STATE_RUNNING {
+		t.Fatalf("manifest is %v after a settle raced by SetRunning, want RUNNING", got)
+	}
+	if !owns(s, run.StartVersion) {
+		t.Fatal("the refused settle dropped the lease of the run it did not finish")
 	}
 }
