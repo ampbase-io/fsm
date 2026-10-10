@@ -169,7 +169,7 @@ func (m *Manager) SendSignal(ctx context.Context, version ulid.ULID, name string
 		return ulid.ULID{}, err
 	}
 
-	id := m.signalIDs.mint()
+	id := m.orderedIDs.mint()
 	sig := &fsmv1.Signal{Id: id.String(), Name: name, Payload: payload}
 	if err := m.store.recordSignal(ctx, run, sig); err != nil {
 		return ulid.ULID{}, err

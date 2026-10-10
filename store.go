@@ -137,6 +137,10 @@ type boltStore struct {
 
 	memDB *memdb.MemDB
 
+	// versions mints every event version, inside the write transaction that
+	// stores it, so a run's events sort in commit order; see orderedid.go.
+	versions *orderedIDs
+
 	// archiveCh is only used in tests to signal the archive loop to run.
 	archiveCh chan struct{}
 }
@@ -191,6 +195,7 @@ func newStore(logger *slog.Logger, tracer trace.Tracer, path string) (*boltStore
 		db:        db,
 		history:   history,
 		memDB:     memDB,
+		versions:  newOrderedIDs(ulid.Now),
 	}
 
 	go s.archive(ctx)
@@ -876,12 +881,6 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 	}
 	event.RunVersion = runVersionBytes
 
-	eventVersion := ulid.Make()
-	version, err := eventVersion.MarshalText()
-	if err != nil {
-		return ulid.ULID{}, err
-	}
-
 	eventBytes, err := proto.Marshal(event)
 	if err != nil {
 		return ulid.ULID{}, err
@@ -892,40 +891,11 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 		[]byte(event.GetAction()),
 	}, keySeparator)
 
-	// EVENT Bucket
-	// <resource_id>#<action>#<run_version>#<event_version>
-	eventKey := bytes.Join([][]byte{eventIdentifier, event.GetRunVersion(), version}, keySeparator)
-
 	aeEventKey, err := activeKey(run)
 	if err != nil {
 		return ulid.ULID{}, err
 	}
 	parentBytes := optionalVersionBytes(run.Parent)
-	var aeEventBytes []byte
-	if event.GetType() == fsmv1.EventType_EVENT_TYPE_START {
-		ae := &fsmv1.ActiveEvent{
-			StartEvent:   eventKey,
-			StartVersion: runVersionBytes,
-			Action:       event.GetAction(),
-			ResourceId:   event.GetId(),
-			Resource:     start.Resource,
-			Transitions:  start.Transitions,
-			Options: &fsmv1.EventOptions{
-				DelayUntil: delayMillis(start.DelayUntil),
-				RunAfter:   optionalVersionBytes(start.RunAfter),
-				Queue:      run.Queue,
-				Exclusive:  run.Exclusive,
-				Parent:     parentBytes,
-			},
-			TraceContext: map[string]string{},
-		}
-		(propagation.TraceContext{}).Inject(ctx, propagation.MapCarrier(ae.TraceContext))
-
-		aeEventBytes, err = proto.Marshal(ae)
-		if err != nil {
-			return ulid.ULID{}, err
-		}
-	}
 
 	rs := runSnapshot{
 		Run: run,
@@ -933,12 +903,43 @@ func (s *boltStore) record(ctx context.Context, run Run, event *fsmv1.StateEvent
 
 	txn := s.memDB.Txn(true)
 	defer txn.Abort()
+	var eventVersion ulid.ULID
 	err = s.db.Update(func(tx *bbolt.Tx) error {
 		activeB := tx.Bucket(activeBucket)
 		eventB := tx.Bucket(eventsBucket)
 
+		// Minted inside the transaction, so a run's event keys sort in the order
+		// bolt commits them: a version minted before another writer's commit would
+		// sort before an event committed ahead of it.
+		eventVersion = s.versions.mint()
+		// EVENT Bucket
+		// <resource_id>#<action>#<run_version>#<event_version>
+		eventKey := bytes.Join([][]byte{eventIdentifier, event.GetRunVersion(), []byte(eventVersion.String())}, keySeparator)
+
 		switch event.GetType() {
 		case fsmv1.EventType_EVENT_TYPE_START:
+			ae := &fsmv1.ActiveEvent{
+				StartEvent:   eventKey,
+				StartVersion: runVersionBytes,
+				Action:       event.GetAction(),
+				ResourceId:   event.GetId(),
+				Resource:     start.Resource,
+				Transitions:  start.Transitions,
+				Options: &fsmv1.EventOptions{
+					DelayUntil: delayMillis(start.DelayUntil),
+					RunAfter:   optionalVersionBytes(start.RunAfter),
+					Queue:      run.Queue,
+					Exclusive:  run.Exclusive,
+					Parent:     parentBytes,
+				},
+				TraceContext: map[string]string{},
+			}
+			(propagation.TraceContext{}).Inject(ctx, propagation.MapCarrier(ae.TraceContext))
+			aeEventBytes, err := proto.Marshal(ae)
+			if err != nil {
+				return err
+			}
+
 			// One active event per resource, unless the run stacks behind the one holding it.
 			if !run.stacks() && activeB.Get(aeEventKey) != nil {
 				var ae fsmv1.ActiveEvent

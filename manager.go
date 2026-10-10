@@ -107,9 +107,9 @@ type Manager struct {
 
 	instruments *instruments
 
-	// signalIDs mints every signal ID this node accepts; see signalid.go for
+	// orderedIDs mints every signal ID this node accepts; see signalid.go for
 	// why ulid.Make is not enough.
-	signalIDs *signalIDs
+	orderedIDs *orderedIDs
 
 	wg sync.WaitGroup
 
@@ -246,7 +246,7 @@ func New(cfg Config) (*Manager, error) {
 		logger:      cfg.Logger.With("sys", "fsm"),
 		tracer:      tracer,
 		instruments: instruments,
-		signalIDs:   newSignalIDs(ulid.Now),
+		orderedIDs:  newOrderedIDs(ulid.Now),
 		store:       store,
 		bus:         busOrNoop(cfg.EventBus),
 		fsms:        map[fsmKey]*fsm{},

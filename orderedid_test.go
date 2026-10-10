@@ -22,14 +22,14 @@ func staleClock() func() uint64 {
 	}
 }
 
-// TestSignalIDs_MintOrderSurvivesAStaleMillisecond: through the minter the
+// TestOrderedIDs_MintOrderSurvivesAStaleMillisecond: through the minter the
 // three IDs sort as minted, every run — the clamp hands the reader 1001 for
 // the third mint and it increments.
-func TestSignalIDs_MintOrderSurvivesAStaleMillisecond(t *testing.T) {
+func TestOrderedIDs_MintOrderSurvivesAStaleMillisecond(t *testing.T) {
 	t.Parallel()
 
 	for range 200 {
-		ids := newSignalIDs(staleClock())
+		ids := newOrderedIDs(staleClock())
 		first, second, third := ids.mint(), ids.mint(), ids.mint()
 		if !(first.Compare(second) < 0 && second.Compare(third) < 0) {
 			t.Fatalf("IDs do not sort in mint order: %s %s %s", first, second, third)
@@ -37,13 +37,13 @@ func TestSignalIDs_MintOrderSurvivesAStaleMillisecond(t *testing.T) {
 	}
 }
 
-// TestSignalIDs_LibraryReaderReordersAStaleMillisecond pins the premise
+// TestOrderedIDs_LibraryReaderReordersAStaleMillisecond pins the premise
 // against the library the minter wraps: the same three milliseconds through
 // ulid's own locked monotonic reader, which is what ulid.Make uses, put the
 // third ID before the first in roughly half the runs. If a ulid upgrade makes
 // this pass zero times, the minter's clamp has become redundant and this test
 // says so rather than letting it rot.
-func TestSignalIDs_LibraryReaderReordersAStaleMillisecond(t *testing.T) {
+func TestOrderedIDs_LibraryReaderReordersAStaleMillisecond(t *testing.T) {
 	t.Parallel()
 
 	const runs = 200
@@ -57,18 +57,18 @@ func TestSignalIDs_LibraryReaderReordersAStaleMillisecond(t *testing.T) {
 		}
 	}
 	if reordered == 0 {
-		t.Fatalf("the library reader kept mint order in all %d runs; the premise behind signalIDs no longer holds", runs)
+		t.Fatalf("the library reader kept mint order in all %d runs; the premise behind orderedIDs no longer holds", runs)
 	}
 	t.Logf("the library reader put the third ID before the first in %d of %d runs", reordered, runs)
 }
 
-// TestSignalIDs_SameMillisecondIncrements: a fixed clock, the case a
+// TestOrderedIDs_SameMillisecondIncrements: a fixed clock, the case a
 // consumer's test constructs, orders by the entropy alone and still sorts as
 // minted.
-func TestSignalIDs_SameMillisecondIncrements(t *testing.T) {
+func TestOrderedIDs_SameMillisecondIncrements(t *testing.T) {
 	t.Parallel()
 
-	ids := newSignalIDs(func() uint64 { return 1000 })
+	ids := newOrderedIDs(func() uint64 { return 1000 })
 	prev := ids.mint()
 	for range 100 {
 		next := ids.mint()
@@ -82,12 +82,12 @@ func TestSignalIDs_SameMillisecondIncrements(t *testing.T) {
 	}
 }
 
-// TestSignalIDs_AreTheOnlyMinterOfSignalIDs: a file that builds a Signal is
+// TestOrderedIDs_AreTheOnlyMinterOfSignalIDs: a file that builds a Signal is
 // a file that stamps its ID, and ulid.Make there is an ID minted outside the
 // lock that keeps them ordered. The package's other ulid.Make calls mint run
-// versions, transition IDs, event versions and a node ID, none of which a
-// signal is ever ordered against.
-func TestSignalIDs_AreTheOnlyMinterOfSignalIDs(t *testing.T) {
+// versions, transition IDs, object-store event versions and a node ID, none of
+// which a signal is ever ordered against.
+func TestOrderedIDs_AreTheOnlyMinterOfSignalIDs(t *testing.T) {
 	t.Parallel()
 
 	files, err := filepath.Glob("*.go")
@@ -108,7 +108,7 @@ func TestSignalIDs_AreTheOnlyMinterOfSignalIDs(t *testing.T) {
 		}
 		builders++
 		if strings.Contains(string(src), "ulid.Make(") {
-			t.Errorf("%s builds a Signal and calls ulid.Make; signal IDs come from signalIDs.mint", file)
+			t.Errorf("%s builds a Signal and calls ulid.Make; signal IDs come from orderedIDs.mint", file)
 		}
 	}
 	if builders == 0 {

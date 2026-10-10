@@ -56,10 +56,6 @@ func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) 
 		return err
 	}
 
-	// EVENT Bucket
-	// <resource_id>#<action>#<run_version>#<event_version>
-	eventVersion := []byte(ulid.Make().String())
-	eventKey := bytes.Join([][]byte{[]byte(run.ID), []byte(run.Action), event.GetRunVersion(), eventVersion}, keySeparator)
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		live, err := activeIn(tx, run)
 		if err != nil {
@@ -68,6 +64,12 @@ func (s *boltStore) recordSignal(_ context.Context, run Run, sig *fsmv1.Signal) 
 		if !live {
 			return ErrFsmNotFound
 		}
+		// EVENT Bucket
+		// <resource_id>#<action>#<run_version>#<event_version>
+		// Minted here, as record does, so the SIGNAL sorts before a FINISH
+		// committed after it.
+		eventVersion := []byte(s.versions.mint().String())
+		eventKey := bytes.Join([][]byte{[]byte(run.ID), []byte(run.Action), event.GetRunVersion(), eventVersion}, keySeparator)
 		if err := tx.Bucket(eventsBucket).Put(eventKey, eventBytes); err != nil {
 			return err
 		}

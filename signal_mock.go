@@ -15,7 +15,7 @@ import (
 // a signal counts as received only when the body's receive completes.
 type MockMailbox struct {
 	mb  *mailbox
-	ids *signalIDs
+	ids *orderedIDs
 }
 
 // MockSignals gives req a mailbox that accepts sigs, as WithSignals does for an FSM's runs. It
@@ -31,7 +31,7 @@ func MockSignals(req AnyRequest, sigs ...AnySignal) *MockMailbox {
 	}
 	mb := newMailbox(accepted, nil, slog.New(slog.DiscardHandler))
 	req.withMailbox(mb)
-	return &MockMailbox{mb: mb, ids: newSignalIDs(ulid.Now)}
+	return &MockMailbox{mb: mb, ids: newOrderedIDs(ulid.Now)}
 }
 
 // Clock sets the clock Deliver stamps signal IDs from. With a fixed clock every
