@@ -179,6 +179,8 @@ func (s *objectStore) record(ctx context.Context, run Run, event *fsmv1.StateEve
 		err = fmt.Errorf("%T: %w", event.Type, errInvalidEventType)
 	}
 	switch {
+	case errors.Is(err, errRunStarted):
+		return ulid.ULID{}, err
 	case errors.Is(err, ErrLeaseLost):
 		// Expected control flow after a takeover, not a storage failure.
 		s.logger.WarnContext(ctx, "append fenced, run no longer owned", "error", err)
@@ -500,6 +502,11 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		if err := s.checkFence(m, epoch); err != nil {
 			return err
 		}
+		// A settle read PENDING before it got here; SetRunning can have moved the run on since,
+		// and the run is then executing under this same epoch.
+		if run.unstarted && m.Status != fsmv1.RunState_RUN_STATE_PENDING {
+			return errRunStarted
+		}
 		m.Status = fsmv1.RunState_RUN_STATE_COMPLETE
 		m.EndEventKey = []byte(eventKey)
 		m.LatestEventKey = []byte(eventKey)
@@ -525,6 +532,8 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 		s.dropLease(run.StartVersion)
 		return err
 	case err != nil:
+		// errRunStarted included: the run keeps its lease, and the FINISH object just put is
+		// named by no manifest, as a fenced owner's can be.
 		return err
 	}
 
