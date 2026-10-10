@@ -3,6 +3,7 @@ package fsm
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
@@ -13,7 +14,8 @@ import (
 // signals can be unit-tested outside a run. It is the mailbox a run gets, with the same delivery:
 // a signal counts as received only when the body's receive completes.
 type MockMailbox struct {
-	mb *mailbox
+	mb  *mailbox
+	ids *signalIDs
 }
 
 // MockSignals gives req a mailbox that accepts sigs, as WithSignals does for an FSM's runs. It
@@ -29,7 +31,15 @@ func MockSignals(req AnyRequest, sigs ...AnySignal) *MockMailbox {
 	}
 	mb := newMailbox(accepted, nil, slog.New(slog.DiscardHandler))
 	req.withMailbox(mb)
-	return &MockMailbox{mb: mb}
+	return &MockMailbox{mb: mb, ids: newSignalIDs(ulid.Now)}
+}
+
+// Clock sets the clock Deliver stamps signal IDs from. With a fixed clock every
+// delivery lands in one millisecond and only the minter's entropy orders them,
+// which is how a test shows a body applying signals in delivery order rather
+// than in whatever order the clock happened to separate them.
+func (m *MockMailbox) Clock(now func() time.Time) {
+	m.ids.setClock(func() uint64 { return ulid.Timestamp(now()) })
 }
 
 // Deliver offers the signal to the request's body and returns its ID. It panics if msg does not
@@ -42,7 +52,7 @@ func (m *MockMailbox) Deliver[T any](s Signal[T], msg *T) ulid.ULID {
 	if err != nil {
 		panic(fmt.Sprintf("fsm: Deliver %s: %v", s.name, err))
 	}
-	id := ulid.Make()
+	id := m.ids.mint()
 	m.mb.offer(&fsmv1.Signal{Id: id.String(), Name: s.name, Payload: payload})
 	return id
 }
