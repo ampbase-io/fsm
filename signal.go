@@ -90,6 +90,24 @@ func (s Signal[T]) Receive(req AnyRequest) <-chan Received[T] {
 	return typed.ch
 }
 
+// Take returns every signal of this name the run holds and has not received in this attempt,
+// oldest first, each counted as received as a completed receive on Receive's channel would be.
+// It never waits for a signal to arrive, and, unlike a receive on that channel with a default
+// case, it does not miss one the run already holds: that channel offers only once its goroutine
+// is back at its select, which a transition that fails fast can poll ahead of on every attempt.
+// Take panics as Receive does.
+func (s Signal[T]) Take(req AnyRequest) []Received[T] {
+	o, ok := req.mailbox().outlet(s.name)
+	if !ok {
+		panic(fmt.Sprintf("fsm: signal %q is not accepted by this run's FSM (WithSignals)", s.name))
+	}
+	typed, ok := o.(*outlet[T])
+	if !ok {
+		panic(fmt.Sprintf("fsm: signal %q is accepted with a different payload type", s.name))
+	}
+	return typed.take()
+}
+
 func (s Signal[T]) signalName() string { return s.name }
 
 func (s Signal[T]) declErr() error { return s.err }

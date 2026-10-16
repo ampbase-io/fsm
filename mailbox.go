@@ -146,9 +146,10 @@ type outlet[T any] struct {
 	ch    chan Received[T]
 	ops   chan outletOp
 
-	// replies carries received's answer. It is allocated once, since only the run's own
-	// goroutine asks.
+	// replies carries received's answer, and takes take's. Each is allocated once, since only
+	// the run's own goroutine asks.
 	replies chan []string
+	takes   chan []Received[T]
 
 	done   <-chan struct{}
 	logger *slog.Logger
@@ -172,6 +173,7 @@ const (
 	opConsume
 	opReceived
 	opUnseen
+	opTake
 )
 
 // outletOp is one call handed to an outlet's goroutine.
@@ -188,6 +190,7 @@ func newOutlet[T any](codec Codec) *outlet[T] {
 		ch:       make(chan Received[T]),
 		ops:      make(chan outletOp),
 		replies:  make(chan []string),
+		takes:    make(chan []Received[T]),
 		pending:  map[string]Received[T]{},
 		consumed: map[string]struct{}{},
 	}
@@ -252,7 +255,29 @@ func (o *outlet[T]) apply(op outletOp) {
 		o.reply(op.reply, o.taken)
 	case opUnseen:
 		o.reply(op.reply, o.unseenOf(op.ids))
+	case opTake:
+		took := o.takeAll()
+		select {
+		case o.takes <- took:
+		case <-o.done:
+		}
 	}
+}
+
+// takeAll counts every pending signal not received in this attempt as received, oldest first,
+// and returns them.
+func (o *outlet[T]) takeAll() []Received[T] {
+	var took []Received[T]
+	for id, r := range o.pending {
+		if !slices.Contains(o.taken, id) {
+			took = append(took, r)
+		}
+	}
+	slices.SortFunc(took, func(a, b Received[T]) int { return a.ID.Compare(b.ID) })
+	for _, r := range took {
+		o.taken = append(o.taken, r.ID.String())
+	}
+	return took
 }
 
 // add decodes and holds a signal the outlet has not seen. A signal that does not decode was
@@ -324,6 +349,20 @@ func (o *outlet[T]) ask(op outletOp) []string {
 }
 
 func (o *outlet[T]) offer(sig *fsmv1.Signal) { o.do(outletOp{kind: opOffer, sig: sig}) }
+
+// take answers from the goroutine's own state, so it sees every op applied before it, a
+// beginAttempt's among them, without waiting for the goroutine to offer again.
+func (o *outlet[T]) take() []Received[T] {
+	if !o.do(outletOp{kind: opTake}) {
+		return nil
+	}
+	select {
+	case took := <-o.takes:
+		return took
+	case <-o.done:
+		return nil
+	}
+}
 
 func (o *outlet[T]) beginAttempt() { o.do(outletOp{kind: opBegin}) }
 

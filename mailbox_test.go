@@ -192,3 +192,54 @@ func TestMailboxCloseStopsOutlets(t *testing.T) {
 
 	eventually(t, time.Second, func() bool { return runtime.NumGoroutine() <= before }, "expected the outlets' goroutines to end")
 }
+
+// TestMailboxTakeSeesTheReofferAtOnce verifies take, asked straight after an attempt begins,
+// returns the signal the failed attempt received, and counts it as received. With one P the
+// outlet's goroutine has taken the begin op but not yet returned to its select, so a receive with
+// a default case polls ahead of the offer: the counterfactual is take answered by that poll.
+func TestMailboxTakeSeesTheReofferAtOnce(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	mb := testMailbox(t)
+	sig := signalOf(t, "advance", command{})
+	mb.offer(sig)
+	within(t, channel(t, mb, testAdvance), time.Second, "the first attempt's receive")
+
+	o, _ := mb.outlet(testAdvance.name)
+	for range 50 {
+		mb.beginAttempt()
+		took := o.(*outlet[command]).take()
+		if len(took) != 1 || took[0].ID.String() != sig.GetId() {
+			t.Fatalf("expected the retry to take %s at once, got %v", sig.GetId(), took)
+		}
+		if got := mb.received(); len(got) != 1 || got[0] != sig.GetId() {
+			t.Fatalf("expected %s counted as received, got %v", sig.GetId(), got)
+		}
+	}
+}
+
+// TestMailboxTakeOnlyUnreceived verifies take returns a name's pending signals oldest first,
+// skips one already received in this attempt, and leaves nothing for the channel to offer
+// again until the next attempt begins.
+func TestMailboxTakeOnlyUnreceived(t *testing.T) {
+	mb := testMailbox(t)
+	older := signalOf(t, "advance", command{Note: "older"})
+	newer := signalOf(t, "advance", command{Note: "newer"})
+	mb.offer(older)
+	ch := channel(t, mb, testAdvance)
+	within(t, ch, time.Second, "the older signal")
+	mb.offer(newer)
+
+	o, _ := mb.outlet(testAdvance.name)
+	took := o.(*outlet[command]).take()
+	if len(took) != 1 || took[0].ID.String() != newer.GetId() {
+		t.Fatalf("expected only the newer signal, got %v", took)
+	}
+	if again := o.(*outlet[command]).take(); len(again) != 0 {
+		t.Fatalf("expected nothing left to take, got %v", again)
+	}
+	select {
+	case r := <-ch:
+		t.Fatalf("expected nothing on offer after take, got %s", r.ID)
+	case <-time.After(50 * time.Millisecond):
+	}
+}

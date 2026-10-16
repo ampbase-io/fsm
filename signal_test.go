@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -699,4 +700,48 @@ func checkStage(stage int) error {
 		return errors.New("unexpected stage")
 	}
 	return nil
+}
+
+// TestSignalTakenByAFailingAttempt verifies a transition whose every attempt fails at once still
+// takes a signal sent while it fails: Take answers from what the run holds, so the first attempt
+// after the send has it. With one P a receive with a default case polls ahead of the outlet's
+// offer on every attempt; the counterfactual is Take answered by that poll, and the run retries
+// until the wait times out.
+func TestSignalTakenByAFailingAttempt(t *testing.T) { runBackends(t, testSignalTakenByAFailingAttempt) }
+
+func testSignalTakenByAFailingAttempt(t *testing.T, b *backend) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	ctx := context.Background()
+	m, _ := b.newManager(nil)
+
+	failed := make(chan struct{}, 1)
+	taken := make(chan ulid.ULID, 1)
+	start, _, err := m.Register[orderReq, orderResp]("signal-take").
+		Start("wait", func(ctx context.Context, req *Request[orderReq, orderResp]) (*Response[orderResp], error) {
+			if took := testPause.Take(req); len(took) > 0 {
+				taken <- took[0].ID
+				return nil, nil
+			}
+			select {
+			case failed <- struct{}{}:
+			default:
+			}
+			return nil, errors.New("fails before any receive")
+		}).
+		End("done", acceptTestSignals()).
+		Build(ctx)
+	if err != nil {
+		t.Fatalf("failed to build FSM: %v", err)
+	}
+
+	version := startOrder(t, start, "signal-take")
+	within(t, failed, 10*time.Second, "a failed attempt")
+	id, err := testPause.Send(ctx, m, version, &command{Note: "pause"})
+	if err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	waitRun(t, m, version)
+	if got := within(t, taken, time.Second, "the taken signal"); got != id {
+		t.Fatalf("expected %s taken, got %s", id, got)
+	}
 }
