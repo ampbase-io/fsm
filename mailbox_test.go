@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,5 +242,55 @@ func TestMailboxTakeOnlyUnreceived(t *testing.T) {
 	case r := <-ch:
 		t.Fatalf("expected nothing on offer after take, got %s", r.ID)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestMailboxTakeConcurrently verifies takes asked at once each get their own answer: together
+// they return every held signal exactly once. The counterfactual is one reply channel shared by
+// the outlet, where an answer can reach the other caller.
+func TestMailboxTakeConcurrently(t *testing.T) {
+	mb := testMailbox(t)
+	want := map[string]bool{}
+	for range 20 {
+		sig := signalOf(t, "advance", command{})
+		want[sig.GetId()] = true
+		mb.offer(sig)
+	}
+	o, _ := mb.outlet(testAdvance.name)
+	answers := make(chan []Received[command], 8)
+	for range cap(answers) {
+		go func() { answers <- o.(*outlet[command]).take() }()
+	}
+	seen := map[string]int{}
+	for range cap(answers) {
+		for _, r := range within(t, answers, time.Second, "a take's answer") {
+			seen[r.ID.String()]++
+		}
+	}
+	for id := range want {
+		if seen[id] != 1 {
+			t.Fatalf("expected %s taken once, got %d", id, seen[id])
+		}
+	}
+}
+
+// TestMailboxTakeMarksTheHeldKey verifies take counts a signal received under the ID it is held
+// by, so one stored with a lowercase ID is not offered again in the attempt.
+func TestMailboxTakeMarksTheHeldKey(t *testing.T) {
+	mb := testMailbox(t)
+	sig := signalOf(t, "advance", command{})
+	sig.Id = strings.ToLower(sig.GetId())
+	mb.offer(sig)
+	o, _ := mb.outlet(testAdvance.name)
+	if took := o.(*outlet[command]).take(); len(took) != 1 {
+		t.Fatalf("expected the signal taken, got %v", took)
+	}
+	select {
+	case r := <-channel(t, mb, testAdvance):
+		t.Fatalf("expected nothing on offer after take, got %s", r.ID)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := mb.received(); len(got) != 1 || got[0] != sig.GetId() {
+		t.Fatalf("expected %s received, got %v", sig.GetId(), got)
 	}
 }

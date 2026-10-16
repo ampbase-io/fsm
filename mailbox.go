@@ -146,10 +146,9 @@ type outlet[T any] struct {
 	ch    chan Received[T]
 	ops   chan outletOp
 
-	// replies carries received's answer, and takes take's. Each is allocated once, since only
-	// the run's own goroutine asks.
+	// replies carries received's answer. It is allocated once, since only the run's own
+	// goroutine asks.
 	replies chan []string
-	takes   chan []Received[T]
 
 	done   <-chan struct{}
 	logger *slog.Logger
@@ -182,6 +181,8 @@ type outletOp struct {
 	sig   *fsmv1.Signal
 	ids   []string
 	reply chan []string
+	// took receives an opTake's answer, which is typed, so it travels outside reply.
+	took any
 }
 
 func newOutlet[T any](codec Codec) *outlet[T] {
@@ -190,7 +191,6 @@ func newOutlet[T any](codec Codec) *outlet[T] {
 		ch:       make(chan Received[T]),
 		ops:      make(chan outletOp),
 		replies:  make(chan []string),
-		takes:    make(chan []Received[T]),
 		pending:  map[string]Received[T]{},
 		consumed: map[string]struct{}{},
 	}
@@ -256,9 +256,8 @@ func (o *outlet[T]) apply(op outletOp) {
 	case opUnseen:
 		o.reply(op.reply, o.unseenOf(op.ids))
 	case opTake:
-		took := o.takeAll()
 		select {
-		case o.takes <- took:
+		case op.took.(chan []Received[T]) <- o.takeAll():
 		case <-o.done:
 		}
 	}
@@ -267,16 +266,18 @@ func (o *outlet[T]) apply(op outletOp) {
 // takeAll counts every pending signal not received in this attempt as received, oldest first,
 // and returns them.
 func (o *outlet[T]) takeAll() []Received[T] {
-	var took []Received[T]
-	for id, r := range o.pending {
+	var ids []string
+	for id := range o.pending {
 		if !slices.Contains(o.taken, id) {
-			took = append(took, r)
+			ids = append(ids, id)
 		}
 	}
-	slices.SortFunc(took, func(a, b Received[T]) int { return a.ID.Compare(b.ID) })
-	for _, r := range took {
-		o.taken = append(o.taken, r.ID.String())
+	slices.Sort(ids)
+	took := make([]Received[T], 0, len(ids))
+	for _, id := range ids {
+		took = append(took, o.pending[id])
 	}
+	o.taken = append(o.taken, ids...)
 	return took
 }
 
@@ -351,13 +352,15 @@ func (o *outlet[T]) ask(op outletOp) []string {
 func (o *outlet[T]) offer(sig *fsmv1.Signal) { o.do(outletOp{kind: opOffer, sig: sig}) }
 
 // take answers from the goroutine's own state, so it sees every op applied before it, a
-// beginAttempt's among them, without waiting for the goroutine to offer again.
+// beginAttempt's among them, without waiting for the goroutine to offer again. Its reply channel
+// is its own, as unseen's is: any goroutine may take.
 func (o *outlet[T]) take() []Received[T] {
-	if !o.do(outletOp{kind: opTake}) {
+	reply := make(chan []Received[T])
+	if !o.do(outletOp{kind: opTake, took: reply}) {
 		return nil
 	}
 	select {
-	case took := <-o.takes:
+	case took := <-reply:
 		return took
 	case <-o.done:
 		return nil
