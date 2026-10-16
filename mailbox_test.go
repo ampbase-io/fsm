@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,4 +192,105 @@ func TestMailboxCloseStopsOutlets(t *testing.T) {
 	mb.close()
 
 	eventually(t, time.Second, func() bool { return runtime.NumGoroutine() <= before }, "expected the outlets' goroutines to end")
+}
+
+// TestMailboxTakeSeesTheReofferAtOnce verifies take, asked straight after an attempt begins,
+// returns the signal the failed attempt received, and counts it as received. With one P the
+// outlet's goroutine has taken the begin op but not yet returned to its select, so a receive with
+// a default case polls ahead of the offer: the counterfactual is take answered by that poll.
+func TestMailboxTakeSeesTheReofferAtOnce(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	mb := testMailbox(t)
+	sig := signalOf(t, "advance", command{})
+	mb.offer(sig)
+	within(t, channel(t, mb, testAdvance), time.Second, "the first attempt's receive")
+
+	o, _ := mb.outlet(testAdvance.name)
+	for range 50 {
+		mb.beginAttempt()
+		took := o.(*outlet[command]).take()
+		if len(took) != 1 || took[0].ID.String() != sig.GetId() {
+			t.Fatalf("expected the retry to take %s at once, got %v", sig.GetId(), took)
+		}
+		if got := mb.received(); len(got) != 1 || got[0] != sig.GetId() {
+			t.Fatalf("expected %s counted as received, got %v", sig.GetId(), got)
+		}
+	}
+}
+
+// TestMailboxTakeOnlyUnreceived verifies take returns a name's pending signals oldest first,
+// skips one already received in this attempt, and leaves nothing for the channel to offer
+// again until the next attempt begins.
+func TestMailboxTakeOnlyUnreceived(t *testing.T) {
+	mb := testMailbox(t)
+	older := signalOf(t, "advance", command{Note: "older"})
+	newer := signalOf(t, "advance", command{Note: "newer"})
+	mb.offer(older)
+	ch := channel(t, mb, testAdvance)
+	within(t, ch, time.Second, "the older signal")
+	mb.offer(newer)
+
+	o, _ := mb.outlet(testAdvance.name)
+	took := o.(*outlet[command]).take()
+	if len(took) != 1 || took[0].ID.String() != newer.GetId() {
+		t.Fatalf("expected only the newer signal, got %v", took)
+	}
+	if again := o.(*outlet[command]).take(); len(again) != 0 {
+		t.Fatalf("expected nothing left to take, got %v", again)
+	}
+	select {
+	case r := <-ch:
+		t.Fatalf("expected nothing on offer after take, got %s", r.ID)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestMailboxTakeConcurrently verifies takes asked at once together return every held signal
+// exactly once. The counterfactual is takeAll not counting what it returns as received, so each
+// take returns the same signals again.
+func TestMailboxTakeConcurrently(t *testing.T) {
+	mb := testMailbox(t)
+	want := map[string]bool{}
+	for range 20 {
+		sig := signalOf(t, "advance", command{})
+		want[sig.GetId()] = true
+		mb.offer(sig)
+	}
+	o, _ := mb.outlet(testAdvance.name)
+	answers := make(chan []Received[command], 8)
+	for range cap(answers) {
+		go func() { answers <- o.(*outlet[command]).take() }()
+	}
+	seen := map[string]int{}
+	for range cap(answers) {
+		for _, r := range within(t, answers, time.Second, "a take's answer") {
+			seen[r.ID.String()]++
+		}
+	}
+	for id := range want {
+		if seen[id] != 1 {
+			t.Fatalf("expected %s taken once, got %d", id, seen[id])
+		}
+	}
+}
+
+// TestMailboxTakeMarksTheHeldKey verifies take counts a signal received under the ID it is held
+// by, so one stored with a lowercase ID is not offered again in the attempt.
+func TestMailboxTakeMarksTheHeldKey(t *testing.T) {
+	mb := testMailbox(t)
+	sig := signalOf(t, "advance", command{})
+	sig.Id = strings.ToLower(sig.GetId())
+	mb.offer(sig)
+	o, _ := mb.outlet(testAdvance.name)
+	if took := o.(*outlet[command]).take(); len(took) != 1 {
+		t.Fatalf("expected the signal taken, got %v", took)
+	}
+	select {
+	case r := <-channel(t, mb, testAdvance):
+		t.Fatalf("expected nothing on offer after take, got %s", r.ID)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := mb.received(); len(got) != 1 || got[0] != sig.GetId() {
+		t.Fatalf("expected %s received, got %v", sig.GetId(), got)
+	}
 }

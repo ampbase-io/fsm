@@ -172,6 +172,7 @@ const (
 	opConsume
 	opReceived
 	opUnseen
+	opTake
 )
 
 // outletOp is one call handed to an outlet's goroutine.
@@ -180,6 +181,8 @@ type outletOp struct {
 	sig   *fsmv1.Signal
 	ids   []string
 	reply chan []string
+	// took receives an opTake's answer, which is typed, so it travels outside reply.
+	took any
 }
 
 func newOutlet[T any](codec Codec) *outlet[T] {
@@ -252,7 +255,30 @@ func (o *outlet[T]) apply(op outletOp) {
 		o.reply(op.reply, o.taken)
 	case opUnseen:
 		o.reply(op.reply, o.unseenOf(op.ids))
+	case opTake:
+		select {
+		case op.took.(chan []Received[T]) <- o.takeAll():
+		case <-o.done:
+		}
 	}
+}
+
+// takeAll counts every pending signal not received in this attempt as received, oldest first,
+// and returns them.
+func (o *outlet[T]) takeAll() []Received[T] {
+	var ids []string
+	for id := range o.pending {
+		if !slices.Contains(o.taken, id) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	took := make([]Received[T], 0, len(ids))
+	for _, id := range ids {
+		took = append(took, o.pending[id])
+	}
+	o.taken = append(o.taken, ids...)
+	return took
 }
 
 // add decodes and holds a signal the outlet has not seen. A signal that does not decode was
@@ -324,6 +350,22 @@ func (o *outlet[T]) ask(op outletOp) []string {
 }
 
 func (o *outlet[T]) offer(sig *fsmv1.Signal) { o.do(outletOp{kind: opOffer, sig: sig}) }
+
+// take answers from the goroutine's own state, so it sees every op applied before it, a
+// beginAttempt's among them, without waiting for the goroutine to offer again. Its reply channel
+// is its own, as unseen's is: any goroutine may take.
+func (o *outlet[T]) take() []Received[T] {
+	reply := make(chan []Received[T])
+	if !o.do(outletOp{kind: opTake, took: reply}) {
+		return nil
+	}
+	select {
+	case took := <-reply:
+		return took
+	case <-o.done:
+		return nil
+	}
+}
 
 func (o *outlet[T]) beginAttempt() { o.do(outletOp{kind: opBegin}) }
 
