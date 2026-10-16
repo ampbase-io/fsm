@@ -245,9 +245,9 @@ func TestMailboxTakeOnlyUnreceived(t *testing.T) {
 	}
 }
 
-// TestMailboxTakeConcurrently verifies takes asked at once each get their own answer: together
-// they return every held signal exactly once. The counterfactual is one reply channel shared by
-// the outlet, where an answer can reach the other caller.
+// TestMailboxTakeConcurrently verifies takes asked at once together return every held signal
+// exactly once. The counterfactual is takeAll not counting what it returns as received, so each
+// take returns the same signals again.
 func TestMailboxTakeConcurrently(t *testing.T) {
 	mb := testMailbox(t)
 	want := map[string]bool{}
