@@ -47,6 +47,9 @@ type S3 struct {
 	prePut     func(key string)
 
 	puts               int
+	gets               int
+	lists              int
+	deletes            int
 	consistentReads    int
 	nonConsistentReads int
 
@@ -120,6 +123,29 @@ func (f *S3) Puts() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.puts
+}
+
+// Gets is the number of single-object reads served, found or not. With Puts and Lists it is the
+// per-run request budget a cost test asserts: what the store pays per transition is a latency
+// contract, not an implementation detail.
+func (f *S3) Gets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets
+}
+
+// Deletes is the number of DELETE requests served, refused ones included.
+func (f *S3) Deletes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deletes
+}
+
+// Lists is the number of prefix listings served.
+func (f *S3) Lists() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lists
 }
 
 // ConsistentReads is the number of GET and list requests that asked for a consistent read.
@@ -215,6 +241,7 @@ func (f *S3) put(w http.ResponseWriter, r *http.Request, key string) {
 
 // del removes a key, or fails it when it is the armed failDelete. Callers hold f.mu.
 func (f *S3) del(w http.ResponseWriter, key string) {
+	f.deletes++
 	if f.failDelete != "" && key == f.failDelete {
 		w.WriteHeader(http.StatusForbidden) // a client error: the SDK's retryer does not stretch the test
 		return
@@ -228,9 +255,11 @@ func (f *S3) del(w http.ResponseWriter, key string) {
 func (f *S3) get(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	f.countRead(r)
 	if r.URL.Query().Get("list-type") == "2" {
+		f.lists++
 		f.list(w, bucket, r.URL.Query().Get("prefix"))
 		return
 	}
+	f.gets++
 	body, ok := f.objects[key]
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)

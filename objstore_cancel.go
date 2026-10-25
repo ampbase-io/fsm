@@ -36,7 +36,7 @@ func (s *objectStore) requestCancel(ctx context.Context, version ulid.ULID, caus
 		return err
 	}
 
-	switch err := s.putIfAbsent(ctx, s.cancelKey(version), []byte(cause.Error())); {
+	switch _, err := s.putIfAbsent(ctx, s.cancelKey(version), []byte(cause.Error())); {
 	case err == nil, errors.Is(err, errPreconditionFailed):
 		// Written, or already recorded by a prior cancel — either way the intent is durable.
 	default:

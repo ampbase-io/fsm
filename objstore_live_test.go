@@ -142,9 +142,11 @@ func startRace(ctx context.Context, stores []*objectStore, id string) ([]raceRes
 
 // TestLiveConcurrentStartsKeepTheResourceActive is the reported shape: two nodes race Start on
 // one resource and the loser, the moment it is refused, asks which runs are active. A refusal
-// means a lock exists that a Start cannot take, so the answer can never be the empty set — and
-// against a real store the refusal lands before the winner's manifest nearly every time, since
-// the lock it was refused by is written four objects earlier.
+// means a lock exists that a Start cannot take, so the answer can never be the empty set,
+// whether or not the winner's manifest has landed by then. How often the refusal falls inside
+// that window is a property of the store and of how many writes a START makes — it logs the
+// split rather than asserting one; TestLiveStartHoldsTheResourceBeforeItsManifest is what pins
+// the window itself.
 func TestLiveConcurrentStartsKeepTheResourceActive(t *testing.T) {
 	ctx := context.Background()
 	stores := liveStores(t, nil, "node-a", "node-b")
@@ -223,6 +225,41 @@ func TestLiveStartHoldsTheResourceBeforeItsManifest(t *testing.T) {
 	}
 	if state := active[key]; state != fsmv1.RunState_RUN_STATE_PENDING {
 		t.Fatalf("once the manifest landed the resource's active runs = %v, want %v pending", active, key)
+	}
+}
+
+// TestLiveRunCASesAgainstRealETags runs a whole run against the real store, which is the only
+// place the cached compare-and-swap target can be checked for what it is: an ETag the provider
+// minted on a PUT. The fake always returns one, so a provider that did not would show up here as
+// a cache that never warms — safe, since the CAS then reads first, but every checkpoint would pay
+// for it. Each write after the START also proves an If-Match against a real ETag is accepted.
+func TestLiveRunCASesAgainstRealETags(t *testing.T) {
+	ctx := context.Background()
+	s := liveStores(t, nil, "node-a")[0]
+
+	run := Run{ID: "etag-1", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+	startCostRun(t, s, run)
+	if _, etag, cached := s.cachedManifest(run.StartVersion); !cached {
+		t.Fatal("the START's manifest write returned no ETag, so no checkpoint can skip its read")
+	} else if !strings.HasPrefix(etag, `"`) {
+		t.Fatalf("the cached CAS target is not a quoted ETag: %q", etag)
+	}
+
+	mustSetRunning(t, s, run)
+	for _, state := range []string{"one", "two", "three"} {
+		mustComplete(t, s, run, state)
+	}
+	mustFinish(t, s, run)
+
+	history, err := s.History(ctx, run.StartVersion)
+	if err != nil {
+		t.Fatalf("failed to read the finished run's history: %v", err)
+	}
+	if got := history.GetLastEvent().GetType(); got != fsmv1.EventType_EVENT_TYPE_FINISH {
+		t.Fatalf("the history record ends in %v, want FINISH", got)
+	}
+	if got := history.GetActiveEvent().GetTransitions(); len(got) != 4 {
+		t.Fatalf("the history record carries %v, want the run's four states", got)
 	}
 }
 

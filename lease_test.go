@@ -140,7 +140,7 @@ func putLock(t *testing.T, s *objectStore, key string, version ulid.ULID) {
 	if err != nil {
 		t.Fatalf("failed to marshal version: %v", err)
 	}
-	if err := s.putIfAbsent(context.Background(), key, versionBytes); err != nil {
+	if _, err := s.putIfAbsent(context.Background(), key, versionBytes); err != nil {
 		t.Fatalf("failed to create lock: %v", err)
 	}
 }

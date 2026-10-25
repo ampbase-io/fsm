@@ -100,7 +100,7 @@ func TestActiveRunsFailsOnAnUnreadableLock(t *testing.T) {
 	a := h.store("node-a", 10*time.Second)
 
 	lockKey := a.lockKey(Run{TypeName: "orderReq", ID: "unreadable-1", Action: "deploy"})
-	if err := a.putIfAbsent(ctx, lockKey, []byte("not-a-run-version")); err != nil {
+	if _, err := a.putIfAbsent(ctx, lockKey, []byte("not-a-run-version")); err != nil {
 		t.Fatalf("failed to plant the lock: %v", err)
 	}
 

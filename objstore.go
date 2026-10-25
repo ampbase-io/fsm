@@ -368,16 +368,20 @@ func (s *objectStore) waitBackoff(ctx context.Context) backoff.BackOff {
 
 // putConditional issues a conditional PutObject — set applies the condition header — and retries
 // on 409 Conflict, which S3 returns when concurrent conditional writes race on a key. It returns
-// the raw PutObject error otherwise; callers map a 412 to their own sentinel.
-func (s *objectStore) putConditional(ctx context.Context, key string, body []byte, set func(*s3.PutObjectInput)) error {
+// the ETag the write landed at, so a writer that keeps writing the same object can CAS against it
+// without reading the object back, and the raw PutObject error otherwise; callers map a 412 to
+// their own sentinel.
+func (s *objectStore) putConditional(ctx context.Context, key string, body []byte, set func(*s3.PutObjectInput)) (string, error) {
+	var etag string
 	op := func() error {
 		in := &s3.PutObjectInput{Bucket: &s.cfg.Bucket, Key: &key, Body: bytes.NewReader(body)}
 		set(in)
 		start := time.Now()
-		_, err := s.client.PutObject(ctx, in)
+		out, err := s.client.PutObject(ctx, in)
 		s.instruments.observeStorage(ctx, "put", start, err)
 		switch {
 		case err == nil:
+			etag = aws.ToString(out.ETag)
 			return nil
 		case isConditionalConflict(err):
 			s.instruments.casRetry(ctx, "conflict")
@@ -387,46 +391,66 @@ func (s *objectStore) putConditional(ctx context.Context, key string, body []byt
 			return backoff.Permanent(err)
 		}
 	}
-	return backoff.Retry(op, retryBackoff(ctx, maxConditionalRetries))
+	err := backoff.Retry(op, retryBackoff(ctx, maxConditionalRetries))
+	return etag, err
 }
 
 // putIfAbsent writes an object only if it does not already exist (If-None-Match: *), returning
-// errPreconditionFailed if it does.
-func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) error {
-	switch err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
+// the ETag it was created at, or errPreconditionFailed if it already exists.
+func (s *objectStore) putIfAbsent(ctx context.Context, key string, body []byte) (string, error) {
+	switch etag, err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
 		in.IfNoneMatch = aws.String("*")
 	}); {
 	case err == nil:
-		return nil
+		return etag, nil
 	case isPreconditionFailed(err):
-		return errPreconditionFailed
+		return "", errPreconditionFailed
 	default:
-		return fmt.Errorf("put object %s: %w", key, err)
+		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
 }
 
 // putIfMatch writes an object only if its current ETag matches (If-Match), giving compare-and-
-// swap semantics. Returns errEtagMismatch if the object changed since etag was read.
-func (s *objectStore) putIfMatch(ctx context.Context, key string, body []byte, etag string) error {
-	switch err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
+// swap semantics, and returns the ETag the write landed at. Returns errEtagMismatch if the object
+// changed since etag was read.
+func (s *objectStore) putIfMatch(ctx context.Context, key string, body []byte, etag string) (string, error) {
+	switch written, err := s.putConditional(ctx, key, body, func(in *s3.PutObjectInput) {
 		in.IfMatch = aws.String(etag)
 	}); {
 	case err == nil:
-		return nil
+		return written, nil
 	case isPreconditionFailed(err):
-		return errEtagMismatch
+		return "", errEtagMismatch
 	default:
-		return fmt.Errorf("put object %s: %w", key, err)
+		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
 }
 
 // putIdempotent writes a write-once object, treating an already-existing object (412) as
 // success. Used for records a crash-retry may re-issue with identical content.
 func (s *objectStore) putIdempotent(ctx context.Context, key string, body []byte) error {
-	if err := s.putIfAbsent(ctx, key, body); err != nil && !errors.Is(err, errPreconditionFailed) {
+	if _, err := s.putIfAbsent(ctx, key, body); err != nil && !errors.Is(err, errPreconditionFailed) {
 		return err
 	}
 	return nil
+}
+
+// writeAll issues independent object writes at once and joins their errors. Object storage has
+// no batch write and a conditional PUT against a multi-region bucket costs north of 100 ms, so
+// writes that do not depend on one another — a START's objects before its manifest, a finish's
+// cleanups after it — are one round trip rather than several.
+func writeAll(writes ...func() error) error {
+	errs := make([]error, len(writes))
+	var wg sync.WaitGroup
+	for i, write := range writes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = write()
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // deleteObject removes an object. Deleting a missing key is not an error.

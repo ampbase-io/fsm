@@ -118,9 +118,10 @@ func (s *objectStore) casQueue(ctx context.Context, name string, mutate func(*fs
 // etag mismatch, so casQueue re-reads and CASes against the winner's roster.
 func (s *objectStore) putRoster(ctx context.Context, key string, body []byte, etag string) error {
 	if etag != "" {
-		return s.putIfMatch(ctx, key, body, etag)
+		_, err := s.putIfMatch(ctx, key, body, etag)
+		return err
 	}
-	err := s.putIfAbsent(ctx, key, body)
+	_, err := s.putIfAbsent(ctx, key, body)
 	if errors.Is(err, errPreconditionFailed) {
 		return errEtagMismatch
 	}

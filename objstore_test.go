@@ -54,7 +54,7 @@ func TestObjectStoreUsesInjectedClient(t *testing.T) {
 	ctx := context.Background()
 	store, s3 := newTestObjectStore(t)
 
-	if err := store.putIfAbsent(ctx, "fsm/injected/key", []byte("a")); err != nil {
+	if _, err := store.putIfAbsent(ctx, "fsm/injected/key", []byte("a")); err != nil {
 		t.Fatalf("write through the injected client failed: %v", err)
 	}
 	if s3.Puts() == 0 {
@@ -82,7 +82,7 @@ func TestObjectStoreBuildsClientFromEndpoint(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	if err := store.putIfAbsent(ctx, "fsm/endpoint/key", []byte("a")); err != nil {
+	if _, err := store.putIfAbsent(ctx, "fsm/endpoint/key", []byte("a")); err != nil {
 		t.Fatalf("write through the built client failed: %v", err)
 	}
 	if s3.Puts() == 0 {
@@ -94,10 +94,10 @@ func TestPutIfAbsent(t *testing.T) {
 	store, _ := newTestObjectStore(t)
 	ctx := context.Background()
 
-	if err := store.putIfAbsent(ctx, "fsm/test/key", []byte("a")); err != nil {
+	if _, err := store.putIfAbsent(ctx, "fsm/test/key", []byte("a")); err != nil {
 		t.Fatalf("first write failed: %v", err)
 	}
-	if err := store.putIfAbsent(ctx, "fsm/test/key", []byte("b")); !errors.Is(err, errPreconditionFailed) {
+	if _, err := store.putIfAbsent(ctx, "fsm/test/key", []byte("b")); !errors.Is(err, errPreconditionFailed) {
 		t.Fatalf("expected errPreconditionFailed for duplicate write, got %v", err)
 	}
 }
@@ -107,7 +107,7 @@ func TestPutIfAbsentRetriesConflict(t *testing.T) {
 	ctx := context.Background()
 
 	s3.Conflicts = 2
-	if err := store.putIfAbsent(ctx, "fsm/test/conflict", []byte("a")); err != nil {
+	if _, err := store.putIfAbsent(ctx, "fsm/test/conflict", []byte("a")); err != nil {
 		t.Fatalf("expected write to succeed after 409 retries, got %v", err)
 	}
 	if got := s3.Puts(); got != 3 {
@@ -120,7 +120,7 @@ func TestPutIfMatchCAS(t *testing.T) {
 	ctx := context.Background()
 
 	const key = "fsm/cas/key"
-	if err := store.putIfAbsent(ctx, key, []byte("v1")); err != nil {
+	if _, err := store.putIfAbsent(ctx, key, []byte("v1")); err != nil {
 		t.Fatalf("initial write failed: %v", err)
 	}
 	_, etag, err := store.getObject(ctx, key)
@@ -128,10 +128,10 @@ func TestPutIfMatchCAS(t *testing.T) {
 		t.Fatalf("failed to read object: %v", err)
 	}
 
-	if err := store.putIfMatch(ctx, key, []byte("v2"), etag); err != nil {
+	if _, err := store.putIfMatch(ctx, key, []byte("v2"), etag); err != nil {
 		t.Fatalf("CAS with current etag failed: %v", err)
 	}
-	if err := store.putIfMatch(ctx, key, []byte("v3"), etag); !errors.Is(err, errEtagMismatch) {
+	if _, err := store.putIfMatch(ctx, key, []byte("v3"), etag); !errors.Is(err, errEtagMismatch) {
 		t.Fatalf("expected errEtagMismatch for stale etag, got %v", err)
 	}
 
