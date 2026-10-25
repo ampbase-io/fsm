@@ -152,40 +152,41 @@ If the write returns 412 (object already exists), the event was already written 
    Body: run_version
    → 412 means another run is active → return AlreadyRunningError
 
-2. Write START event:
+2. The provisional objects, issued together:
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
+   PUT fsm/index/<type>/<id>/<action>/<run_ver>      [If-None-Match: *]
+   PUT fsm/children/<parent_ver>/<run_ver>           [If-None-Match: *]  (if parented)
 
-3. Write the index marker:
-   PUT fsm/index/<type>/<id>/<action>/<run_ver>     [If-None-Match: *]
-
-4. Link the parent, if any:
-   PUT fsm/children/<parent_ver>/<run_ver>           [If-None-Match: *]
-
-5. Write run manifest:
+3. Write run manifest:
    PUT fsm/runs/<run_ver>        [If-None-Match: *]
    Body: RunManifest { status: "pending", owner_node: self, ... }
 ```
 
 Every operation uses `If-None-Match: *`, making them individually idempotent, and the manifest is last: the run exists once it does, and nothing before it is load-bearing on its own. If a step fails after the lock is taken, a recovery scan (on startup or periodic) detects orphaned locks by checking whether a corresponding manifest exists; an index marker or parent link without a manifest is inert, since readers skip a child whose manifest is missing. The link precedes the manifest for that reason — written after it, a failure would leave a live run its parent can never find.
 
+Step 2's writes depend on nothing but the lock, so they are issued at once and a START costs three round trips rather than five. A crash inside the group leaves an arbitrary subset of them rather than a prefix, which is no weaker: each of the three with no manifest is already something every reader tolerates.
+
 The lock being first also means the lock outlives nothing but precedes everything: from the moment it lands, a competing Start is refused — and is refused *because* the holder's manifest is not readable yet, since that is how a live run is told from an orphan. A lock scan therefore has two legitimate answers for a lock it cannot resolve to a manifest, and which one it gives depends on what the caller came for. The resume and claim paths came for the run's recorded state and skip it, taking the run on a later pass. A query that answers "is this resource busy?" cannot skip it: a lock absent from the answer reads as an idle resource while a Start on it would be refused, so `ActiveRuns` reports the lock with its holder's version and no state (`RUN_STATE_UNSPECIFIED`). A lock old enough that no START can still be writing its manifest is reaped by the scan instead, in either mode.
+
+`WaitRun` reads the same window from the other side, and with less to go on: given a run version alone, a manifest that is not there and a history record that is not there mean either a START still landing or a run that never existed. It keeps polling while the version is young enough to be the first and answers `ErrFsmNotFound` past it, so a waiter holding a version from a listing, a `run_after` dependency or a `Wait` by id is not told a run it can see does not exist.
 
 For queued runs, the lock key includes the run version (`locks/<type>/<id>/<action>/<run_version>`) to allow multiple runs for the same resource — unless the run was started exclusive (`WithExclusiveQueue`), which takes the resource's own key like an unqueued run and so refuses a second start of its id while it is live, from Start until FINISH rather than only once admitted. The manifest records it, so the finish deletes the key the start took.
 
 #### COMPLETE / ERROR / CANCEL (mid-run events)
 
 ```
-1. Write event:
+Both at once:
    PUT fsm/events/<id>/<action>/<run_ver>/<evt_ver>  [If-None-Match: *]
 
-2. Update manifest (CAS):
-   GET fsm/runs/<run_ver>        [X-Tigris-Consistent: true]
-   → read current ETag
    Modify: bump latest_event_key, event_count, append to completed_states
            (and, for a repeated transition, count the iteration in iterations)
-   PUT fsm/runs/<run_ver>        [If-Match: <etag>]
-   → 412 means concurrent modification → re-read and retry
+   PUT fsm/runs/<run_ver>        [If-Match: <etag of this node's last write>]
+   → 412 means someone else wrote it → GET fsm/runs/<run_ver>, re-apply, retry
 ```
+
+A checkpoint is one round trip. The event object is not read back anywhere on this backend — only the FINISH event is, by the history record that names it — so it is an audit object: it is issued beside the manifest write rather than before it, and a failure to write one is logged rather than failing a transition the manifest recorded. A fenced writer could always leave an event its manifest never names, so no reader's view changes.
+
+The manifest write needs no read because the owning node already holds the manifest it last wrote, with the ETag that write returned, and compare-and-swaps against it. Nothing is taken on trust: any write by anyone else — a claim, a takeover, a settle, a cancel — moves the ETag, so the precondition fails, and the retry reads the current manifest and re-applies the change to it. That is also what makes a stolen lease still trip the fence. The cached target lives with the node's lease, so only the holder has one and losing the lease drops it; a node that has not written since claiming a run (a resume) reads once, as before.
 
 The retry loop on the manifest CAS is bounded (e.g., 10 attempts). In practice, contention on a single run's manifest is near-zero because a single goroutine drives the run sequentially.
 
@@ -199,14 +200,15 @@ The retry loop on the manifest CAS is bounded (e.g., 10 attempts). In practice, 
    PUT fsm/runs/<run_ver>        [If-Match: <etag>]
    Body: RunManifest { status: "complete", end_event_key: ... }
 
-3. Delete resource lock:
+3. The cleanups the terminal manifest makes safe, the markers beside the record:
    DELETE fsm/locks/<type>/<id>/<action>
-
-4. Write history:
-   PUT fsm/history/<date>/<run_ver>            [If-None-Match: *]
+   DELETE fsm/cancel/<run_ver>                 (canceled runs only)
+   PUT    fsm/history/<date>/<run_ver>         [If-None-Match: *]
 ```
 
-If the process crashes between steps 2 and 3, the lock is orphaned but the manifest records completion. The archive/recovery process detects this: "manifest says complete, lock still exists → delete the lock."
+The FINISH event keeps its place ahead of the flip: the history record names it, so a terminal manifest must never point at an event that is not there. Step 3's writes land before the run's completion is published, so a waiter released by it still observes a finished run.
+
+If the process crashes between steps 2 and 3, the lock is orphaned but the manifest records completion. The archive/recovery process detects this: "manifest says complete, lock still exists → delete the lock." A crash that leaves the lock deleted and the history record unwritten is repaired by the archive pass, which rebuilds the record from the manifest and the FINISH event before reclaiming either.
 
 ### Cluster Coordination
 
