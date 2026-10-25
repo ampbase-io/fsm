@@ -10,6 +10,7 @@ import (
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
 	"github.com/oklog/ulid/v2"
+	"google.golang.org/protobuf/proto"
 )
 
 // leaseReleaseTimeout bounds the best-effort lease releases done outside a caller's context
@@ -42,6 +43,59 @@ type lease struct {
 	// need not keep their IDs: the next COMPLETE drops them from consumed_signals. They go with
 	// the lease, since only the lease holder writes the manifest.
 	deletedSignals []string
+
+	// manifest is the run's manifest as this node last wrote it, under the etag that write
+	// landed at — the compare-and-swap target of its next one, so a checkpoint costs a
+	// conditional PUT and no read. Both go with the lease for the same reason as above: only the
+	// holder writes the manifest, so only the holder can know the current bytes, and losing the
+	// lease drops the entry rather than leaving a tag to reuse.
+	manifest *fsmv1.RunManifest
+	etag     string
+}
+
+// cloneManifest is a manifest a caller may mutate without touching the original.
+func cloneManifest(m *fsmv1.RunManifest) *fsmv1.RunManifest {
+	return proto.Clone(m).(*fsmv1.RunManifest)
+}
+
+// cacheManifest records the manifest this node has just written as the CAS target of its next
+// write. A run this node does not hold caches nothing: the entry lives with the lease.
+func (s *objectStore) cacheManifest(version ulid.ULID, manifest *fsmv1.RunManifest, etag string) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	l, ok := s.leases[version]
+	if !ok || l.state != leaseHeld {
+		return
+	}
+	l.manifest, l.etag = cloneManifest(manifest), etag
+	s.leases[version] = l
+}
+
+// cachedManifest returns a copy of the manifest this node last wrote for the run and the ETag to
+// CAS it against. The copy is the caller's to mutate: a CAS that loses its precondition must not
+// leave the cached state carrying its attempt.
+func (s *objectStore) cachedManifest(version ulid.ULID) (*fsmv1.RunManifest, string, bool) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	l, ok := s.leases[version]
+	if !ok || l.state != leaseHeld || l.etag == "" {
+		return nil, "", false
+	}
+	return cloneManifest(l.manifest), l.etag, true
+}
+
+// forgetManifest drops the cached CAS target, so the next write reads the manifest. Called when a
+// CAS fails its precondition: someone else wrote the run, and what this node last wrote is no
+// longer what the object holds.
+func (s *objectStore) forgetManifest(version ulid.ULID) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	l, ok := s.leases[version]
+	if !ok {
+		return
+	}
+	l.manifest, l.etag = nil, ""
+	s.leases[version] = l
 }
 
 // checkFence returns ErrLeaseLost unless the manifest still records this node as owner at the
@@ -315,7 +369,7 @@ func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey) ([]claimedRu
 
 // claimLocks claims every run under one resource type's lock prefix whose action this node runs.
 func (s *objectStore) claimLocks(ctx context.Context, typeName string, registered map[fsmKey]struct{}) ([]claimedRun, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
+	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName), scanResumable)
 	if err != nil {
 		return nil, err
 	}

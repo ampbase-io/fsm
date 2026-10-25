@@ -16,7 +16,7 @@ import (
 // pendingCancellations can be exercised against arbitrary (owned, unowned, malformed) keys.
 func plantSentinel(t *testing.T, s *objectStore, version ulid.ULID, cause string) {
 	t.Helper()
-	if err := s.putIfAbsent(context.Background(), s.cancelKey(version), []byte(cause)); err != nil {
+	if _, err := s.putIfAbsent(context.Background(), s.cancelKey(version), []byte(cause)); err != nil {
 		t.Fatalf("failed to plant cancel sentinel: %v", err)
 	}
 }
@@ -137,7 +137,7 @@ func TestPendingCancellationsSkipsMalformedKey(t *testing.T) {
 	run := startRun(t, s, "pc-mal")
 	plantSentinel(t, s, run.StartVersion, "good")
 	// A stray non-ULID key under the cancel prefix must be skipped, not fail the whole sweep.
-	if err := s.putIfAbsent(ctx, s.cancelPrefix()+"not-a-ulid", []byte("garbage")); err != nil {
+	if _, err := s.putIfAbsent(ctx, s.cancelPrefix()+"not-a-ulid", []byte("garbage")); err != nil {
 		t.Fatalf("failed to plant malformed key: %v", err)
 	}
 

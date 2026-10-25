@@ -140,7 +140,7 @@ func putLock(t *testing.T, s *objectStore, key string, version ulid.ULID) {
 	if err != nil {
 		t.Fatalf("failed to marshal version: %v", err)
 	}
-	if err := s.putIfAbsent(context.Background(), key, versionBytes); err != nil {
+	if _, err := s.putIfAbsent(context.Background(), key, versionBytes); err != nil {
 		t.Fatalf("failed to create lock: %v", err)
 	}
 }
@@ -647,7 +647,7 @@ func TestScanLocksBeyondFanout(t *testing.T) {
 	go func() {
 		defer close(done)
 		var err error
-		entries, err = a.scanLocks(ctx, a.lockPrefix("orderReq"))
+		entries, err = a.scanLocks(ctx, a.lockPrefix("orderReq"), scanResumable)
 		if err != nil {
 			t.Errorf("scanLocks failed: %v", err)
 		}
@@ -663,7 +663,9 @@ func TestScanLocksBeyondFanout(t *testing.T) {
 }
 
 // TestStaleOrphanLockReaped covers lock-without-manifest recovery: a lock old enough that no
-// START can still be writing its manifest is reaped; a fresh one is left alone.
+// START can still be writing its manifest is reaped; a fresh one is left alone — skipped by a
+// resume scan, and reported by a query, which must not call the resource idle while the lock
+// still holds it.
 func TestStaleOrphanLockReaped(t *testing.T) {
 	h := newLeaseHarness(t)
 	ctx := context.Background()
@@ -677,12 +679,20 @@ func TestStaleOrphanLockReaped(t *testing.T) {
 	freshKey := a.lockKey(Run{TypeName: "orderReq", ID: "fresh-1", Action: "deploy", StartVersion: freshVersion})
 	putLock(t, a, freshKey, freshVersion)
 
-	entries, err := a.scanLocks(ctx, a.lockPrefix("orderReq"))
+	entries, err := a.scanLocks(ctx, a.lockPrefix("orderReq"), scanResumable)
 	if err != nil {
 		t.Fatalf("scanLocks failed: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("expected no resolvable entries, got %v", entries)
+		t.Fatalf("expected no resumable entries, got %v", entries)
+	}
+
+	held, err := a.scanLocks(ctx, a.lockPrefix("orderReq"), scanHeld)
+	if err != nil {
+		t.Fatalf("scanLocks failed: %v", err)
+	}
+	if len(held) != 1 || held[0].version != freshVersion {
+		t.Fatalf("expected the fresh lock reported as held by %s, got %v", freshVersion, held)
 	}
 
 	if _, _, err := a.getObject(ctx, staleKey); !errors.Is(err, ErrFsmNotFound) {

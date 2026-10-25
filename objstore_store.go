@@ -89,13 +89,23 @@ func (s *objectStore) getManifest(ctx context.Context, runVersion ulid.ULID) (*f
 // retrying on concurrent modification, so mutate always observes fresh state. A mutate error
 // (a tripped fence, a lost claim race) aborts the CAS and is returned as-is. It returns the
 // manifest as written.
+//
+// The first attempt CASes against the manifest this node last wrote (cachedManifest), so a run's
+// steady state is one conditional PUT per checkpoint rather than a read and a write. Nothing is
+// taken on trust: a write by anyone else moves the ETag, so the CAS fails its precondition and
+// the retry reads the fresh manifest and re-runs mutate against it — which is how a lease taken
+// over still trips checkFence. A node that has not written since it claimed the run (a resume)
+// has no cached tag and reads once, as before.
 func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mutate func(*fsmv1.RunManifest) error) (*fsmv1.RunManifest, error) {
 	key := s.manifestKey(runVersion)
 	var updated *fsmv1.RunManifest
 	op := func() error {
-		manifest, etag, err := s.getManifest(ctx, runVersion)
-		if err != nil {
-			return backoff.Permanent(err)
+		manifest, etag, cached := s.cachedManifest(runVersion)
+		if !cached {
+			var err error
+			if manifest, etag, err = s.getManifest(ctx, runVersion); err != nil {
+				return backoff.Permanent(err)
+			}
 		}
 
 		if err := mutate(manifest); err != nil {
@@ -108,11 +118,13 @@ func (s *objectStore) casManifest(ctx context.Context, runVersion ulid.ULID, mut
 			return backoff.Permanent(fmt.Errorf("marshal manifest %s: %w", runVersion, err))
 		}
 
-		switch err := s.putIfMatch(ctx, key, body, etag); {
+		switch written, err := s.putIfMatch(ctx, key, body, etag); {
 		case err == nil:
+			s.cacheManifest(runVersion, manifest, written)
 			updated = manifest
 			return nil
 		case errors.Is(err, errEtagMismatch):
+			s.forgetManifest(runVersion)
 			s.instruments.casRetry(ctx, "manifest")
 			s.logger.DebugContext(ctx, "manifest changed concurrently, retrying", "key", key)
 			return err
@@ -258,7 +270,7 @@ func (s *objectStore) lockOwner(ctx context.Context, lockKey string) (ulid.ULID,
 // restarts a resource right after waiting on its completion doesn't see a spurious
 // AlreadyRunning.
 func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVersionBytes []byte) error {
-	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	switch _, err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
 	case err == nil:
 		return nil
 	case !errors.Is(err, errPreconditionFailed):
@@ -277,7 +289,7 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 	if err := s.reapTerminalLock(ctx, lockKey); err != nil {
 		return fmt.Errorf("failed to delete orphaned lock %s: %w", lockKey, err)
 	}
-	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
+	switch _, err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
 	case err == nil:
 		return nil
 	case !errors.Is(err, errPreconditionFailed):
@@ -304,32 +316,25 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 		return err
 	}
 
-	// 2. Write the START event.
-	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
-		return err
-	}
-
-	// 3. Record the run in the per-resource index. Unlike the lock (deleted at FINISH) and
-	// events (deleted at archival), index markers persist, so past runs stay enumerable.
+	// 2. The three objects the manifest depends on none of, at once: the START event; the
+	// per-resource index marker, which unlike the lock (deleted at FINISH) and the events
+	// (deleted at archival) persists, so past runs stay enumerable; and the parent-child link,
+	// which has to precede the manifest, since a failure after it would leave a live run its
+	// parent can never find. Each is provisional on its own — a crash among them leaves a lock
+	// the reaper deletes, an index marker no run claims, a link ActiveChildren skips, and an
+	// event nothing reads — so losing any subset is no worse than losing the tail of them.
 	indexKey := s.runIndexKey(event.GetResourceType(), event.GetId(), event.GetAction(), run.StartVersion)
-	if err := s.putIdempotent(ctx, indexKey, nil); err != nil {
+	if err := writeAll(
+		func() error { return s.putIdempotent(ctx, eventKey, eventBytes) },
+		func() error { return s.putIdempotent(ctx, indexKey, nil) },
+		func() error { return s.linkParent(ctx, run.Parent, run.StartVersion) },
+	); err != nil {
 		return err
 	}
 
-	// 4. Record the parent-child relationship. Before the manifest, so the link can only be
-	// missing from a run that does not exist: everything up to here is provisional (a crash
-	// leaves a lock the reaper deletes, and ActiveChildren skips a child with no manifest),
-	// while a failure after the manifest would leave a live run its parent can never find.
-	if err := s.linkParent(ctx, run.Parent, run.StartVersion); err != nil {
-		return err
-	}
-
-	// 5. Create the manifest, leased to this node: the run exists from here.
-	manifestBytes, err := s.startManifest(ctx, run, event, start, eventKey, runVersionBytes)
-	if err != nil {
-		return err
-	}
-	return s.createRunManifest(ctx, run, lockKey, manifestBytes, start.Unowned)
+	// 3. Create the manifest, leased to this node: the run exists from here.
+	manifest := s.startManifest(ctx, run, event, start, eventKey, runVersionBytes)
+	return s.createRunManifest(ctx, run, lockKey, manifest, start.Unowned)
 }
 
 // startManifest materializes a new run's initial manifest. By default it is leased to this node
@@ -337,7 +342,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 // tick. An unowned START (the RPC ingress' persist-then-ack) leaves the lease empty so the claim
 // loop distributes the run across the worker pool; its epoch is bumped from zero on the first
 // claim.
-func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord, eventKey string, runVersionBytes []byte) ([]byte, error) {
+func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.StateEvent, start *startRecord, eventKey string, runVersionBytes []byte) *fsmv1.RunManifest {
 	ownerNode := s.node
 	leaseExpiry := time.Now().Add(s.cfg.leaseTimeout()).UnixMilli()
 	leaseEpoch := int64(1)
@@ -372,19 +377,27 @@ func (s *objectStore) startManifest(ctx context.Context, run Run, event *fsmv1.S
 	}
 	(propagation.TraceContext{}).Inject(ctx, propagation.MapCarrier(manifest.TraceContext))
 
-	return proto.Marshal(manifest)
+	return manifest
 }
 
-// createRunManifest writes the run's initial manifest and tracks its lease. An unowned START
-// carries no lease, so nothing is tracked — the claim loop leases it on pickup. A manifest that
-// already exists belongs to a crashed earlier attempt of this same run and is adopted instead.
-func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifestBytes []byte, unowned bool) error {
-	switch err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), manifestBytes); {
+// createRunManifest writes the run's initial manifest and tracks its lease, leaving the manifest
+// it wrote as the CAS target of the run's first write — this node has the bytes, so that write
+// needs no read. An unowned START carries no lease, so nothing is tracked or cached — the claim
+// loop leases it on pickup. A manifest that already exists belongs to a crashed earlier attempt
+// of this same run and is adopted instead.
+func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey string, manifest *fsmv1.RunManifest, unowned bool) error {
+	body, err := proto.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("marshal manifest %s: %w", run.StartVersion, err)
+	}
+
+	switch etag, err := s.putIfAbsent(ctx, s.manifestKey(run.StartVersion), body); {
 	case err == nil:
 		if !unowned {
 			// A leased START is never admission-controlled — queued runs are persisted unowned so
 			// the claim loop admits them (see Manager.start) — so it holds no queue-roster slot.
 			s.trackLease(run.StartVersion, 1, "")
+			s.cacheManifest(run.StartVersion, manifest, etag)
 		}
 		return nil
 	case errors.Is(err, errPreconditionFailed):
@@ -435,37 +448,36 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 		return ErrLeaseLost
 	}
 
-	if err := s.putIdempotent(ctx, eventKey, eventBytes); err != nil {
-		return err
-	}
-
 	// A COMPLETE also prunes the consumed IDs whose markers this node has since deleted.
 	pruned := s.deletedSignals(run.StartVersion)
-	_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
-		if err := s.checkFence(m, epoch); err != nil {
-			return err
-		}
-		m.LatestEventKey = []byte(eventKey)
-		m.EventCount++
-		if m.Status == fsmv1.RunState_RUN_STATE_PENDING {
-			m.Status = fsmv1.RunState_RUN_STATE_RUNNING
-		}
-
-		switch event.GetType() {
-		case fsmv1.EventType_EVENT_TYPE_COMPLETE:
-			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
-			if event.GetResponse() != nil {
-				m.LatestResponse = event.GetResponse()
+	err := s.besideEvent(ctx, eventKey, eventBytes, func() error {
+		_, err := s.casManifest(ctx, run.StartVersion, func(m *fsmv1.RunManifest) error {
+			if err := s.checkFence(m, epoch); err != nil {
+				return err
 			}
-			m.Iterations = recordIteration(m.Iterations, event)
-			m.ConsumedSignals = append(withoutIDs(m.ConsumedSignals, pruned), event.GetConsumedSignals()...)
-		case fsmv1.EventType_EVENT_TYPE_CANCEL:
-			m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
-			recordOutcome(m, event)
-		case fsmv1.EventType_EVENT_TYPE_ERROR:
-			m.RetryCount = event.GetRetryCount()
-		}
-		return nil
+			m.LatestEventKey = []byte(eventKey)
+			m.EventCount++
+			if m.Status == fsmv1.RunState_RUN_STATE_PENDING {
+				m.Status = fsmv1.RunState_RUN_STATE_RUNNING
+			}
+
+			switch event.GetType() {
+			case fsmv1.EventType_EVENT_TYPE_COMPLETE:
+				m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
+				if event.GetResponse() != nil {
+					m.LatestResponse = event.GetResponse()
+				}
+				m.Iterations = recordIteration(m.Iterations, event)
+				m.ConsumedSignals = append(withoutIDs(m.ConsumedSignals, pruned), event.GetConsumedSignals()...)
+			case fsmv1.EventType_EVENT_TYPE_CANCEL:
+				m.CompletedStates = appendUniqueState(m.CompletedStates, event.GetState())
+				recordOutcome(m, event)
+			case fsmv1.EventType_EVENT_TYPE_ERROR:
+				m.RetryCount = event.GetRetryCount()
+			}
+			return nil
+		})
+		return err
 	})
 	if errors.Is(err, ErrLeaseLost) {
 		s.dropLease(run.StartVersion)
@@ -478,6 +490,50 @@ func (s *objectStore) appendMidRun(ctx context.Context, run Run, event *fsmv1.St
 	}
 	s.deleteConsumedSignals(ctx, run.StartVersion, event.GetConsumedSignals())
 	return nil
+}
+
+// besideEvent writes the run's event object with write — the manifest write it records — in
+// flight beside it, and returns write's error. Only the FINISH event is ever read back on this
+// backend (the history record names it), so a mid-run event is an audit object: it rides beside
+// the manifest instead of ahead of it, and a failure to write one is logged rather than failing
+// a transition the manifest recorded. A fenced writer could already leave behind an event its
+// manifest never names, so no reader sees anything new.
+func (s *objectStore) besideEvent(ctx context.Context, eventKey string, eventBytes []byte, write func() error) error {
+	var (
+		eventErr error
+		wg       sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		eventErr = s.putIdempotent(ctx, eventKey, eventBytes)
+	}()
+
+	err := write()
+	wg.Wait()
+	if eventErr != nil {
+		s.logger.ErrorContext(ctx, "failed to record a run's event", "error", eventErr, "key", eventKey)
+	}
+	return err
+}
+
+// dropFinishedMarkers deletes what a finished run no longer needs: its resource lock, and a
+// canceled run's now-inert sentinel, which would otherwise leave the cancel/ prefix every
+// heartbeat sweep lists carrying a week of finished cancels. Only a cancel outcome has a
+// sentinel, so every other finish pays one delete. Failures are logged: a lock outliving its
+// terminal manifest is reaped by the next lock scan, and a sentinel by the archive pass.
+func (s *objectStore) dropFinishedMarkers(ctx context.Context, run Run, manifest *fsmv1.RunManifest) {
+	lockKey := s.lockKey(lockedRun(run.StartVersion, manifest))
+	if err := s.deleteObject(ctx, lockKey); err != nil {
+		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
+	}
+
+	if _, canceled := errors.AsType[*CancelError](run.fsmErr.Err); !canceled {
+		return
+	}
+	if err := s.deleteObject(ctx, s.cancelKey(run.StartVersion)); err != nil {
+		s.logger.ErrorContext(ctx, "failed to delete cancel sentinel", "error", err, versionAttr(run.StartVersion))
+	}
 }
 
 // withoutIDs is ids with every one in drop removed.
@@ -539,24 +595,13 @@ func (s *objectStore) appendFinish(ctx context.Context, run Run, event *fsmv1.St
 
 	s.dropLease(run.StartVersion)
 
-	// The lock is deleted after the manifest records completion; a crash in between leaves an
-	// orphaned lock that Active detects (manifest complete) and removes opportunistically.
-	lockKey := s.lockKey(lockedRun(run.StartVersion, manifest))
-	if err := s.deleteObject(ctx, lockKey); err != nil {
-		s.logger.ErrorContext(ctx, "failed to delete resource lock", "error", err, "key", lockKey)
-	}
-
-	// A canceled run's sentinel is inert once the manifest is terminal; deleting it here keeps
-	// the cancel/ prefix every heartbeat sweep lists from carrying a week of finished cancels.
-	// Only a cancel outcome has one — every other finish pays no request — and the archive reap
-	// is the backstop for a sentinel whose cancel lost the race with FINISH.
-	if _, canceled := errors.AsType[*CancelError](run.fsmErr.Err); canceled {
-		if err := s.deleteObject(ctx, s.cancelKey(run.StartVersion)); err != nil {
-			s.logger.ErrorContext(ctx, "failed to delete cancel sentinel", "error", err, versionAttr(run.StartVersion))
-		}
-	}
-
-	if err := s.writeHistory(ctx, run.StartVersion, historyFromManifest(manifest, event)); err != nil {
+	// What the terminal manifest makes safe, at once: the markers the run no longer needs, and
+	// the history record that outlives it. Neither waits on the other, and both land before the
+	// done publish below, so a waiter released by it still observes a complete finish.
+	if err := writeAll(
+		func() error { s.dropFinishedMarkers(ctx, run, manifest); return nil },
+		func() error { return s.writeHistory(ctx, run.StartVersion, historyFromManifest(manifest, event)) },
+	); err != nil {
 		return err
 	}
 
@@ -672,7 +717,9 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 	}
 }
 
-// lockEntry pairs an active resource lock with the manifest of the run holding it.
+// lockEntry pairs an active resource lock with the manifest of the run holding it. A scanHeld
+// entry may carry no manifest: the run holds the resource, and nothing about its state is
+// readable yet.
 type lockEntry struct {
 	action string
 
@@ -681,6 +728,20 @@ type lockEntry struct {
 	manifest *fsmv1.RunManifest
 }
 
+// lockScan is what a scan makes of a held lock it cannot resolve to a run — a START that has
+// written its lock but not yet its manifest, or a lock that will not read.
+type lockScan int
+
+const (
+	// scanResumable skips it: the run's state is what the resume and claim paths came for, and
+	// a later pass retries once the manifest is there.
+	scanResumable lockScan = iota
+
+	// scanHeld reports it, manifest or not. A lock left out of a query reads as an idle
+	// resource, while a Start on that resource is refused for as long as the lock exists.
+	scanHeld
+)
+
 // scanFanout bounds the concurrent object storage operations of a lock scan or a lease pass;
 // a serial pass over many runs could outrun the interval that scheduled it.
 const scanFanout = 8
@@ -688,9 +749,9 @@ const scanFanout = 8
 // scanLocks lists resource locks under prefix and resolves each to its owning run's manifest
 // (keys-only listing plus one lock GET and one manifest GET per active run, scanFanout at a
 // time — event bodies are never read, per the RFC's resumability contract). Crash windows are
-// handled inline: a lock without a manifest is skipped, and a lock whose manifest is terminal
-// is deleted.
-func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry, error) {
+// handled inline: a lock whose manifest is terminal is deleted, and what a lock with no manifest
+// means to the caller is the scan mode's to say.
+func (s *objectStore) scanLocks(ctx context.Context, prefix string, scan lockScan) ([]lockEntry, error) {
 	lockKeys, err := s.listKeys(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -708,7 +769,7 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			resolved[i], errs[i] = s.resolveLock(ctx, lockKey)
+			resolved[i], errs[i] = s.resolveLock(ctx, lockKey, scan)
 		}()
 	}
 	wg.Wait()
@@ -726,9 +787,10 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 	return entries, nil
 }
 
-// resolveLock resolves a single lock key to its owning run's manifest. Skips — malformed keys,
-// crash windows, terminal-manifest cleanup — return (nil, nil).
-func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEntry, error) {
+// resolveLock resolves a single lock key to its owning run's manifest. Skips — a malformed key,
+// a lock already released, terminal-manifest cleanup — return (nil, nil); a held lock whose run
+// is not readable is the scan mode's to interpret.
+func (s *objectStore) resolveLock(ctx context.Context, lockKey string, scan lockScan) (*lockEntry, error) {
 	logger := s.logger.With("key", lockKey)
 
 	// locks/<type>/<id>/<action>[/<run_version>]
@@ -744,7 +806,15 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	}
 
 	version, err := s.lockOwner(ctx, lockKey)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		// Released between the listing and the read: the run finished, so nothing holds the
+		// resource any more and there is nothing to report.
+		logger.DebugContext(ctx, "lock released during the scan")
+		return nil, nil
+	case err != nil && scan == scanHeld:
+		return nil, err
+	case err != nil:
 		logger.ErrorContext(ctx, "failed to resolve lock owner", "error", err)
 		return nil, nil
 	}
@@ -752,9 +822,10 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	manifest, _, err := s.getManifest(ctx, version)
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
-		// Crash window between lock acquisition and manifest creation. A recent lock may
-		// belong to an in-flight START and is left alone; one old enough that no START can
-		// still be writing it (the run version carries its creation time) is reaped.
+		// The window between lock acquisition and manifest creation: an in-flight START, which
+		// refuses a competing Start from the moment its lock lands, or a crash inside one. A
+		// lock old enough that no START can still be writing it (the run version carries its
+		// creation time) is reaped.
 		if time.Since(ulid.Time(version.Time())) > 2*s.cfg.leaseTimeout() {
 			logger.WarnContext(ctx, "stale lock with no manifest, removing")
 			if err := s.deleteObject(ctx, lockKey); err != nil {
@@ -762,8 +833,12 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 			}
 			return nil, nil
 		}
-		logger.WarnContext(ctx, "lock held but manifest missing, skipping")
-		return nil, nil
+		if scan == scanResumable {
+			logger.WarnContext(ctx, "lock held but manifest missing, skipping")
+			return nil, nil
+		}
+		logger.DebugContext(ctx, "lock held but manifest missing, reporting the lock")
+		return &lockEntry{action: action, version: version}, nil
 	case err != nil:
 		return nil, err
 	}
@@ -787,9 +862,10 @@ func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) erro
 
 // Active returns every incomplete run of one FSM, enumerated from the locks/ prefix. The Manager
 // resumes through claimRuns on this backend, so Active is the query form of the same scan: every
-// active run, whether or not this node may take it.
+// active run, whether or not this node may take it — and, being a resume path, only runs whose
+// recorded state it can hand back.
 func (s *objectStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(key.typeName))
+	entries, err := s.scanLocks(ctx, s.lockPrefix(key.typeName), scanResumable)
 	if err != nil {
 		return nil, err
 	}
@@ -818,8 +894,12 @@ func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
 	}
 }
 
+// ActiveRuns answers from the resource's locks, and answers for every one of them: a caller
+// deciding whether the resource is busy must never read it as idle while a lock on it would
+// refuse a Start. A run whose START has not yet written its manifest is therefore reported with
+// RUN_STATE_UNSPECIFIED — held, state not known yet.
 func (s *objectStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
-	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
+	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID), scanHeld)
 	if err != nil {
 		return nil, err
 	}
@@ -854,13 +934,28 @@ func (s *objectStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]R
 	return active, nil
 }
 
+// startVisibilityWindow is how long a run version may exist with no manifest to read: a START
+// takes the resource lock with its first write and creates the manifest last, so a version
+// minted moments ago may be a run being written rather than one that never existed. A second is
+// several times the conditional writes a START makes against a multi-region bucket, and is the
+// longest a wait on a version that really is unknown waits to be told so.
+const startVisibilityWindow = time.Second
+
+// startInFlight reports whether a version is young enough that a START could still be writing
+// its run. Neither the manifest nor the history record is readable in that window, so nothing
+// but the version's own age tells a run that is landing from a run that does not exist.
+func startInFlight(runVersion ulid.ULID) bool {
+	return time.Since(ulid.Time(runVersion.Time())) < startVisibilityWindow
+}
+
 // WaitRun blocks until the run records a terminal state, polling its manifest under exponential
 // backoff with the bus as a fast path: a fsm.run.done event wakes the wait immediately instead
 // of on the next poll tick, and a live bus relaxes the poll floor to a rare insurance interval
 // (waitBackoff). Outcomes of runs this process completed are answered from the in-process
-// finished map, which preserves typed run errors; a missing manifest is answered from history.
-// A terminal manifest whose finish is still being cleaned up by this process keeps the waiter
-// polling until the outcome is recorded.
+// finished map, which preserves typed run errors; a missing manifest is answered from history,
+// unless the run may be one a START is still writing (startVisibilityWindow). A terminal
+// manifest whose finish is still being cleaned up by this process keeps the waiter polling
+// until the outcome is recorded.
 func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	// Subscribe before the first manifest read: a completion landing between the read and the
 	// wait still wakes us, and one that landed before Subscribe returned is caught by that
@@ -879,6 +974,9 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		switch {
 		case errors.Is(err, ErrFsmNotFound):
 			outcome = historyOutcome(ctx, s, runVersion)
+			if errors.Is(outcome, ErrFsmNotFound) && startInFlight(runVersion) {
+				return false, nil
+			}
 			return true, nil
 		case err != nil:
 			return false, err
@@ -930,8 +1028,10 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	}
 }
 
+// ListActive lists every incomplete run for the admin API. A lock whose manifest is not written
+// yet is skipped rather than listed as a row with no state, queue or current state in it.
 func (s *objectStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
-	entries, err := s.scanLocks(ctx, s.locksPrefix())
+	entries, err := s.scanLocks(ctx, s.locksPrefix(), scanResumable)
 	if err != nil {
 		return nil, err
 	}

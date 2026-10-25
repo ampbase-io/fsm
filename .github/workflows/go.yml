@@ -43,6 +43,50 @@ jobs:
         # coordination bugs the plain suite missed.
         run: go test -race ./...
 
+  # The live tests (TestLive*) run the object backend against a real
+  # S3-compatible server instead of the in-process fake, where every operation
+  # answers instantly and the gaps a multi-object write opens — a START's lock
+  # landing four objects before its manifest — close too fast to observe. They
+  # skip themselves when FSM_TEST_S3_ENDPOINT is unset, so without this job
+  # nothing would ever run them.
+  #
+  # Pinned to an exact release rather than a moving tag: a store swap changes
+  # what the tests mean, so it should be a change here, not a silent one.
+  object-store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Allow go.mod's RC toolchain
+        # See the root job: GOTOOLCHAIN=auto must be re-exported after setup-go.
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+      - name: Start the object store
+        run: |
+          docker run -d --name rustfs -p 127.0.0.1:9000:9000 \
+            -e RUSTFS_ACCESS_KEY=minioadmin \
+            -e RUSTFS_SECRET_KEY=minioadmin \
+            rustfs/rustfs:1.0.0 server /data
+      - name: Wait for the object store
+        run: |
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:9000/health && exit 0
+            sleep 1
+          done
+          echo "::error::the object store never became ready"
+          docker logs rustfs 2>&1 | tail -40
+          exit 1
+      - name: Test against the object store
+        env:
+          FSM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        # -count=1 so a cached pass from the fake-backed job cannot stand in for
+        # a run against the real store.
+        run: go test -race -count=1 -run TestLive ./...
+
   # The NATS EventBus adapter (eventbus/nats) is a nested module so nats.go stays
   # out of the core module's dependency graph — the root job's ./... never descends
   # into it, hence this separate job rather than a matrix entry (a matrix would

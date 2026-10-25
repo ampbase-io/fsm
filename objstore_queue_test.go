@@ -354,7 +354,7 @@ func startQueuedRun(t *testing.T, s *objectStore, id, queue string) Run {
 // scanOne returns the single lock entry the queued run planted, failing if there isn't exactly one.
 func scanOne(t *testing.T, s *objectStore) lockEntry {
 	t.Helper()
-	entries, err := s.scanLocks(context.Background(), s.lockPrefix("orderReq"))
+	entries, err := s.scanLocks(context.Background(), s.lockPrefix("orderReq"), scanResumable)
 	if err != nil {
 		t.Fatalf("scanLocks: %v", err)
 	}
