@@ -889,13 +889,28 @@ func (s *objectStore) ActiveChildren(ctx context.Context, parent ulid.ULID) ([]R
 	return active, nil
 }
 
+// startVisibilityWindow is how long a run version may exist with no manifest to read: a START
+// takes the resource lock with its first write and creates the manifest last, so a version
+// minted moments ago may be a run being written rather than one that never existed. A second is
+// several times the conditional writes a START makes against a multi-region bucket, and is the
+// longest a wait on a version that really is unknown waits to be told so.
+const startVisibilityWindow = time.Second
+
+// startInFlight reports whether a version is young enough that a START could still be writing
+// its run. Neither the manifest nor the history record is readable in that window, so nothing
+// but the version's own age tells a run that is landing from a run that does not exist.
+func startInFlight(runVersion ulid.ULID) bool {
+	return time.Since(ulid.Time(runVersion.Time())) < startVisibilityWindow
+}
+
 // WaitRun blocks until the run records a terminal state, polling its manifest under exponential
 // backoff with the bus as a fast path: a fsm.run.done event wakes the wait immediately instead
 // of on the next poll tick, and a live bus relaxes the poll floor to a rare insurance interval
 // (waitBackoff). Outcomes of runs this process completed are answered from the in-process
-// finished map, which preserves typed run errors; a missing manifest is answered from history.
-// A terminal manifest whose finish is still being cleaned up by this process keeps the waiter
-// polling until the outcome is recorded.
+// finished map, which preserves typed run errors; a missing manifest is answered from history,
+// unless the run may be one a START is still writing (startVisibilityWindow). A terminal
+// manifest whose finish is still being cleaned up by this process keeps the waiter polling
+// until the outcome is recorded.
 func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	// Subscribe before the first manifest read: a completion landing between the read and the
 	// wait still wakes us, and one that landed before Subscribe returned is caught by that
@@ -914,6 +929,9 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 		switch {
 		case errors.Is(err, ErrFsmNotFound):
 			outcome = historyOutcome(ctx, s, runVersion)
+			if errors.Is(outcome, ErrFsmNotFound) && startInFlight(runVersion) {
+				return false, nil
+			}
 			return true, nil
 		case err != nil:
 			return false, err
