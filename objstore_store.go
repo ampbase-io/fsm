@@ -672,7 +672,9 @@ func runFromManifest(version ulid.ULID, m *fsmv1.RunManifest) Run {
 	}
 }
 
-// lockEntry pairs an active resource lock with the manifest of the run holding it.
+// lockEntry pairs an active resource lock with the manifest of the run holding it. A scanHeld
+// entry may carry no manifest: the run holds the resource, and nothing about its state is
+// readable yet.
 type lockEntry struct {
 	action string
 
@@ -681,6 +683,20 @@ type lockEntry struct {
 	manifest *fsmv1.RunManifest
 }
 
+// lockScan is what a scan makes of a held lock it cannot resolve to a run — a START that has
+// written its lock but not yet its manifest, or a lock that will not read.
+type lockScan int
+
+const (
+	// scanResumable skips it: the run's state is what the resume and claim paths came for, and
+	// a later pass retries once the manifest is there.
+	scanResumable lockScan = iota
+
+	// scanHeld reports it, manifest or not. A lock left out of a query reads as an idle
+	// resource, while a Start on that resource is refused for as long as the lock exists.
+	scanHeld
+)
+
 // scanFanout bounds the concurrent object storage operations of a lock scan or a lease pass;
 // a serial pass over many runs could outrun the interval that scheduled it.
 const scanFanout = 8
@@ -688,9 +704,9 @@ const scanFanout = 8
 // scanLocks lists resource locks under prefix and resolves each to its owning run's manifest
 // (keys-only listing plus one lock GET and one manifest GET per active run, scanFanout at a
 // time — event bodies are never read, per the RFC's resumability contract). Crash windows are
-// handled inline: a lock without a manifest is skipped, and a lock whose manifest is terminal
-// is deleted.
-func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry, error) {
+// handled inline: a lock whose manifest is terminal is deleted, and what a lock with no manifest
+// means to the caller is the scan mode's to say.
+func (s *objectStore) scanLocks(ctx context.Context, prefix string, scan lockScan) ([]lockEntry, error) {
 	lockKeys, err := s.listKeys(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -708,7 +724,7 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			resolved[i], errs[i] = s.resolveLock(ctx, lockKey)
+			resolved[i], errs[i] = s.resolveLock(ctx, lockKey, scan)
 		}()
 	}
 	wg.Wait()
@@ -726,9 +742,10 @@ func (s *objectStore) scanLocks(ctx context.Context, prefix string) ([]lockEntry
 	return entries, nil
 }
 
-// resolveLock resolves a single lock key to its owning run's manifest. Skips — malformed keys,
-// crash windows, terminal-manifest cleanup — return (nil, nil).
-func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEntry, error) {
+// resolveLock resolves a single lock key to its owning run's manifest. Skips — a malformed key,
+// a lock already released, terminal-manifest cleanup — return (nil, nil); a held lock whose run
+// is not readable is the scan mode's to interpret.
+func (s *objectStore) resolveLock(ctx context.Context, lockKey string, scan lockScan) (*lockEntry, error) {
 	logger := s.logger.With("key", lockKey)
 
 	// locks/<type>/<id>/<action>[/<run_version>]
@@ -744,7 +761,15 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	}
 
 	version, err := s.lockOwner(ctx, lockKey)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrFsmNotFound):
+		// Released between the listing and the read: the run finished, so nothing holds the
+		// resource any more and there is nothing to report.
+		logger.DebugContext(ctx, "lock released during the scan")
+		return nil, nil
+	case err != nil && scan == scanHeld:
+		return nil, err
+	case err != nil:
 		logger.ErrorContext(ctx, "failed to resolve lock owner", "error", err)
 		return nil, nil
 	}
@@ -752,9 +777,10 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 	manifest, _, err := s.getManifest(ctx, version)
 	switch {
 	case errors.Is(err, ErrFsmNotFound):
-		// Crash window between lock acquisition and manifest creation. A recent lock may
-		// belong to an in-flight START and is left alone; one old enough that no START can
-		// still be writing it (the run version carries its creation time) is reaped.
+		// The window between lock acquisition and manifest creation: an in-flight START, which
+		// refuses a competing Start from the moment its lock lands, or a crash inside one. A
+		// lock old enough that no START can still be writing it (the run version carries its
+		// creation time) is reaped.
 		if time.Since(ulid.Time(version.Time())) > 2*s.cfg.leaseTimeout() {
 			logger.WarnContext(ctx, "stale lock with no manifest, removing")
 			if err := s.deleteObject(ctx, lockKey); err != nil {
@@ -762,8 +788,12 @@ func (s *objectStore) resolveLock(ctx context.Context, lockKey string) (*lockEnt
 			}
 			return nil, nil
 		}
-		logger.WarnContext(ctx, "lock held but manifest missing, skipping")
-		return nil, nil
+		if scan == scanResumable {
+			logger.WarnContext(ctx, "lock held but manifest missing, skipping")
+			return nil, nil
+		}
+		logger.DebugContext(ctx, "lock held but manifest missing, reporting the lock")
+		return &lockEntry{action: action, version: version}, nil
 	case err != nil:
 		return nil, err
 	}
@@ -787,9 +817,10 @@ func (s *objectStore) reapTerminalLock(ctx context.Context, lockKey string) erro
 
 // Active returns every incomplete run of one FSM, enumerated from the locks/ prefix. The Manager
 // resumes through claimRuns on this backend, so Active is the query form of the same scan: every
-// active run, whether or not this node may take it.
+// active run, whether or not this node may take it — and, being a resume path, only runs whose
+// recorded state it can hand back.
 func (s *objectStore) Active(ctx context.Context, key fsmKey) ([]*activeResource, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(key.typeName))
+	entries, err := s.scanLocks(ctx, s.lockPrefix(key.typeName), scanResumable)
 	if err != nil {
 		return nil, err
 	}
@@ -818,8 +849,12 @@ func manifestResource(version ulid.ULID, m *fsmv1.RunManifest) *activeResource {
 	}
 }
 
+// ActiveRuns answers from the resource's locks, and answers for every one of them: a caller
+// deciding whether the resource is busy must never read it as idle while a lock on it would
+// refuse a Start. A run whose START has not yet written its manifest is therefore reported with
+// RUN_STATE_UNSPECIFIED — held, state not known yet.
 func (s *objectStore) ActiveRuns(ctx context.Context, resourceType, resourceID string) (ActiveSet, error) {
-	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID))
+	entries, err := s.scanLocks(ctx, s.lockResourcePrefix(resourceType, resourceID), scanHeld)
 	if err != nil {
 		return nil, err
 	}
@@ -930,8 +965,10 @@ func (s *objectStore) WaitRun(ctx context.Context, runVersion ulid.ULID) error {
 	}
 }
 
+// ListActive lists every incomplete run for the admin API. A lock whose manifest is not written
+// yet is skipped rather than listed as a row with no state, queue or current state in it.
 func (s *objectStore) ListActive(ctx context.Context) ([]runSnapshot, error) {
-	entries, err := s.scanLocks(ctx, s.locksPrefix())
+	entries, err := s.scanLocks(ctx, s.locksPrefix(), scanResumable)
 	if err != nil {
 		return nil, err
 	}

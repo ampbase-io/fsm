@@ -315,7 +315,7 @@ func (s *objectStore) claimRuns(ctx context.Context, keys []fsmKey) ([]claimedRu
 
 // claimLocks claims every run under one resource type's lock prefix whose action this node runs.
 func (s *objectStore) claimLocks(ctx context.Context, typeName string, registered map[fsmKey]struct{}) ([]claimedRun, error) {
-	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName))
+	entries, err := s.scanLocks(ctx, s.lockPrefix(typeName), scanResumable)
 	if err != nil {
 		return nil, err
 	}
