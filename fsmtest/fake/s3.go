@@ -42,6 +42,11 @@ type S3 struct {
 	// write that succeeds server-side while its response is lost.
 	LostPuts int
 
+	// ErroredPuts is the number of conditional PUTs to apply but answer with 500, simulating a
+	// write that lands while its response fails: the S3 client's own retryer re-sends it, and the
+	// re-send meets the object its first attempt wrote.
+	ErroredPuts int
+
 	failDelete string
 	failPut    string
 	prePut     func(key string)
@@ -178,7 +183,7 @@ func (f *S3) Handler(bucket string) http.Handler {
 }
 
 // put applies a write under its If-None-Match: * or If-Match condition, then the armed faults:
-// Conflicts refuses before applying, LostPuts refuses after. Callers hold f.mu.
+// Conflicts refuses before applying, LostPuts and ErroredPuts refuse after. Callers hold f.mu.
 func (f *S3) put(w http.ResponseWriter, r *http.Request, key string) {
 	f.puts++
 	if f.failPut != "" && key == f.failPut {
@@ -207,6 +212,11 @@ func (f *S3) put(w http.ResponseWriter, r *http.Request, key string) {
 	if conditional && f.LostPuts > 0 {
 		f.LostPuts--
 		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	if conditional && f.ErroredPuts > 0 {
+		f.ErroredPuts--
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("ETag", f.etag(key))
