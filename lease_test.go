@@ -14,6 +14,8 @@ import (
 	"github.com/ampbase-io/fsm/fsmtest/fake"
 	fsmv1 "github.com/ampbase-io/fsm/gen/fsm/v1"
 
+	awsretry "github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -64,10 +66,27 @@ func asymmetricTimings(ownerHeartbeat time.Duration) func(*ObjectStorageConfig) 
 
 func (h *leaseHarness) store(nodeID string, leaseTimeout time.Duration) *objectStore {
 	h.t.Helper()
+	return h.storeWith(nodeID, leaseTimeout, h.s3.Client())
+}
+
+// resendingStore is a store whose S3 client keeps the SDK's standard retryer but re-sends at
+// once, so a test of a write the retryer re-sends doesn't wait out its jittered backoff.
+func (h *leaseHarness) resendingStore(nodeID string) *objectStore {
+	h.t.Helper()
+	client := s3.New(h.s3.Client().Options(), func(o *s3.Options) {
+		o.Retryer = awsretry.NewStandard(func(so *awsretry.StandardOptions) {
+			so.Backoff = awsretry.BackoffDelayerFunc(func(int, error) (time.Duration, error) { return 0, nil })
+		})
+	})
+	return h.storeWith(nodeID, 10*time.Second, client)
+}
+
+func (h *leaseHarness) storeWith(nodeID string, leaseTimeout time.Duration, client *s3.Client) *objectStore {
+	h.t.Helper()
 
 	store, err := newObjectStore(context.Background(), slog.Default(), testInstruments(h.t), &ObjectStorageConfig{
 		Bucket:       h.s3.Bucket(),
-		Client:       h.s3.Client(),
+		Client:       client,
 		LeaseTimeout: leaseTimeout,
 	}, nodeID, nil, nil)
 	if err != nil {
@@ -90,13 +109,17 @@ func startRun(t *testing.T, s *objectStore, id string) Run {
 }
 
 func appendStarted(s *objectStore, run Run) error {
+	return appendStartedWith(s, run, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}})
+}
+
+func appendStartedWith(s *objectStore, run Run, start *startRecord) error {
 	_, err := s.Start(context.Background(), run, &fsmv1.StateEvent{
 		Type:         fsmv1.EventType_EVENT_TYPE_START,
 		Id:           run.ID,
 		ResourceType: run.TypeName,
 		Action:       run.Action,
 		State:        "created",
-	}, &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}})
+	}, start)
 	return err
 }
 
@@ -519,7 +542,7 @@ func TestAdoptRunManifest(t *testing.T) {
 
 	// A restarted incarnation of the owning node adopts the existing lease.
 	a2 := h.store("node-a", 10*time.Second)
-	if err := a2.adoptRunManifest(ctx, run, runLockKey(a2, run)); err != nil {
+	if err := a2.adoptRunManifest(ctx, run, runLockKey(a2, run), false); err != nil {
 		t.Fatalf("expected the owning node to adopt its manifest, got %v", err)
 	}
 	if epoch, ok := a2.ownedEpoch(run.StartVersion); !ok || epoch != 7 {
@@ -528,7 +551,7 @@ func TestAdoptRunManifest(t *testing.T) {
 
 	// A foreign node is fenced.
 	b := h.store("node-b", 10*time.Second)
-	if err := b.adoptRunManifest(ctx, run, runLockKey(b, run)); !errors.Is(err, ErrLeaseLost) {
+	if err := b.adoptRunManifest(ctx, run, runLockKey(b, run), false); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("expected a foreign adopter fenced with ErrLeaseLost, got %v", err)
 	}
 	if owns(b, run.StartVersion) {
@@ -604,6 +627,112 @@ func TestStartRetryAfterFinishRejected(t *testing.T) {
 	}
 	if _, _, err := a.getObject(ctx, runLockKey(a, run)); !errors.Is(err, ErrFsmNotFound) {
 		t.Fatalf("expected the retry's lock removed, got %v", err)
+	}
+}
+
+// TestStartSurvivesResentLockCreate covers a lock create that lands but answers an error: the S3
+// client's retryer re-sends it and meets the lock its first attempt wrote. That lock names the
+// run being started, so the start proceeds instead of refusing itself as already running. The
+// lingering case resends the create that follows reaping a finished run's leftover lock.
+func TestStartSurvivesResentLockCreate(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, s *objectStore)
+	}{
+		{"free", func(*testing.T, *objectStore) {}},
+		{"finished run's lock lingers", func(t *testing.T, s *objectStore) {
+			done := startRun(t, s, "resent-lock")
+			finishRun(t, s, done)
+			putLock(t, s, runLockKey(s, done), done.StartVersion)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newLeaseHarness(t)
+			s := h.resendingStore("node-a")
+			tt.setup(t, s)
+
+			run := Run{ID: "resent-lock", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+			// The first lock create that lands; a 412 on a lingering lock lands nothing.
+			h.s3.ErroredPuts = 1
+			err := appendStarted(s, run)
+			if are, ok := errors.AsType[*AlreadyRunningError](err); ok && are.Version == run.StartVersion {
+				t.Fatalf("start refused by its own lock: AlreadyRunningError names the run's own version %s", are.Version)
+			}
+			if err != nil {
+				t.Fatalf("failed to start: %v", err)
+			}
+			if !owns(s, run.StartVersion) {
+				t.Fatal("expected the start to lease the run to its node")
+			}
+
+			finishRun(t, s, run)
+			if got := mustManifest(t, s, run.StartVersion).GetStatus(); got != fsmv1.RunState_RUN_STATE_COMPLETE {
+				t.Fatalf("expected the run to complete, got %v", got)
+			}
+			if !objectGone(t, s, runLockKey(s, run)) {
+				t.Fatal("expected the finished run's lock removed")
+			}
+		})
+	}
+}
+
+// TestStartRefusesLockOfAnotherRun is the case a resent create must not swallow: a 412 on a lock
+// naming another run still reports that run, whether it is live or its START is in flight.
+func TestStartRefusesLockOfAnotherRun(t *testing.T) {
+	tests := []struct {
+		name  string
+		other func(t *testing.T, s *objectStore) ulid.ULID
+	}{
+		{"live", func(t *testing.T, s *objectStore) ulid.ULID {
+			return startRun(t, s, "contended").StartVersion
+		}},
+		{"start in flight", func(t *testing.T, s *objectStore) ulid.ULID {
+			version := ulid.Make()
+			putLock(t, s, runLockKey(s, Run{ID: "contended", Action: "deploy", TypeName: "orderReq"}), version)
+			return version
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newLeaseHarness(t)
+			s := h.resendingStore("node-a")
+			other := tt.other(t, s)
+
+			run := Run{ID: "contended", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+			are, ok := errors.AsType[*AlreadyRunningError](appendStarted(s, run))
+			if !ok {
+				t.Fatal("expected AlreadyRunningError")
+			}
+			if are.Version != other {
+				t.Fatalf("expected the error to name the holder %s, got %s", other, are.Version)
+			}
+		})
+	}
+}
+
+// TestStartSurvivesEveryResentCreate lands every create of a START — lock, event, index,
+// manifest — behind an error, so each re-send meets its own object. A leased start adopts its
+// own manifest's lease; an unowned one has no lease to adopt.
+func TestStartSurvivesEveryResentCreate(t *testing.T) {
+	for _, unowned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unowned=%t", unowned), func(t *testing.T) {
+			h := newLeaseHarness(t)
+			s := h.resendingStore("node-a")
+
+			run := Run{ID: "resent-all", StartVersion: ulid.Make(), Action: "deploy", TypeName: "orderReq"}
+			h.s3.ErroredPuts = 4
+			start := &startRecord{Resource: []byte("{}"), Transitions: []string{"created", "done"}, Unowned: unowned}
+			if err := appendStartedWith(s, run, start); err != nil {
+				t.Fatalf("failed to start: %v", err)
+			}
+			if owns(s, run.StartVersion) == unowned {
+				t.Fatalf("expected the node to own the run: %t", !unowned)
+			}
+			if got := mustManifest(t, s, run.StartVersion).GetStatus(); got != fsmv1.RunState_RUN_STATE_PENDING {
+				t.Fatalf("expected a PENDING manifest, got %v", got)
+			}
+		})
 	}
 }
 

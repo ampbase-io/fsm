@@ -257,7 +257,10 @@ func (s *objectStore) lockOwner(ctx context.Context, lockKey string) (ulid.ULID,
 // deletion: the cleanup is finished here and the acquire retried once, so a caller that
 // restarts a resource right after waiting on its completion doesn't see a spurious
 // AlreadyRunning.
-func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVersionBytes []byte) error {
+//
+// A 412 on a lock that names this run is this run's own lock: a create that landed but whose
+// answer was lost, re-sent by the S3 client's retryer.
+func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, version ulid.ULID, runVersionBytes []byte) error {
 	switch err := s.putIfAbsent(ctx, lockKey, runVersionBytes); {
 	case err == nil:
 		return nil
@@ -266,8 +269,11 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 	}
 
 	ownerVersion, err := s.lockOwner(ctx, lockKey)
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
+	case ownerVersion == version:
+		return nil
 	}
 	manifest, _, err := s.getManifest(ctx, ownerVersion)
 	if err != nil || !manifestTerminal(manifest) {
@@ -284,10 +290,13 @@ func (s *objectStore) acquireRunLock(ctx context.Context, lockKey string, runVer
 		return err
 	}
 
-	// Lost the re-acquire race to another starter.
+	// Lost the re-acquire race to another starter, or to this run's own resent create.
 	ownerVersion, err = s.lockOwner(ctx, lockKey)
-	if err != nil {
+	switch {
+	case err != nil:
 		return err
+	case ownerVersion == version:
+		return nil
 	}
 	return &AlreadyRunningError{Version: ownerVersion}
 }
@@ -300,7 +309,7 @@ func (s *objectStore) appendStart(ctx context.Context, run Run, event *fsmv1.Sta
 
 	// 1. Acquire the resource lock. A 412 means another run holds it.
 	lockKey := s.lockKey(run)
-	if err := s.acquireRunLock(ctx, lockKey, runVersionBytes); err != nil {
+	if err := s.acquireRunLock(ctx, lockKey, run.StartVersion, runVersionBytes); err != nil {
 		return err
 	}
 
@@ -388,7 +397,7 @@ func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey st
 		}
 		return nil
 	case errors.Is(err, errPreconditionFailed):
-		return s.adoptRunManifest(ctx, run, lockKey)
+		return s.adoptRunManifest(ctx, run, lockKey, unowned)
 	default:
 		return err
 	}
@@ -398,8 +407,8 @@ func (s *objectStore) createRunManifest(ctx context.Context, run Run, lockKey st
 // existing manifest is authoritative. Its lease is adopted if this node still owns it — but
 // never from a terminal manifest: a START retry arriving after the run finished must not
 // re-execute it, and the lock the retry re-acquired is undone so the duplicate leaves no
-// trace.
-func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey string) error {
+// trace. An unowned START has no lease to adopt: the run is persisted, whoever has claimed it.
+func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey string, unowned bool) error {
 	existing, _, err := s.getManifest(ctx, run.StartVersion)
 	if err != nil {
 		return err
@@ -411,7 +420,10 @@ func (s *objectStore) adoptRunManifest(ctx context.Context, run Run, lockKey str
 		}
 		return &AlreadyRunningError{Version: run.StartVersion}
 	}
-	if existing.GetOwnerNode() != s.node {
+	switch {
+	case unowned:
+		return nil
+	case existing.GetOwnerNode() != s.node:
 		return ErrLeaseLost
 	}
 

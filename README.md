@@ -421,5 +421,5 @@ b := fsmtest.NewObjectBackend(t,
 
 The fakes live in `fsmtest/fake` and do not import `fsm`: a test that builds its own `Config`
 takes `fake.NewS3(t).Client()` for `ObjectStorageConfig.Client` and `fake.NewBus()` for
-`EventBus`. The S3 fake injects faults — `Conflicts`, `LostPuts`, `SetPrePut`, `SetFailDelete`
-— and counts `Puts()` and reads, for tests of the conditional-write paths.
+`EventBus`. The S3 fake injects faults — `Conflicts`, `LostPuts`, `ErroredPuts`, `SetPrePut`,
+`SetFailDelete` — and counts `Puts()` and reads, for tests of the conditional-write paths.
